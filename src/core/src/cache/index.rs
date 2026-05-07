@@ -51,6 +51,17 @@ impl ArtIndex {
         }
     }
 
+    /// Remove an entry from the index. Returns the removed entry, or `None` if
+    /// the key was not present.
+    pub(crate) fn remove(&self, entry_id: &EntryID) -> Option<Arc<CacheEntry>> {
+        let guard = self.art.pin();
+        let removed = self.art.remove(*entry_id, &guard);
+        if removed.is_some() {
+            self.entry_count.fetch_sub(1, Ordering::Relaxed);
+        }
+        removed
+    }
+
     pub(crate) fn reset(&self) {
         let guard = self.art.pin();
         self.art.keys().into_iter().for_each(|k| {

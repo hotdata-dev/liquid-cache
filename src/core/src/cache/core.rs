@@ -302,7 +302,9 @@ impl LiquidCache {
         }
     }
 
-    /// Insert a batch into the cache, it will run cache replacement policy until the batch is inserted.
+    /// Insert a batch into the cache. RAM-only: when full, evict the LRU
+    /// victim by dropping it; never spill to disk. If the new entry doesn't
+    /// fit even after the cache is empty, silently skip caching it.
     pub(crate) async fn insert_inner(&self, entry_id: EntryID, mut batch_to_cache: CacheEntry) {
         loop {
             let Err(not_inserted) = self.try_insert(entry_id, batch_to_cache) else {
@@ -313,21 +315,25 @@ impl LiquidCache {
                 kind: CachedBatchType::from(&not_inserted),
             });
 
-            let victims = self.cache_policy.find_victim(8);
+            // Evict one victim per iteration: dropped data can't come back, so
+            // over-eviction would silently discard recently-used entries.
+            let victims = self.cache_policy.find_victim(1);
             if victims.is_empty() {
-                // no advice, because the cache is already empty
-                // this can happen if the entry to be inserted is too large, in that case,
-                // we write it to disk
-                let on_disk_batch = self
-                    .write_in_memory_batch_to_disk(entry_id, not_inserted)
-                    .await;
-                batch_to_cache = on_disk_batch;
-                continue;
+                // Nothing left to free; the entry is larger than the budget.
+                return;
             }
-            self.squeeze_victims(victims).await;
-
+            self.drop_victims(&victims);
             batch_to_cache = not_inserted;
             crate::utils::yield_now_if_shuttle();
+        }
+    }
+
+    fn drop_victims(&self, victims: &[EntryID]) {
+        for victim in victims {
+            self.trace(InternalEvent::SqueezeVictim { entry: *victim });
+            if let Some(entry) = self.index.remove(victim) {
+                self.budget.release_memory(entry.memory_usage_bytes());
+            }
         }
     }
 
