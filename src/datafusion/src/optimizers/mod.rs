@@ -437,8 +437,8 @@ mod tests {
         // A point-fetch: precise access plan over 100 row groups selecting just 1.
         let mut plan = ParquetAccessPlan::new_none(total_row_groups);
         plan.scan(0);
-        let targeted = PartitionedFile::new("targeted.parquet", file_size)
-            .with_extensions(Arc::new(plan));
+        let targeted =
+            PartitionedFile::new("targeted.parquet", file_size).with_extensions(Arc::new(plan));
 
         // Estimate scales to ~1/100 of the file, not the full size.
         assert_eq!(estimated_scan_bytes(&targeted), file_size / 100);
