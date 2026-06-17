@@ -58,6 +58,14 @@ impl BudgetAccounting {
         }
     }
 
+    /// Release previously reserved memory bytes — used when an entry is
+    /// dropped from the cache without being persisted.
+    pub(super) fn release_memory(&self, bytes: usize) {
+        if bytes != 0 {
+            self.used_memory_bytes.fetch_sub(bytes, Ordering::Relaxed);
+        }
+    }
+
     pub fn memory_usage_bytes(&self) -> usize {
         self.used_memory_bytes.load(Ordering::Relaxed)
     }
