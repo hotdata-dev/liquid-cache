@@ -26,17 +26,35 @@ use crate::{LiquidCacheParquetRef, LiquidParquetSource, cache::ColumnSqueezeHint
 #[derive(Debug)]
 pub struct LocalModeOptimizer {
     cache: LiquidCacheParquetRef,
+    /// When set, parquet scans whose total file size exceeds this threshold
+    /// are left as vanilla DataFusion reads instead of being wrapped by
+    /// LiquidCache. `None` means cache every scan.
+    max_scan_bytes: Option<u64>,
 }
 
 impl LocalModeOptimizer {
     /// Create an optimizer with an existing cache instance
     pub fn new(cache: LiquidCacheParquetRef) -> Self {
-        Self { cache }
+        Self {
+            cache,
+            max_scan_bytes: None,
+        }
     }
 
     /// Create an optimizer with an existing cache instance
     pub fn with_cache(cache: LiquidCacheParquetRef) -> Self {
-        Self { cache }
+        Self {
+            cache,
+            max_scan_bytes: None,
+        }
+    }
+
+    /// Set the maximum total file size (in bytes) for a parquet scan to be
+    /// routed through LiquidCache. Scans exceeding this are read directly
+    /// from the underlying parquet source, bypassing the cache.
+    pub fn with_max_scan_bytes(mut self, max_bytes: u64) -> Self {
+        self.max_scan_bytes = Some(max_bytes);
+        self
     }
 }
 
@@ -48,7 +66,14 @@ impl PhysicalOptimizerRule for LocalModeOptimizer {
     ) -> Result<Arc<dyn ExecutionPlan>, datafusion::error::DataFusionError> {
         let analysis = HintAnalyzer::analyze(&plan);
         let cache = self.cache.clone();
+        let max_scan_bytes = self.max_scan_bytes;
         let mut convert = |node: &Arc<dyn ExecutionPlan>, hints: ColumnSqueezeHints| {
+            // Leave oversized scans as vanilla parquet reads, bypassing the cache.
+            if let Some(max_bytes) = max_scan_bytes
+                && parquet_scan_total_bytes(node).is_some_and(|total| total > max_bytes)
+            {
+                return None;
+            }
             convert_parquet_scan(node, &cache, hints)
         };
         Ok(squeeze_hint::rewrite_with_hints(
@@ -98,6 +123,21 @@ pub fn rewrite_data_source_plan(
     cache: &LiquidCacheParquetRef,
 ) -> Arc<dyn ExecutionPlan> {
     rewrite_data_source_plan_with_hints(plan, cache, &ColumnSqueezeHints::default())
+}
+
+/// Total size in bytes of all files scanned by a parquet `DataSourceExec`, or
+/// `None` if `node` is not such a scan.
+fn parquet_scan_total_bytes(node: &Arc<dyn ExecutionPlan>) -> Option<u64> {
+    let data_source_exec = node.downcast_ref::<DataSourceExec>()?;
+    let (file_scan_config, _) = data_source_exec.downcast_to_file_source::<ParquetSource>()?;
+    Some(
+        file_scan_config
+            .file_groups
+            .iter()
+            .flat_map(|g| g.files())
+            .map(|f| f.object_meta.size)
+            .sum(),
+    )
 }
 
 /// If `node` is a `DataSourceExec` over a `ParquetSource`, return an equivalent
