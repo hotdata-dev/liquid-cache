@@ -1,12 +1,12 @@
 [package]
 name = "dev-tools"
-version = "0.1.2"
+version = "0.1.3"
 authors = ["XiangpengHao <me@xiangpeng.systems>"]
 edition = "2024"
 
 
 [dependencies]
-dioxus = { version = "0.7.4", features = ["router", "fullstack"] }
+dioxus = { version = "=0.7.5", features = ["router", "fullstack"] }
 
 [features]
 default = ["web"]

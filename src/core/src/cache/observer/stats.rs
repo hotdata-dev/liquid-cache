@@ -103,6 +103,8 @@ define_runtime_stats! {
     (hit_date32_expression_calls, "Number of `hit_date32_expression` calls.", incr_hit_date32_expression),
     (read_io_count, "Number of read IO operations.", incr_read_io_count),
     (write_io_count, "Number of write IO operations.", incr_write_io_count),
+    (disk_evictions, "Number of disk cache entries evicted.", incr_disk_evictions),
+    (disk_reservation_failures, "Number of failed disk budget reservations.", incr_disk_reservation_failures),
     (eval_predicate_on_liquid_failed, "Number of `eval_predicate` calls that failed on Liquid array.", incr_eval_predicate_on_liquid_failed),
     (squeezed_decompressed_count, "Number of decompressed Squeezed-Liquid entries.", __incr_squeezed_decompressed_count),
     (squeezed_total_count, "Total number of Squeezed-Liquid entries.", __incr_squeezed_total_count),
@@ -144,8 +146,10 @@ pub struct CacheStats {
     pub memory_usage_bytes: usize,
     /// Total disk usage of the cache.
     pub disk_usage_bytes: usize,
-    /// Maximum cache size.
-    pub max_cache_bytes: usize,
+    /// Maximum memory size.
+    pub max_memory_bytes: usize,
+    /// Maximum disk size.
+    pub max_disk_bytes: usize,
     /// Runtime counters snapshot.
     pub runtime: RuntimeStatsSnapshot,
 }

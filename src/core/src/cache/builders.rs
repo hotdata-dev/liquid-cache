@@ -8,9 +8,9 @@ use arrow::buffer::BooleanBuffer;
 
 use super::cached_batch::CacheEntry;
 use super::core::LiquidCache;
-use super::io_context::{DefaultIoContext, IoContext};
+use super::io_context::{DefaultCacheMetadata, EntryMetadata};
 use super::policies::{CachePolicy, HydrationPolicy, SqueezePolicy, TranscodeSqueezeEvict};
-use super::{CacheExpression, EntryID, LiquidExpr, LiquidPolicy};
+use super::{CacheExpression, CacheFull, EntryID, LiquidExpr, LiquidPolicy};
 use crate::sync::Arc;
 
 /// Builder for [LiquidCache].
@@ -23,7 +23,7 @@ use crate::sync::Arc;
 /// tokio_test::block_on(async {
 ///     let _storage = LiquidCacheBuilder::new()
 ///         .with_batch_size(8192)
-///         .with_max_cache_bytes(1024 * 1024 * 1024)
+///         .with_max_memory_bytes(1024 * 1024 * 1024)
 ///         .with_cache_policy(Box::new(LiquidPolicy::new()))
 ///         .build()
 ///         .await;
@@ -31,11 +31,14 @@ use crate::sync::Arc;
 /// ```
 pub struct LiquidCacheBuilder {
     batch_size: usize,
-    max_cache_bytes: usize,
+    max_memory_bytes: usize,
+    max_disk_bytes: usize,
     cache_policy: Box<dyn CachePolicy>,
     hydration_policy: Box<dyn HydrationPolicy>,
     squeeze_policy: Box<dyn SqueezePolicy>,
-    io_context: Option<Arc<dyn IoContext>>,
+    metadata: Option<Arc<dyn EntryMetadata>>,
+    store: Option<t4::Store>,
+    squeeze_victims_concurrently: bool,
 }
 
 impl Default for LiquidCacheBuilder {
@@ -47,13 +50,18 @@ impl Default for LiquidCacheBuilder {
 impl LiquidCacheBuilder {
     /// Create a new instance of [LiquidCacheBuilder].
     pub fn new() -> Self {
+        let max_memory_bytes = default_max_memory_bytes();
+        let max_disk_bytes = max_memory_bytes.saturating_mul(10);
         Self {
             batch_size: 8192,
-            max_cache_bytes: 1024 * 1024 * 1024,
+            max_memory_bytes,
+            max_disk_bytes,
             cache_policy: Box::new(LiquidPolicy::new()),
             hydration_policy: Box::new(super::AlwaysHydrate::new()),
             squeeze_policy: Box::new(TranscodeSqueezeEvict),
-            io_context: None,
+            metadata: None,
+            store: None,
+            squeeze_victims_concurrently: !cfg!(test),
         }
     }
 
@@ -64,10 +72,17 @@ impl LiquidCacheBuilder {
         self
     }
 
-    /// Set the max cache bytes for the cache.
-    /// Default is 1GB.
-    pub fn with_max_cache_bytes(mut self, max_cache_bytes: usize) -> Self {
-        self.max_cache_bytes = max_cache_bytes;
+    /// Set the max memory bytes for the cache.
+    /// Default is half of available system memory.
+    pub fn with_max_memory_bytes(mut self, max_memory_bytes: usize) -> Self {
+        self.max_memory_bytes = max_memory_bytes;
+        self
+    }
+
+    /// Set the max disk bytes for the cache.
+    /// Default is 10x the default memory size.
+    pub fn with_max_disk_bytes(mut self, max_disk_bytes: usize) -> Self {
+        self.max_disk_bytes = max_disk_bytes;
         self
     }
 
@@ -92,39 +107,67 @@ impl LiquidCacheBuilder {
         self
     }
 
-    /// Set the [IoContext] for the cache.
-    /// Default is [DefaultIoContext].
-    pub fn with_io_context(mut self, io_context: Arc<dyn IoContext>) -> Self {
-        self.io_context = Some(io_context);
+    /// Set the [EntryMetadata] for the cache.
+    /// Default is [DefaultCacheMetadata].
+    pub fn with_metadata(mut self, metadata: Arc<dyn EntryMetadata>) -> Self {
+        self.metadata = Some(metadata);
+        self
+    }
+
+    /// Set the [`t4::Store`] used for on-disk IO.
+    /// If not provided, the builder mounts a fresh store at a temporary directory.
+    pub fn with_store(mut self, store: t4::Store) -> Self {
+        self.store = Some(store);
+        self
+    }
+
+    /// Set whether cache victims are squeezed concurrently.
+    pub fn with_squeeze_victims_concurrently(mut self, enabled: bool) -> Self {
+        self.squeeze_victims_concurrently = enabled;
         self
     }
 
     /// Build the cache storage.
     ///
     /// The cache storage is wrapped in an [Arc] to allow for concurrent access.
-    /// When no custom [IoContext] is provided, a [`t4::Store`] is mounted at a
-    /// temporary directory.
+    /// When no [`t4::Store`] is provided, one is mounted at a temporary directory.
     pub async fn build(self) -> Arc<LiquidCache> {
-        let io_worker = match self.io_context {
-            Some(io_context) => io_context,
+        let store = match self.store {
+            Some(store) => store,
             None => {
                 let cache_dir = tempfile::tempdir().unwrap().keep();
                 let store_path = cache_dir.join("liquid_cache.t4");
-                let store = t4::mount(&store_path)
+                t4::mount(&store_path)
                     .await
-                    .expect("failed to mount t4 store");
-                Arc::new(DefaultIoContext::new(store))
+                    .expect("failed to mount t4 store")
             }
         };
+        let metadata = self
+            .metadata
+            .unwrap_or_else(|| Arc::new(DefaultCacheMetadata::new()));
         Arc::new(LiquidCache::new(
             self.batch_size,
-            self.max_cache_bytes,
+            self.max_memory_bytes,
+            self.max_disk_bytes,
             self.squeeze_policy,
             self.cache_policy,
             self.hydration_policy,
-            io_worker,
+            metadata,
+            store,
+            self.squeeze_victims_concurrently,
         ))
     }
+}
+
+/// Returns half of the total system memory in bytes.
+///
+/// Used as the default value for [`LiquidCacheBuilder::with_max_memory_bytes`].
+pub fn default_max_memory_bytes() -> usize {
+    let mut sys = sysinfo::System::new();
+    sys.refresh_memory();
+    let total = sys.total_memory();
+    let half = total / 2;
+    usize::try_from(half).unwrap_or(usize::MAX)
 }
 
 /// Builder returned by [`LiquidCache::insert`] for configuring cache writes.
@@ -160,7 +203,7 @@ impl<'a> Insert<'a> {
         self
     }
 
-    async fn run(self) {
+    async fn run(self) -> Result<(), CacheFull> {
         let batch = if self.skip_gc {
             self.batch.clone()
         } else {
@@ -170,13 +213,13 @@ impl<'a> Insert<'a> {
             self.storage.add_squeeze_hint(&self.entry_id, squeeze_hint);
         }
         let batch = CacheEntry::memory_arrow(batch);
-        self.storage.insert_inner(self.entry_id, batch).await;
+        self.storage.insert_inner(self.entry_id, batch).await
     }
 }
 
 impl<'a> IntoFuture for Insert<'a> {
-    type Output = ();
-    type IntoFuture = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+    type Output = Result<(), CacheFull>;
+    type IntoFuture = Pin<Box<dyn Future<Output = Result<(), CacheFull>> + Send + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move { self.run().await })
@@ -409,7 +452,7 @@ mod tests {
 
         let cache = LiquidCacheBuilder::new().build().await;
         let entry_id = EntryID::from(123usize);
-        cache.insert(entry_id, root.clone()).await;
+        cache.insert(entry_id, root.clone()).await.unwrap();
 
         let stored = cache.get(&entry_id).await.expect("array present");
         let post_size = stored.get_array_memory_size();

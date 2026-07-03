@@ -26,7 +26,7 @@ entries.memory.liquid: 1
 entries.memory.squeezed_liquid: 0
 entries.disk.liquid: 2
 entries.disk.arrow: 0
-usage.memory_bytes: 949843
+usage.memory_bytes: 1000915
 usage.disk_bytes: 35000
 RuntimeStatsSnapshot:
   get: 4
@@ -38,6 +38,8 @@ RuntimeStatsSnapshot:
   hit_date32_expression_calls: 0
   read_io_count: 0
   write_io_count: 0
+  disk_evictions: 0
+  disk_reservation_failures: 0
   eval_predicate_on_liquid_failed: 0
   squeezed_decompressed_count: 0
   squeezed_total_count: 0
@@ -169,7 +171,7 @@ entries.memory.liquid: 1
 entries.memory.squeezed_liquid: 0
 entries.disk.liquid: 2
 entries.disk.arrow: 0
-usage.memory_bytes: 949843
+usage.memory_bytes: 1000915
 usage.disk_bytes: 35000
 RuntimeStatsSnapshot:
   get: 5
@@ -181,6 +183,8 @@ RuntimeStatsSnapshot:
   hit_date32_expression_calls: 0
   read_io_count: 0
   write_io_count: 0
+  disk_evictions: 0
+  disk_reservation_failures: 0
   eval_predicate_on_liquid_failed: 0
   squeezed_decompressed_count: 0
   squeezed_total_count: 0
@@ -213,7 +217,7 @@ entries.memory.liquid: 3
 entries.memory.squeezed_liquid: 0
 entries.disk.liquid: 0
 entries.disk.arrow: 0
-usage.memory_bytes: 985232
+usage.memory_bytes: 1036304
 usage.disk_bytes: 35000
 RuntimeStatsSnapshot:
   get: 4
@@ -225,6 +229,8 @@ RuntimeStatsSnapshot:
   hit_date32_expression_calls: 0
   read_io_count: 0
   write_io_count: 0
+  disk_evictions: 0
+  disk_reservation_failures: 0
   eval_predicate_on_liquid_failed: 0
   squeezed_decompressed_count: 0
   squeezed_total_count: 0

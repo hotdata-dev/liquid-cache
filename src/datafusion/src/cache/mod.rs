@@ -1,7 +1,7 @@
 //! This module contains the cache implementation for the Parquet reader.
 //!
 
-use crate::io::ParquetIoContext;
+use crate::io::ParquetCacheMetadata;
 use crate::reader::{LiquidPredicate, extract_multi_column_or};
 use crate::sync::Mutex;
 use ahash::AHashMap;
@@ -10,9 +10,10 @@ use arrow::buffer::BooleanBuffer;
 use arrow_schema::{ArrowError, Field, Schema, SchemaRef};
 use liquid_cache::cache::squeeze_policies::SqueezePolicy;
 use liquid_cache::cache::{
-    CachePolicy, EventTrace, HydrationPolicy, LiquidCache, LiquidCacheBuilder,
+    CacheExpression, CachePolicy, EventTrace, HydrationPolicy, LiquidCache, LiquidCacheBuilder,
 };
 use parquet::arrow::arrow_reader::ArrowPredicate;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -25,6 +26,16 @@ pub(crate) use column::InsertArrowArrayError;
 pub use column::{CachedColumn, CachedColumnRef};
 pub(crate) use id::ColumnAccessPath;
 pub use id::{BatchID, ParquetArrayID};
+
+/// Typed squeeze hints for a single file, keyed by file-schema column name.
+///
+/// Produced by the physical squeeze-hint analyzer (local mode) or shipped from
+/// the client (Flight mode), and attached to the
+/// [`LiquidParquetSource`](crate::LiquidParquetSource) that opens the file.
+pub type ColumnSqueezeHints = HashMap<String, Arc<CacheExpression>>;
+
+/// One column of a row group: (file column index, field, squeeze hint, is-predicate).
+type CachedColumnSpec = (u64, Arc<Field>, Option<Arc<CacheExpression>>, bool);
 
 #[derive(Default, Debug)]
 struct ColumnMaps {
@@ -48,15 +59,16 @@ impl CachedRowGroup {
         cache_store: Arc<LiquidCache>,
         row_group_idx: u64,
         file_idx: u64,
-        columns: &[(u64, Arc<Field>, bool)],
+        columns: &[CachedColumnSpec],
     ) -> Self {
         let mut column_maps = ColumnMaps::default();
-        for (column_id, field, is_predicate_column) in columns {
+        for (column_id, field, expression, is_predicate_column) in columns {
             let column_access_path = ColumnAccessPath::new(file_idx, row_group_idx, *column_id);
             let column = Arc::new(CachedColumn::new(
                 Arc::clone(field),
                 Arc::clone(&cache_store),
                 column_access_path,
+                expression.clone(),
                 *is_predicate_column,
             ));
             column_maps.by_id.insert(*column_id, column.clone());
@@ -175,14 +187,21 @@ pub struct CachedFile {
     cache_store: Arc<LiquidCache>,
     file_id: u64,
     file_schema: SchemaRef,
+    squeeze_hints: Arc<ColumnSqueezeHints>,
 }
 
 impl CachedFile {
-    fn new(cache_store: Arc<LiquidCache>, file_id: u64, file_schema: SchemaRef) -> Self {
+    fn new(
+        cache_store: Arc<LiquidCache>,
+        file_id: u64,
+        file_schema: SchemaRef,
+        squeeze_hints: Arc<ColumnSqueezeHints>,
+    ) -> Self {
         Self {
             cache_store,
             file_id,
             file_schema,
+            squeeze_hints,
         }
     }
 
@@ -192,14 +211,20 @@ impl CachedFile {
         row_group_id: u64,
         predicate_column_ids: Vec<usize>,
     ) -> CachedRowGroupRef {
-        let columns: Vec<(u64, Arc<Field>, bool)> = self
+        let columns: Vec<CachedColumnSpec> = self
             .file_schema
             .fields()
             .iter()
             .enumerate()
             .map(|(idx, field)| {
                 let is_predicate_column = predicate_column_ids.contains(&idx);
-                (idx as u64, Arc::clone(field), is_predicate_column)
+                let expression = self.squeeze_hints.get(field.name()).cloned();
+                (
+                    idx as u64,
+                    Arc::clone(field),
+                    expression,
+                    is_predicate_column,
+                )
             })
             .collect();
 
@@ -243,21 +268,51 @@ impl LiquidCacheParquet {
     /// Create a new cache for parquet files.
     pub async fn new(
         batch_size: usize,
-        max_cache_bytes: usize,
+        max_memory_bytes: usize,
+        max_disk_bytes: usize,
         store: t4::Store,
         cache_policy: Box<dyn CachePolicy>,
         squeeze_policy: Box<dyn SqueezePolicy>,
         hydration_policy: Box<dyn HydrationPolicy>,
     ) -> Self {
+        Self::new_with_squeeze_victim_concurrency(
+            batch_size,
+            max_memory_bytes,
+            max_disk_bytes,
+            store,
+            cache_policy,
+            squeeze_policy,
+            hydration_policy,
+            !cfg!(test),
+        )
+        .await
+    }
+
+    /// Create a new cache for parquet files with explicit victim squeeze concurrency.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn new_with_squeeze_victim_concurrency(
+        batch_size: usize,
+        max_memory_bytes: usize,
+        max_disk_bytes: usize,
+        store: t4::Store,
+        cache_policy: Box<dyn CachePolicy>,
+        squeeze_policy: Box<dyn SqueezePolicy>,
+        hydration_policy: Box<dyn HydrationPolicy>,
+        squeeze_victims_concurrently: bool,
+    ) -> Self {
         assert!(batch_size.is_power_of_two());
-        let io_context = Arc::new(ParquetIoContext::new(store));
+        let metadata = Arc::new(ParquetCacheMetadata::new());
         let cache_storage = LiquidCacheBuilder::new()
             .with_batch_size(batch_size)
-            .with_max_cache_bytes(max_cache_bytes)
+            .with_max_memory_bytes(max_memory_bytes)
+            .with_max_disk_bytes(max_disk_bytes)
             .with_squeeze_policy(squeeze_policy)
             .with_cache_policy(cache_policy)
             .with_hydration_policy(hydration_policy)
-            .with_io_context(io_context)
+            .with_metadata(metadata)
+            .with_store(store)
+            .with_squeeze_victims_concurrently(squeeze_victims_concurrently)
             .build()
             .await;
 
@@ -274,6 +329,17 @@ impl LiquidCacheParquet {
         file_path: String,
         full_file_schema: SchemaRef,
     ) -> CachedFileRef {
+        self.register_or_get_file_with_hints(file_path, full_file_schema, Arc::default())
+    }
+
+    /// Register a file in the cache, attaching typed squeeze hints derived from
+    /// the query plan (keyed by file-schema column name).
+    pub fn register_or_get_file_with_hints(
+        &self,
+        file_path: String,
+        full_file_schema: SchemaRef,
+        squeeze_hints: Arc<ColumnSqueezeHints>,
+    ) -> CachedFileRef {
         let mut files = self.files.lock().unwrap();
         let file_id = *files
             .entry(file_path.clone())
@@ -284,6 +350,7 @@ impl LiquidCacheParquet {
             self.cache_store.clone(),
             file_id,
             full_file_schema,
+            squeeze_hints,
         ))
     }
 
@@ -292,9 +359,14 @@ impl LiquidCacheParquet {
         self.cache_store.config().batch_size()
     }
 
-    /// Get the max cache bytes of the cache.
-    pub fn max_cache_bytes(&self) -> usize {
-        self.cache_store.config().max_cache_bytes()
+    /// Get the max memory bytes of the cache.
+    pub fn max_memory_bytes(&self) -> usize {
+        self.cache_store.config().max_memory_bytes()
+    }
+
+    /// Get the max disk bytes of the cache.
+    pub fn max_disk_bytes(&self) -> usize {
+        self.cache_store.config().max_disk_bytes()
     }
 
     /// Get the memory usage of the cache in bytes.
@@ -340,8 +412,8 @@ impl LiquidCacheParquet {
     /// This is for admin use only.
     /// This has no guarantees that some new entry will not be inserted in the meantime, or some entries are promoted to memory again.
     /// You mostly want to use this when no one else is using the cache.
-    pub async fn flush_data(&self) {
-        self.cache_store.flush_all_to_disk().await;
+    pub async fn flush_data(&self) -> Result<(), liquid_cache::cache::CacheFull> {
+        self.cache_store.flush_all_to_disk().await
     }
 
     /// Get the storage of the cache.
@@ -383,6 +455,7 @@ mod tests {
             .unwrap();
         let cache = LiquidCacheParquet::new(
             batch_size,
+            usize::MAX,
             usize::MAX,
             store,
             Box::new(LiquidPolicy::new()),

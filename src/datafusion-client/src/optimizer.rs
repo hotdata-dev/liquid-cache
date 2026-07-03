@@ -7,6 +7,8 @@ use datafusion::{
     physical_plan::aggregates::AggregateMode, physical_plan::repartition::RepartitionExec,
 };
 
+use liquid_cache_datafusion::optimizers::SqueezeHintMap;
+
 use crate::client_exec::LiquidCacheClientExec;
 
 /// PushdownOptimizer is a physical optimizer rule that pushes down filters to the liquid cache server.
@@ -37,13 +39,13 @@ impl PushdownOptimizer {
     }
 
     /// Apply the optimization by finding nodes to push down and wrapping them
-    fn optimize_plan(&self, plan: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {
+    fn optimize_plan(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        hints: &SqueezeHintMap,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
         // If this node is already a LiquidCacheClientExec, return it as is
-        if plan
-            .as_any()
-            .downcast_ref::<LiquidCacheClientExec>()
-            .is_some()
-        {
+        if plan.is::<LiquidCacheClientExec>() {
             return Ok(plan);
         }
 
@@ -51,10 +53,16 @@ impl PushdownOptimizer {
         if let Some(candidate) = find_pushdown_candidate(&plan) {
             // If the current node is the one to be pushed down, wrap it
             if Arc::ptr_eq(&plan, &candidate) {
+                // The fragment is single-scan; collect that scan's squeeze
+                // hints (derived from the full plan, which includes the
+                // client-side projections that won't be shipped) so the server
+                // can apply them when it rebuilds the LiquidParquetSource.
+                let squeeze_hints = hints.for_fragment(&plan);
                 return Ok(Arc::new(LiquidCacheClientExec::new(
                     plan,
                     self.cache_server.clone(),
                     self.object_stores.clone(),
+                    squeeze_hints,
                 )));
             }
         }
@@ -64,7 +72,7 @@ impl PushdownOptimizer {
         let mut children_changed = false;
 
         for child in plan.children() {
-            let new_child = self.optimize_plan(child.clone())?;
+            let new_child = self.optimize_plan(child.clone(), hints)?;
             if !Arc::ptr_eq(child, &new_child) {
                 children_changed = true;
             }
@@ -83,48 +91,39 @@ impl PushdownOptimizer {
 /// Find the highest pushable node
 fn find_pushdown_candidate(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
     // Check if this node is already a LiquidCacheClientExec to avoid redundant wrapping
-    if plan
-        .as_any()
-        .downcast_ref::<LiquidCacheClientExec>()
-        .is_some()
-    {
+    if plan.is::<LiquidCacheClientExec>() {
         return None;
     }
 
-    let plan_any = plan.as_any();
-
     // If we have an AggregateExec (partial, no group by) with a pushable child (direct or through RepartitionExec), push it down
-    if let Some(agg_exec) = plan_any.downcast_ref::<AggregateExec>()
+    if let Some(agg_exec) = plan.downcast_ref::<AggregateExec>()
         && matches!(agg_exec.mode(), AggregateMode::Partial)
         && agg_exec.group_expr().is_empty()
     {
         let child = agg_exec.input();
 
         // Check if child is DataSourceExec or RepartitionExec->DataSourceExec
-        if child.as_any().downcast_ref::<DataSourceExec>().is_some() {
+        if child.is::<DataSourceExec>() {
             return Some(plan.clone());
         }
-        if let Some(repart) = child.as_any().downcast_ref::<RepartitionExec>()
+        if let Some(repart) = child.downcast_ref::<RepartitionExec>()
             && let Some(repart_child) = repart.children().first()
-            && repart_child
-                .as_any()
-                .downcast_ref::<DataSourceExec>()
-                .is_some()
+            && repart_child.is::<DataSourceExec>()
         {
             return Some(plan.clone());
         }
     }
 
     // If we have a RepartitionExec with a DataSourceExec child, push it down
-    if let Some(repart_exec) = plan_any.downcast_ref::<RepartitionExec>()
+    if let Some(repart_exec) = plan.downcast_ref::<RepartitionExec>()
         && let Some(child) = repart_exec.children().first()
-        && child.as_any().downcast_ref::<DataSourceExec>().is_some()
+        && child.is::<DataSourceExec>()
     {
         return Some(plan.clone());
     }
 
     // If this is a DataSourceExec, push it down
-    if plan_any.downcast_ref::<DataSourceExec>().is_some() {
+    if plan.is::<DataSourceExec>() {
         return Some(plan.clone());
     }
 
@@ -144,7 +143,12 @@ impl PhysicalOptimizerRule for PushdownOptimizer {
         plan: Arc<dyn ExecutionPlan>,
         _config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        self.optimize_plan(plan)
+        // Derive squeeze hints from the full physical plan up front: the
+        // lineage that justifies a hint (e.g. a `date_part` projection) often
+        // lives above the node we push down, so it must be captured before the
+        // plan is split into fragments.
+        let hints = SqueezeHintMap::analyze(&plan);
+        self.optimize_plan(plan, &hints)
     }
 
     fn name(&self) -> &str {

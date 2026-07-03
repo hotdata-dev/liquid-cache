@@ -13,13 +13,13 @@ pub mod policies;
 mod transcode;
 mod utils;
 
-pub use builders::{EvaluatePredicate, Get, Insert, LiquidCacheBuilder};
+pub use builders::{EvaluatePredicate, Get, Insert, LiquidCacheBuilder, default_max_memory_bytes};
 pub use cached_batch::{CacheEntry, CachedBatchType};
 pub use core::LiquidCache;
 pub use expressions::{CacheExpression, VariantRequest};
 #[cfg(test)]
 pub(crate) use io_context::TestSqueezeIo;
-pub use io_context::{DefaultIoContext, DefaultSqueezeIo, IoContext};
+pub use io_context::{DefaultCacheMetadata, DefaultSqueezeIo, EntryMetadata};
 pub use liquid_expr::LiquidExpr;
 pub use observer::EventTrace;
 pub use observer::Observer;
@@ -30,6 +30,10 @@ pub use policies::{
 };
 pub use transcode::{transcode_liquid_inner, transcode_liquid_inner_with_hint};
 pub use utils::{EntryID, LiquidCompressorStates};
+
+/// The cache could not reserve enough disk budget for a write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheFull;
 
 // Backwards-compatible module paths for existing imports.
 /// Legacy path: re-export cache policy types under `cache::cache_policies`.
