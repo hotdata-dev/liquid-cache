@@ -23,7 +23,7 @@ use crate::liquid_array::raw::BitPackedArray;
 use super::primitive_array::LiquidPrimitiveType;
 use super::{
     LiquidDataType, LiquidSqueezedArray, NeedsBacking, Operator, PrimitiveKind, SqueezeIoHandler,
-    SqueezeResult,
+    SqueezeResult, SqueezedBacking,
 };
 
 #[derive(Clone, Copy)]
@@ -33,7 +33,7 @@ enum PredicateLhs {
 }
 
 fn unwrap_dynamic_filter(expr: &Arc<dyn PhysicalExpr>) -> Option<Arc<dyn PhysicalExpr>> {
-    if let Some(dynamic_filter) = expr.as_any().downcast_ref::<DynamicFilterPhysicalExpr>() {
+    if let Some(dynamic_filter) = expr.downcast_ref::<DynamicFilterPhysicalExpr>() {
         dynamic_filter.current().ok()
     } else {
         Some(expr.clone())
@@ -41,13 +41,13 @@ fn unwrap_dynamic_filter(expr: &Arc<dyn PhysicalExpr>) -> Option<Arc<dyn Physica
 }
 
 fn predicate_lhs_kind(expr: &Arc<dyn PhysicalExpr>) -> Option<PredicateLhs> {
-    if expr.as_any().downcast_ref::<Column>().is_some() {
+    if expr.is::<Column>() {
         return Some(PredicateLhs::Plain);
     }
-    if let Some(func) = expr.as_any().downcast_ref::<ScalarFunctionExpr>()
+    if let Some(func) = expr.downcast_ref::<ScalarFunctionExpr>()
         && func.name() == "to_timestamp_seconds"
         && let [arg] = func.args()
-        && arg.as_any().downcast_ref::<Column>().is_some()
+        && arg.is::<Column>()
     {
         return Some(PredicateLhs::ToTimestampSeconds);
     }
@@ -317,6 +317,10 @@ where
         T::DATA_TYPE.clone()
     }
 
+    fn disk_backing(&self) -> SqueezedBacking {
+        SqueezedBacking::Liquid((self.disk_range.end - self.disk_range.start) as usize)
+    }
+
     async fn filter(&self, selection: &BooleanBuffer) -> ArrayRef {
         if selection.count_set_bits() == 0 {
             return arrow::array::new_empty_array(&self.original_arrow_data_type());
@@ -344,7 +348,7 @@ where
             let fallback = self.filter(filter).await;
             return eval_predicate_on_array(fallback, liquid_expr);
         };
-        let Some(binary_expr) = expr.as_any().downcast_ref::<BinaryExpr>() else {
+        let Some(binary_expr) = expr.downcast_ref::<BinaryExpr>() else {
             let fallback = self.filter(filter).await;
             return eval_predicate_on_array(fallback, liquid_expr);
         };
@@ -352,7 +356,7 @@ where
             let fallback = self.filter(filter).await;
             return eval_predicate_on_array(fallback, liquid_expr);
         };
-        let Some(literal) = binary_expr.right().as_any().downcast_ref::<Literal>() else {
+        let Some(literal) = binary_expr.right().downcast_ref::<Literal>() else {
             let fallback = self.filter(filter).await;
             return eval_predicate_on_array(fallback, liquid_expr);
         };
@@ -689,6 +693,10 @@ where
         T::DATA_TYPE.clone()
     }
 
+    fn disk_backing(&self) -> SqueezedBacking {
+        SqueezedBacking::Liquid((self.disk_range.end - self.disk_range.start) as usize)
+    }
+
     async fn try_eval_predicate(
         &self,
         liquid_expr: &LiquidExpr,
@@ -703,7 +711,7 @@ where
             let fallback = self.filter(filter).await;
             return eval_predicate_on_array(fallback, liquid_expr);
         };
-        let Some(binary_expr) = expr.as_any().downcast_ref::<BinaryExpr>() else {
+        let Some(binary_expr) = expr.downcast_ref::<BinaryExpr>() else {
             let fallback = self.filter(filter).await;
             return eval_predicate_on_array(fallback, liquid_expr);
         };
@@ -711,7 +719,7 @@ where
             let fallback = self.filter(filter).await;
             return eval_predicate_on_array(fallback, liquid_expr);
         };
-        let Some(literal) = binary_expr.right().as_any().downcast_ref::<Literal>() else {
+        let Some(literal) = binary_expr.right().downcast_ref::<Literal>() else {
             let fallback = self.filter(filter).await;
             return eval_predicate_on_array(fallback, liquid_expr);
         };

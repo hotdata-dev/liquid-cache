@@ -10,13 +10,12 @@ use datafusion::logical_expr::Operator;
 use datafusion::prelude::*;
 use datafusion::scalar::ScalarValue;
 use futures::StreamExt;
-use liquid_cache::cache::DefaultIoContext;
 use liquid_cache::cache::EntryID;
 use liquid_cache::cache::LiquidCache;
 use liquid_cache::cache::LiquidCacheBuilder;
 use liquid_cache::cache::LiquidExpr;
+use liquid_cache::cache::LiquidPolicy;
 use liquid_cache::cache::squeeze_policies::TranscodeSqueezeEvict;
-use liquid_cache::cache_policies::FiloPolicy;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -48,13 +47,12 @@ fn main() {
         .unwrap_or_else(|| tempfile::tempdir().unwrap().keep());
     let store_path = cache_dir.join("liquid_cache.t4");
     let store = tokio_test::block_on(t4::mount(&store_path)).expect("failed to mount t4 store");
-    let io_context = Arc::new(DefaultIoContext::new(store));
     let storage = tokio_test::block_on(async {
         LiquidCacheBuilder::new()
-            .with_max_cache_bytes(500 * 1024 * 1024)
+            .with_max_memory_bytes(500 * 1024 * 1024)
             .with_squeeze_policy(Box::new(TranscodeSqueezeEvict))
-            .with_cache_policy(Box::new(FiloPolicy::new()))
-            .with_io_context(io_context)
+            .with_cache_policy(Box::new(LiquidPolicy::new()))
+            .with_store(store)
             .build()
             .await
     });
@@ -146,7 +144,7 @@ fn load_and_insert_referer(
             let id = EntryID::from(idx);
             ids.push(id);
             total_size += array.get_array_memory_size();
-            storage.insert(id, array).await;
+            storage.insert(id, array).await.unwrap();
             idx += 1;
         }
 

@@ -35,8 +35,9 @@ use datafusion::{
 use datafusion_proto::bytes::physical_plan_from_bytes;
 use fastrace::prelude::SpanContext;
 use futures::{Stream, TryStreamExt};
+use liquid_cache::cache::CacheExpression;
 use liquid_cache_common::rpc::{FetchResults, LiquidCacheActions};
-use liquid_cache_datafusion::cache::LiquidCacheParquetRef;
+use liquid_cache_datafusion::cache::{ColumnSqueezeHints, LiquidCacheParquetRef};
 use log::info;
 use prost::bytes::Bytes;
 use service::LiquidCacheServiceInner;
@@ -124,11 +125,11 @@ impl LiquidCacheService {
     /// # Arguments
     ///
     /// * `ctx` - The [SessionContext] to use
-    /// * `max_cache_bytes` - The maximum number of bytes to cache in memory
+    /// * `max_memory_bytes` - The maximum number of bytes to cache in memory
     /// * `disk_cache_dir` - The directory to store the disk cache
     pub async fn new(
         ctx: SessionContext,
-        max_cache_bytes: Option<usize>,
+        max_memory_bytes: Option<usize>,
         disk_cache_dir: Option<PathBuf>,
         cache_policy: Box<dyn CachePolicy>,
         squeeze_policy: Box<dyn SqueezePolicy>,
@@ -145,7 +146,7 @@ impl LiquidCacheService {
         Ok(Self {
             inner: LiquidCacheServiceInner::new(
                 Arc::new(ctx),
-                max_cache_bytes,
+                max_memory_bytes,
                 disk_cache_dir,
                 cache_policy,
                 squeeze_policy,
@@ -249,10 +250,15 @@ impl LiquidCacheService {
                 Ok(Response::new(Box::pin(output)))
             }
             LiquidCacheActions::RegisterPlan(cmd) => {
-                let plan = cmd.plan;
-                let plan = physical_plan_from_bytes(&plan, &self.inner.get_ctx().task_ctx())?;
+                let plan = physical_plan_from_bytes(&cmd.plan, &self.inner.get_ctx().task_ctx())?;
                 let handle = Uuid::from_bytes_ref(cmd.handle.as_ref().try_into()?);
-                self.inner.register_plan(*handle, plan);
+                let mut squeeze_hints = ColumnSqueezeHints::default();
+                for hint in &cmd.squeeze_hints {
+                    if let Some(expr) = CacheExpression::from_metadata_value(&hint.hint) {
+                        squeeze_hints.insert(hint.column.clone(), Arc::new(expr));
+                    }
+                }
+                self.inner.register_plan(*handle, plan, squeeze_hints);
                 let output = futures::stream::iter(vec![Ok(arrow_flight::Result {
                     body: Bytes::default(),
                 })]);

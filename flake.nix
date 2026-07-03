@@ -5,14 +5,12 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     rust-overlay.url = "github:oxalica/rust-overlay";
     flake-utils.url = "github:numtide/flake-utils";
-    crane.url = "github:ipetkov/crane";
   };
 
   outputs =
     { nixpkgs
     , rust-overlay
     , flake-utils
-    , crane
     , ...
     }:
     flake-utils.lib.eachDefaultSystem (
@@ -22,26 +20,14 @@
         pkgs = import nixpkgs {
           inherit system overlays;
         };
-        craneLib = crane.mkLib pkgs;
-        kaniVerifier = craneLib.buildPackage {
-          pname = "kani-verifier";
-          version = "0.67.0";
-          src = craneLib.downloadCargoPackage {
-            name = "kani-verifier";
-            version = "0.67.0";
-            source = "registry+https://github.com/rust-lang/crates.io-index";
-            checksum = "sha256-1iJafsEwN+mE9r692jPTQ5DmQ6HNKkUiy11ejm7YXis=";
-          };
-          doCheck = false;
-        };
         # Fetch daisyUI bundle files
         daisyui-bundle = pkgs.fetchurl {
-          url = "https://github.com/saadeghi/daisyui/releases/latest/download/daisyui.mjs";
-          sha256 = "sha256-dH6epo+aSV+eeh3uQbxd7MkWlG+6hCaGaknQ4Bnljj4=";
+          url = "https://github.com/saadeghi/daisyui/releases/download/v5.5.19/daisyui.mjs";
+          sha256 = "sha256-X+Q/9eg8XPUZzMMtdqoagu1r/FDuPm9dxgB+6mI5rx8=";
         };
         daisyui-theme-bundle = pkgs.fetchurl {
-          url = "https://github.com/saadeghi/daisyui/releases/latest/download/daisyui-theme.mjs";
-          sha256 = "sha256-iiUODarjHRxAD+tyOPh95xhHJELC40oczt+dsDo86yE=";
+          url = "https://github.com/saadeghi/daisyui/releases/download/v5.5.19/daisyui-theme.mjs";
+          sha256 = "sha256-tAcb7y5ZvYNQllnB5ybMGXBKH9FP8uVtR5vBampT8m0=";
         };
       in
       {
@@ -52,7 +38,6 @@
               pkg-config
               eza
               fd
-              kaniVerifier
               llvmPackages.bintools
               lldb
               cargo-fuzz
@@ -64,7 +49,7 @@
               nodejs
               tailwindcss_4
               dioxus-cli
-              wasm-bindgen-cli_0_2_108
+              wasm-bindgen-cli_0_2_118
               binaryen
               (rust-bin.selectLatestNightlyWith (toolchain: toolchain.default.override {
                 extensions = [ "rust-src" "llvm-tools-preview" ];

@@ -37,7 +37,7 @@ async fn general_test(sql: &str) -> CacheStatsSummary {
 
     // Set up the session context with liquid cache
     let lc_builder = LiquidCacheLocalBuilder::new()
-        .with_max_cache_bytes(1024 * 1024)
+        .with_max_memory_bytes(1024 * 1024)
         .with_cache_dir(cache_dir.path().to_path_buf())
         .with_squeeze_policy(Box::new(TranscodeSqueezeEvict))
         .with_cache_policy(Box::new(liquid_cache::cache_policies::LiquidPolicy::new()));
@@ -97,26 +97,26 @@ async fn general_test(sql: &str) -> CacheStatsSummary {
 async fn test_date_extraction() {
     let sql = r#"select AVG(EXTRACT(YEAR from date_a)) as year from test_table"#;
     let stats = general_test(sql).await;
-    assert_eq!(stats.stats.runtime.hit_date32_expression_calls, 81);
+    assert_eq!(stats.stats.runtime.hit_date32_expression_calls, 86);
 }
 
 #[tokio::test]
 async fn date_extraction_month() {
     let sql = r#"select AVG(EXTRACT(MONTH from date_a)) as month from test_table"#;
     let stats = general_test(sql).await;
-    assert_eq!(stats.stats.runtime.hit_date32_expression_calls, 73);
+    assert_eq!(stats.stats.runtime.hit_date32_expression_calls, 78);
 }
 
 #[tokio::test]
 async fn date_extraction_day() {
     let sql = r#"select AVG(EXTRACT(DAY from date_a)) as day from test_table"#;
     let stats = general_test(sql).await;
-    assert_eq!(stats.stats.runtime.hit_date32_expression_calls, 81);
+    assert_eq!(stats.stats.runtime.hit_date32_expression_calls, 86);
 }
 
 #[tokio::test]
 async fn test_date_extraction_case2() {
     let sql = r#"select AVG(EXTRACT(YEAR from date_a) + 1) as year, (SELECT MAX(EXTRACT(YEAR from date_a)) FROM test_table) as max_year from test_table"#;
     let stats = general_test(sql).await;
-    assert_eq!(stats.stats.runtime.hit_date32_expression_calls, 162); // we know this.
+    assert_eq!(stats.stats.runtime.hit_date32_expression_calls, 172); // we know this.
 }

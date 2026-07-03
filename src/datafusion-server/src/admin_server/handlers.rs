@@ -121,7 +121,7 @@ pub(crate) async fn get_parquet_cache_usage_handler(
 #[derive(Serialize)]
 pub(crate) struct CacheInfo {
     batch_size: usize,
-    max_cache_bytes: u64,
+    max_memory_bytes: u64,
     memory_usage_bytes: u64,
     disk_usage_bytes: u64,
 }
@@ -130,12 +130,12 @@ pub(crate) async fn get_cache_info_handler(State(state): State<Arc<AppState>>) -
     info!("Getting cache info...");
     let cache = state.liquid_cache.cache();
     let batch_size = cache.batch_size();
-    let max_cache_bytes = cache.max_cache_bytes() as u64;
+    let max_memory_bytes = cache.max_memory_bytes() as u64;
     let memory_usage_bytes = cache.memory_usage_bytes() as u64;
     let disk_usage_bytes = cache.disk_usage_bytes() as u64;
     Json(CacheInfo {
         batch_size,
-        max_cache_bytes,
+        max_memory_bytes,
         memory_usage_bytes,
         disk_usage_bytes,
     })
@@ -403,17 +403,15 @@ impl From<&Arc<dyn ExecutionPlan>> for ExecutionPlanWithStats {
 fn get_liquid_exec_info(plan: &Arc<dyn ExecutionPlan>) -> Option<String> {
     let mut rv = None;
     plan.apply(|node| {
-        let Some(data_source) = node.as_any().downcast_ref::<DataSourceExec>() else {
+        let Some(data_source) = node.downcast_ref::<DataSourceExec>() else {
             return Ok(TreeNodeRecursion::Continue);
         };
         let file_scan_config = data_source
             .data_source()
-            .as_any()
             .downcast_ref::<FileScanConfig>()
             .expect("FileScanConfig not found");
         let Some(liquid_source) = file_scan_config
             .file_source()
-            .as_any()
             .downcast_ref::<LiquidParquetSource>()
         else {
             return Ok(TreeNodeRecursion::Continue);

@@ -36,7 +36,7 @@ use crate::liquid_array::ipc::{PhysicalTypeMarker, get_physical_type_id};
 use crate::liquid_array::raw::BitPackedArray;
 use crate::liquid_array::{
     LiquidSqueezedArray, LiquidSqueezedArrayRef, NeedsBacking, Operator, SqueezeResult,
-    eval_predicate_on_array, ipc::LiquidIPCHeader,
+    SqueezedBacking, eval_predicate_on_array, ipc::LiquidIPCHeader,
 };
 use crate::utils::get_bit_width;
 use crate::{cache::CacheExpression, liquid_array::SqueezeIoHandler};
@@ -985,6 +985,10 @@ where
         T::DATA_TYPE.clone()
     }
 
+    fn disk_backing(&self) -> SqueezedBacking {
+        SqueezedBacking::Liquid((self.disk_range.end - self.disk_range.start) as usize)
+    }
+
     async fn try_eval_predicate(
         &self,
         liquid_expr: &LiquidExpr,
@@ -994,8 +998,8 @@ where
         let filtered = self.filter_inner(filter);
         let expr = liquid_expr.physical_expr();
 
-        if let Some(binary_expr) = expr.as_any().downcast_ref::<BinaryExpr>()
-            && let Some(literal) = binary_expr.right().as_any().downcast_ref::<Literal>()
+        if let Some(binary_expr) = expr.downcast_ref::<BinaryExpr>()
+            && let Some(literal) = binary_expr.right().downcast_ref::<Literal>()
         {
             let op = binary_expr.op();
             let supported_op = Operator::from_datafusion(op);

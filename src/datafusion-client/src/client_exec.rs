@@ -2,14 +2,21 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
-use std::{any::Any, fmt::Formatter, sync::Arc};
+use std::{fmt::Formatter, sync::Arc};
 
 use arrow::array::RecordBatch;
 use arrow_flight::decode::FlightRecordBatchStream;
 use arrow_flight::flight_service_client::FlightServiceClient;
-use arrow_schema::SchemaRef;
+use arrow_schema::{Schema, SchemaRef};
+use datafusion::catalog::memory::DataSourceExec;
+use datafusion::common::internal_err;
+use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::config::ConfigOptions;
+use datafusion::datasource::physical_plan::{FileSource, ParquetSource};
 use datafusion::execution::object_store::ObjectStoreUrl;
+use datafusion::logical_expr::ColumnarValue;
+use datafusion::physical_expr::expressions::Literal;
+use datafusion::physical_expr::scalar_subquery::ScalarSubqueryExpr;
 use datafusion::physical_expr_adapter::{BatchAdapter, BatchAdapterFactory};
 use datafusion::physical_plan::execution_plan::CardinalityEffect;
 use datafusion::physical_plan::filter_pushdown::{
@@ -30,8 +37,10 @@ use fastrace::future::FutureExt;
 use fastrace::prelude::*;
 use futures::{Stream, TryStreamExt, future::BoxFuture, ready};
 use liquid_cache_common::rpc::{
-    FetchResults, LiquidCacheActions, RegisterObjectStoreRequest, RegisterPlanRequest,
+    ColumnSqueezeHint, FetchResults, LiquidCacheActions, RegisterObjectStoreRequest,
+    RegisterPlanRequest,
 };
+use liquid_cache_datafusion::cache::ColumnSqueezeHints;
 use tonic::Request;
 use uuid::Uuid;
 
@@ -54,6 +63,9 @@ pub struct LiquidCacheClientExec {
     uuid: Uuid,
     plan_registered: Arc<AtomicUsize>,
     properties: Arc<PlanProperties>,
+    /// Typed squeeze hints for the scan in `remote_plan`, derived by the client
+    /// from the full physical plan and shipped to the cache server.
+    squeeze_hints: ColumnSqueezeHints,
 }
 
 impl std::fmt::Debug for LiquidCacheClientExec {
@@ -67,6 +79,7 @@ impl LiquidCacheClientExec {
         remote_plan: Arc<dyn ExecutionPlan>,
         cache_server: String,
         object_stores: Vec<(ObjectStoreUrl, HashMap<String, String>)>,
+        squeeze_hints: ColumnSqueezeHints,
     ) -> Self {
         let properties = Arc::new(PlanProperties::new(
             remote_plan.equivalence_properties().clone(), // Equivalence Properties
@@ -83,6 +96,7 @@ impl LiquidCacheClientExec {
             uuid,
             metrics: ExecutionPlanMetricsSet::new(),
             properties,
+            squeeze_hints,
         }
     }
 
@@ -114,10 +128,6 @@ impl DisplayAs for LiquidCacheClientExec {
 }
 
 impl ExecutionPlan for LiquidCacheClientExec {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "LiquidCacheClientExec"
     }
@@ -142,6 +152,7 @@ impl ExecutionPlan for LiquidCacheClientExec {
             metrics: self.metrics.clone(),
             uuid: self.uuid,
             properties: self.properties.clone(),
+            squeeze_hints: self.squeeze_hints.clone(),
         }))
     }
 
@@ -168,6 +179,7 @@ impl ExecutionPlan for LiquidCacheClientExec {
             self.uuid,
             partition,
             self.object_stores.clone(),
+            squeeze_hints_to_wire(&self.squeeze_hints),
         );
         Ok(Box::pin(FlightStream::new(
             Some(Box::pin(stream)),
@@ -224,6 +236,17 @@ impl ExecutionPlan for LiquidCacheClientExec {
     }
 }
 
+/// Convert typed squeeze hints into their wire form (canonical string encoding).
+fn squeeze_hints_to_wire(hints: &ColumnSqueezeHints) -> Vec<ColumnSqueezeHint> {
+    hints
+        .iter()
+        .map(|(column, expr)| ColumnSqueezeHint {
+            column: column.clone(),
+            hint: expr.to_metadata_value(),
+        })
+        .collect()
+}
+
 async fn flight_stream(
     server: String,
     plan: Arc<dyn ExecutionPlan>,
@@ -231,7 +254,14 @@ async fn flight_stream(
     handle: Uuid,
     partition: usize,
     object_stores: Vec<(ObjectStoreUrl, HashMap<String, String>)>,
+    squeeze_hints: Vec<ColumnSqueezeHint>,
 ) -> Result<SendableRecordBatchStream> {
+    // Materialized scalar-subquery results are embedded in scan predicates as
+    // `ScalarSubqueryExpr`, which cannot be serialized on its own and is
+    // meaningless on the remote server. Replace them with literal values
+    // before the plan is shipped.
+    let plan = snapshot_scalar_subqueries(plan)?;
+
     let channel = flight_channel(server)
         .in_span(Span::enter_with_local_parent("connect_channel"))
         .await?;
@@ -264,6 +294,7 @@ async fn flight_stream(
             let action = LiquidCacheActions::RegisterPlan(RegisterPlanRequest {
                 plan: plan_bytes.to_vec(),
                 handle: handle.into_bytes().to_vec().into(),
+                squeeze_hints: squeeze_hints.clone(),
             })
             .into();
             client
@@ -298,6 +329,68 @@ async fn flight_stream(
             .with_headers(md)
             .map_err(to_df_err);
     Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
+}
+
+/// Rewrite scan predicates in `plan` so they no longer contain
+/// [`ScalarSubqueryExpr`], making the plan safe to serialize and execute on the
+/// remote cache server.
+///
+/// DataFusion 54 represents an uncorrelated scalar subquery as a
+/// `ScalarSubqueryExpr` whose value is produced at runtime by a sibling
+/// `ScalarSubqueryExec`. When such a predicate is pushed into a Parquet scan
+/// that we ship to the server, two things break: `datafusion-proto` refuses to
+/// serialize a bare `ScalarSubqueryExpr` (it can only be decoded inside its
+/// exec), and the server has no way to run the subquery. By the time a scan is
+/// shipped the subquery result is already computed, so we substitute its value.
+fn snapshot_scalar_subqueries(plan: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {
+    Ok(plan
+        .transform_up(|node| match rebuild_scan_without_subquery(&node)? {
+            Some(new_plan) => Ok(Transformed::yes(new_plan)),
+            None => Ok(Transformed::no(node)),
+        })?
+        .data)
+}
+
+/// If `node` is a Parquet scan whose predicate contains a `ScalarSubqueryExpr`,
+/// return a rebuilt scan with those exprs replaced by their literal values;
+/// otherwise return `None`.
+fn rebuild_scan_without_subquery(
+    node: &Arc<dyn ExecutionPlan>,
+) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+    let Some(data_source_exec) = node.downcast_ref::<DataSourceExec>() else {
+        return Ok(None);
+    };
+    let Some((file_scan_config, parquet_source)) =
+        data_source_exec.downcast_to_file_source::<ParquetSource>()
+    else {
+        return Ok(None);
+    };
+    let Some(predicate) = parquet_source.filter() else {
+        return Ok(None);
+    };
+
+    let rewritten = predicate.transform_up(|expr| {
+        if let Some(subquery) = expr.downcast_ref::<ScalarSubqueryExpr>() {
+            let empty = RecordBatch::new_empty(Arc::new(Schema::empty()));
+            let ColumnarValue::Scalar(value) = subquery.evaluate(&empty)? else {
+                return internal_err!("scalar subquery produced an array, cannot push down");
+            };
+            Ok(Transformed::yes(
+                Arc::new(Literal::new(value)) as Arc<dyn PhysicalExpr>
+            ))
+        } else {
+            Ok(Transformed::no(expr))
+        }
+    })?;
+
+    if !rewritten.transformed {
+        return Ok(None);
+    }
+
+    let new_source = parquet_source.with_predicate(rewritten.data);
+    let mut new_config = file_scan_config.clone();
+    new_config.file_source = Arc::new(new_source);
+    Ok(Some(Arc::new(DataSourceExec::new(Arc::new(new_config)))))
 }
 
 enum FlightStreamState {
