@@ -26,17 +26,35 @@ use crate::{LiquidCacheParquetRef, LiquidParquetSource, cache::ColumnSqueezeHint
 #[derive(Debug)]
 pub struct LocalModeOptimizer {
     cache: LiquidCacheParquetRef,
+    /// When set, parquet scans whose total file size exceeds this threshold
+    /// are left as vanilla DataFusion reads instead of being wrapped by
+    /// LiquidCache. `None` means cache every scan.
+    max_scan_bytes: Option<u64>,
 }
 
 impl LocalModeOptimizer {
     /// Create an optimizer with an existing cache instance
     pub fn new(cache: LiquidCacheParquetRef) -> Self {
-        Self { cache }
+        Self {
+            cache,
+            max_scan_bytes: None,
+        }
     }
 
     /// Create an optimizer with an existing cache instance
     pub fn with_cache(cache: LiquidCacheParquetRef) -> Self {
-        Self { cache }
+        Self {
+            cache,
+            max_scan_bytes: None,
+        }
+    }
+
+    /// Set the maximum total file size (in bytes) for a parquet scan to be
+    /// routed through LiquidCache. Scans exceeding this are read directly
+    /// from the underlying parquet source, bypassing the cache.
+    pub fn with_max_scan_bytes(mut self, max_bytes: u64) -> Self {
+        self.max_scan_bytes = Some(max_bytes);
+        self
     }
 }
 
@@ -48,7 +66,14 @@ impl PhysicalOptimizerRule for LocalModeOptimizer {
     ) -> Result<Arc<dyn ExecutionPlan>, datafusion::error::DataFusionError> {
         let analysis = HintAnalyzer::analyze(&plan);
         let cache = self.cache.clone();
+        let max_scan_bytes = self.max_scan_bytes;
         let mut convert = |node: &Arc<dyn ExecutionPlan>, hints: ColumnSqueezeHints| {
+            // Leave oversized scans as vanilla parquet reads, bypassing the cache.
+            if let Some(max_bytes) = max_scan_bytes
+                && parquet_scan_total_bytes(node).is_some_and(|total| total > max_bytes)
+            {
+                return None;
+            }
             convert_parquet_scan(node, &cache, hints)
         };
         Ok(squeeze_hint::rewrite_with_hints(
@@ -98,6 +123,21 @@ pub fn rewrite_data_source_plan(
     cache: &LiquidCacheParquetRef,
 ) -> Arc<dyn ExecutionPlan> {
     rewrite_data_source_plan_with_hints(plan, cache, &ColumnSqueezeHints::default())
+}
+
+/// Total size in bytes of all files scanned by a parquet `DataSourceExec`, or
+/// `None` if `node` is not such a scan.
+fn parquet_scan_total_bytes(node: &Arc<dyn ExecutionPlan>) -> Option<u64> {
+    let data_source_exec = node.downcast_ref::<DataSourceExec>()?;
+    let (file_scan_config, _) = data_source_exec.downcast_to_file_source::<ParquetSource>()?;
+    Some(
+        file_scan_config
+            .file_groups
+            .iter()
+            .flat_map(|g| g.files())
+            .map(|f| f.object_meta.size)
+            .sum(),
+    )
 }
 
 /// If `node` is a `DataSourceExec` over a `ParquetSource`, return an equivalent
@@ -185,5 +225,87 @@ mod tests {
             .unwrap();
         let plan = df.create_physical_plan().await.unwrap();
         rewrite_plan_inner(plan.clone()).await;
+    }
+
+    async fn build_cache() -> LiquidCacheParquetRef {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let store = t4::mount(tmp_dir.path().join("liquid_cache.t4"))
+            .await
+            .unwrap();
+        Arc::new(
+            LiquidCacheParquet::new(
+                8192,
+                1000000,
+                usize::MAX,
+                store,
+                Box::new(LiquidPolicy::new()),
+                Box::new(TranscodeSqueezeEvict),
+                Box::new(AlwaysHydrate::new()),
+            )
+            .await,
+        )
+    }
+
+    /// True if any parquet scan in `plan` was rewritten to `LiquidParquetSource`.
+    fn has_liquid_source(plan: &Arc<dyn ExecutionPlan>) -> bool {
+        let mut found = false;
+        plan.apply(|node| {
+            if let Some(exec) = node.downcast_ref::<DataSourceExec>()
+                && let Some(cfg) = exec.data_source().downcast_ref::<FileScanConfig>()
+                && cfg
+                    .file_source()
+                    .downcast_ref::<LiquidParquetSource>()
+                    .is_some()
+            {
+                found = true;
+                return Ok(TreeNodeRecursion::Stop);
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })
+        .unwrap();
+        found
+    }
+
+    /// A parquet scan whose total file size exceeds `max_scan_bytes` is left as
+    /// a plain `ParquetSource`; one under the threshold is still wrapped in
+    /// `LiquidParquetSource`.
+    #[tokio::test]
+    async fn test_max_scan_bytes_pass_through() {
+        let ctx = SessionContext::new();
+        ctx.register_parquet(
+            "nano_hits",
+            "../../examples/nano_hits.parquet",
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        let plan = ctx
+            .sql("SELECT * FROM nano_hits WHERE \"URL\" like 'https://%' limit 10")
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let config = ConfigOptions::default();
+
+        // Threshold below the file size → scan bypasses the cache.
+        let capped = LocalModeOptimizer::new(build_cache().await)
+            .with_max_scan_bytes(1)
+            .optimize(plan.clone(), &config)
+            .unwrap();
+        assert!(
+            !has_liquid_source(&capped),
+            "oversized scan should stay a plain ParquetSource"
+        );
+
+        // Threshold above the file size → scan is cached as usual.
+        let uncapped = LocalModeOptimizer::new(build_cache().await)
+            .with_max_scan_bytes(u64::MAX)
+            .optimize(plan, &config)
+            .unwrap();
+        assert!(
+            has_liquid_source(&uncapped),
+            "under-threshold scan should be wrapped in LiquidParquetSource"
+        );
     }
 }
