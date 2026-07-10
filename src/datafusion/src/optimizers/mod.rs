@@ -171,13 +171,16 @@ pub fn estimate_projected_bytes(config: &FileScanConfig) -> u64 {
         .flat_map(|g| g.files())
         .map(|f| f.object_meta.size)
         .sum();
-    let total_cols = config.table_schema().fields().len().max(1);
+    let total_cols = config.file_schema().fields().len().max(1);
     // On error, assume the full projection so the estimate stays conservative
-    // (larger → more likely to be gated out).
+    // (larger → more likely to be gated out). Clamp to the file column count:
+    // the projected schema can also include (near-zero-byte) partition columns,
+    // which must not push the ratio above 1.
     let projected_cols = config
         .projected_schema()
         .map(|schema| schema.fields().len())
-        .unwrap_or(total_cols);
+        .unwrap_or(total_cols)
+        .min(total_cols);
     ((total_bytes as u128 * projected_cols as u128) / total_cols as u128) as u64
 }
 
