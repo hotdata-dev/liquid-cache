@@ -8,7 +8,10 @@ use datafusion::{
     catalog::memory::DataSourceExec,
     common::tree_node::{Transformed, TreeNode, TreeNodeRecursion},
     config::ConfigOptions,
-    datasource::{physical_plan::ParquetSource, source::DataSource},
+    datasource::{
+        physical_plan::{FileScanConfig, ParquetSource},
+        source::DataSource,
+    },
     physical_optimizer::PhysicalOptimizerRule,
     physical_plan::ExecutionPlan,
 };
@@ -18,18 +21,34 @@ pub use squeeze_hint::SqueezeHintMap;
 
 use crate::{LiquidCacheParquetRef, LiquidParquetSource, cache::ColumnSqueezeHints};
 
+/// Admission predicate deciding whether a parquet scan is routed through
+/// LiquidCache. Called once per parquet `DataSourceExec` with that scan's
+/// [`FileScanConfig`]; returning `false` leaves the scan as a vanilla
+/// DataFusion read. The caller owns the policy (e.g. estimated scan size vs.
+/// the cache budget); [`estimate_projected_bytes`] is a ready-made building
+/// block for size-based filters.
+pub type ScanAdmissionFilter = Arc<dyn Fn(&FileScanConfig) -> bool + Send + Sync>;
+
 /// Physical optimizer rule for local mode liquid cache.
 ///
 /// Rewrites `DataSourceExec` parquet scans to use [`LiquidParquetSource`], and
 /// in the same pass derives typed squeeze hints from the full physical plan
 /// (via the squeeze-hint analyzer) and attaches each scan's hints to its source.
-#[derive(Debug)]
 pub struct LocalModeOptimizer {
     cache: LiquidCacheParquetRef,
-    /// When set, parquet scans whose total file size exceeds this threshold
-    /// are left as vanilla DataFusion reads instead of being wrapped by
-    /// LiquidCache. `None` means cache every scan.
-    max_scan_bytes: Option<u64>,
+    /// Optional admission predicate. When set, a scan is only wrapped by
+    /// LiquidCache if the predicate returns `true`; scans it rejects are left
+    /// as vanilla DataFusion reads. `None` means cache every scan.
+    scan_filter: Option<ScanAdmissionFilter>,
+}
+
+impl std::fmt::Debug for LocalModeOptimizer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LocalModeOptimizer")
+            .field("cache", &self.cache)
+            .field("scan_filter", &self.scan_filter.as_ref().map(|_| "<fn>"))
+            .finish()
+    }
 }
 
 impl LocalModeOptimizer {
@@ -37,7 +56,7 @@ impl LocalModeOptimizer {
     pub fn new(cache: LiquidCacheParquetRef) -> Self {
         Self {
             cache,
-            max_scan_bytes: None,
+            scan_filter: None,
         }
     }
 
@@ -45,15 +64,16 @@ impl LocalModeOptimizer {
     pub fn with_cache(cache: LiquidCacheParquetRef) -> Self {
         Self {
             cache,
-            max_scan_bytes: None,
+            scan_filter: None,
         }
     }
 
-    /// Set the maximum total file size (in bytes) for a parquet scan to be
-    /// routed through LiquidCache. Scans exceeding this are read directly
-    /// from the underlying parquet source, bypassing the cache.
-    pub fn with_max_scan_bytes(mut self, max_bytes: u64) -> Self {
-        self.max_scan_bytes = Some(max_bytes);
+    /// Set an admission predicate that decides, per parquet scan, whether the
+    /// scan is routed through LiquidCache. Scans the predicate rejects are read
+    /// directly from the underlying parquet source, bypassing the cache. See
+    /// [`ScanAdmissionFilter`] and [`estimate_projected_bytes`].
+    pub fn with_scan_filter(mut self, filter: ScanAdmissionFilter) -> Self {
+        self.scan_filter = Some(filter);
         self
     }
 }
@@ -66,11 +86,13 @@ impl PhysicalOptimizerRule for LocalModeOptimizer {
     ) -> Result<Arc<dyn ExecutionPlan>, datafusion::error::DataFusionError> {
         let analysis = HintAnalyzer::analyze(&plan);
         let cache = self.cache.clone();
-        let max_scan_bytes = self.max_scan_bytes;
+        let scan_filter = self.scan_filter.clone();
         let mut convert = |node: &Arc<dyn ExecutionPlan>, hints: ColumnSqueezeHints| {
-            // Leave oversized scans as vanilla parquet reads, bypassing the cache.
-            if let Some(max_bytes) = max_scan_bytes
-                && parquet_scan_total_bytes(node).is_some_and(|total| total > max_bytes)
+            // Let the admission predicate veto a scan, leaving it as a vanilla
+            // parquet read that bypasses the cache.
+            if let Some(filter) = &scan_filter
+                && let Some(config) = parquet_file_scan_config(node)
+                && !filter(config)
             {
                 return None;
             }
@@ -125,19 +147,38 @@ pub fn rewrite_data_source_plan(
     rewrite_data_source_plan_with_hints(plan, cache, &ColumnSqueezeHints::default())
 }
 
-/// Total size in bytes of all files scanned by a parquet `DataSourceExec`, or
-/// `None` if `node` is not such a scan.
-fn parquet_scan_total_bytes(node: &Arc<dyn ExecutionPlan>) -> Option<u64> {
+/// If `node` is a parquet `DataSourceExec`, return its [`FileScanConfig`].
+fn parquet_file_scan_config(node: &Arc<dyn ExecutionPlan>) -> Option<&FileScanConfig> {
     let data_source_exec = node.downcast_ref::<DataSourceExec>()?;
     let (file_scan_config, _) = data_source_exec.downcast_to_file_source::<ParquetSource>()?;
-    Some(
-        file_scan_config
-            .file_groups
-            .iter()
-            .flat_map(|g| g.files())
-            .map(|f| f.object_meta.size)
-            .sum(),
-    )
+    Some(file_scan_config)
+}
+
+/// Estimate the compressed bytes a parquet scan will read, accounting for
+/// column projection: the total on-disk size of the scan's files scaled by the
+/// fraction of columns the query actually projects.
+///
+/// Intended as a building block for size-based [`ScanAdmissionFilter`]s. Two
+/// caveats on accuracy: it assumes columns are roughly uniform in size (a
+/// single very wide column projected alone is under-counted), and it does not
+/// account for row-group/page pruning, which is decided at execution time.
+/// File- and partition-level pruning is already reflected, since the scan's
+/// file groups only contain files that survived planning.
+pub fn estimate_projected_bytes(config: &FileScanConfig) -> u64 {
+    let total_bytes: u64 = config
+        .file_groups
+        .iter()
+        .flat_map(|g| g.files())
+        .map(|f| f.object_meta.size)
+        .sum();
+    let total_cols = config.table_schema().fields().len().max(1);
+    // On error, assume the full projection so the estimate stays conservative
+    // (larger → more likely to be gated out).
+    let projected_cols = config
+        .projected_schema()
+        .map(|schema| schema.fields().len())
+        .unwrap_or(total_cols);
+    ((total_bytes as u128 * projected_cols as u128) / total_cols as u128) as u64
 }
 
 /// If `node` is a `DataSourceExec` over a `ParquetSource`, return an equivalent
@@ -266,11 +307,25 @@ mod tests {
         found
     }
 
-    /// A parquet scan whose total file size exceeds `max_scan_bytes` is left as
-    /// a plain `ParquetSource`; one under the threshold is still wrapped in
+    /// Extract the [`FileScanConfig`] of the first parquet scan in `plan`.
+    fn scan_config_of(plan: &Arc<dyn ExecutionPlan>) -> FileScanConfig {
+        let mut found = None;
+        plan.apply(|node| {
+            if let Some(config) = parquet_file_scan_config(node) {
+                found = Some(config.clone());
+                return Ok(TreeNodeRecursion::Stop);
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })
+        .unwrap();
+        found.expect("plan should contain a parquet scan")
+    }
+
+    /// A scan the admission filter rejects is left as a plain `ParquetSource`;
+    /// one it accepts (and the default no-filter case) is wrapped in
     /// `LiquidParquetSource`.
     #[tokio::test]
-    async fn test_max_scan_bytes_pass_through() {
+    async fn test_scan_filter_pass_through() {
         let ctx = SessionContext::new();
         ctx.register_parquet(
             "nano_hits",
@@ -288,24 +343,75 @@ mod tests {
             .unwrap();
         let config = ConfigOptions::default();
 
-        // Threshold below the file size → scan bypasses the cache.
-        let capped = LocalModeOptimizer::new(build_cache().await)
-            .with_max_scan_bytes(1)
+        // Filter rejects the scan → bypasses the cache.
+        let rejected = LocalModeOptimizer::new(build_cache().await)
+            .with_scan_filter(Arc::new(|_| false))
             .optimize(plan.clone(), &config)
             .unwrap();
         assert!(
-            !has_liquid_source(&capped),
-            "oversized scan should stay a plain ParquetSource"
+            !has_liquid_source(&rejected),
+            "rejected scan should stay a plain ParquetSource"
         );
 
-        // Threshold above the file size → scan is cached as usual.
-        let uncapped = LocalModeOptimizer::new(build_cache().await)
-            .with_max_scan_bytes(u64::MAX)
+        // Filter accepts the scan → cached.
+        let accepted = LocalModeOptimizer::new(build_cache().await)
+            .with_scan_filter(Arc::new(|_| true))
+            .optimize(plan.clone(), &config)
+            .unwrap();
+        assert!(
+            has_liquid_source(&accepted),
+            "accepted scan should be wrapped in LiquidParquetSource"
+        );
+
+        // No filter → cache every scan (default).
+        let default = LocalModeOptimizer::new(build_cache().await)
             .optimize(plan, &config)
             .unwrap();
         assert!(
-            has_liquid_source(&uncapped),
-            "under-threshold scan should be wrapped in LiquidParquetSource"
+            has_liquid_source(&default),
+            "with no filter every scan should be cached"
+        );
+    }
+
+    /// The projection-aware estimate shrinks when fewer columns are read: a
+    /// single-column projection must estimate strictly fewer bytes than a
+    /// full-table scan of the same files.
+    #[tokio::test]
+    async fn test_estimate_projected_bytes_scales_with_projection() {
+        let ctx = SessionContext::new();
+        ctx.register_parquet(
+            "nano_hits",
+            "../../examples/nano_hits.parquet",
+            Default::default(),
+        )
+        .await
+        .unwrap();
+
+        let all_cols = scan_config_of(
+            &ctx.sql("SELECT * FROM nano_hits")
+                .await
+                .unwrap()
+                .create_physical_plan()
+                .await
+                .unwrap(),
+        );
+        let one_col = scan_config_of(
+            &ctx.sql("SELECT \"URL\" FROM nano_hits")
+                .await
+                .unwrap()
+                .create_physical_plan()
+                .await
+                .unwrap(),
+        );
+
+        let all_bytes = estimate_projected_bytes(&all_cols);
+        let one_bytes = estimate_projected_bytes(&one_col);
+
+        assert!(all_bytes > 0, "full-table estimate should be non-zero");
+        assert!(
+            one_bytes < all_bytes,
+            "single-column projection ({one_bytes}) should estimate fewer bytes \
+             than the full scan ({all_bytes})"
         );
     }
 }

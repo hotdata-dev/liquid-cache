@@ -13,10 +13,12 @@ use datafusion::prelude::{SessionConfig, SessionContext};
 use liquid_cache::cache::squeeze_policies::{SqueezePolicy, TranscodeSqueezeEvict};
 use liquid_cache::cache::{AlwaysHydrate, HydrationPolicy, default_max_memory_bytes};
 use liquid_cache::cache_policies::{CachePolicy, LiquidPolicy};
-use liquid_cache_datafusion::optimizers::LocalModeOptimizer;
+use liquid_cache_datafusion::optimizers::{LocalModeOptimizer, ScanAdmissionFilter};
 use liquid_cache_datafusion::{
     LiquidCacheParquet, LiquidCacheParquetRef, VariantGetUdf, VariantPretty, VariantToJsonUdf,
 };
+
+pub use liquid_cache_datafusion::optimizers::{ScanAdmissionFilter as ScanFilter, estimate_projected_bytes};
 
 pub use liquid_cache as storage;
 pub use liquid_cache_common as common;
@@ -69,8 +71,9 @@ pub struct LiquidCacheLocalBuilder {
     squeeze_policy: Box<dyn SqueezePolicy>,
     /// Hydration policy
     hydration_policy: Box<dyn HydrationPolicy>,
-    /// Maximum total file size for a scan to be routed through LiquidCache.
-    max_scan_bytes: Option<u64>,
+    /// Optional admission predicate deciding, per scan, whether it is routed
+    /// through LiquidCache.
+    scan_filter: Option<ScanAdmissionFilter>,
     span: fastrace::Span,
 }
 
@@ -86,7 +89,7 @@ impl Default for LiquidCacheLocalBuilder {
             cache_policy: Box::new(LiquidPolicy::new()),
             squeeze_policy: Box::new(TranscodeSqueezeEvict),
             hydration_policy: Box::new(AlwaysHydrate::new()),
-            max_scan_bytes: None,
+            scan_filter: None,
             span: fastrace::Span::enter_with_local_parent("liquid_cache_datafusion_local_builder"),
         }
     }
@@ -148,11 +151,13 @@ impl LiquidCacheLocalBuilder {
         self
     }
 
-    /// Set the maximum total file size (in bytes) for a scan to be routed
-    /// through LiquidCache. Scans exceeding this threshold are read directly
-    /// from the parquet source, bypassing the cache entirely.
-    pub fn with_max_scan_bytes(mut self, max_bytes: u64) -> Self {
-        self.max_scan_bytes = Some(max_bytes);
+    /// Set an admission predicate deciding, per parquet scan, whether the scan
+    /// is routed through LiquidCache. Scans the predicate rejects are read
+    /// directly from the parquet source, bypassing the cache. Combine with
+    /// [`estimate_projected_bytes`] to build a size-based filter that keeps the
+    /// cache within its memory budget.
+    pub fn with_scan_filter(mut self, filter: ScanAdmissionFilter) -> Self {
+        self.scan_filter = Some(filter);
         self
     }
 
@@ -202,8 +207,8 @@ impl LiquidCacheLocalBuilder {
         let cache_ref = Arc::new(cache);
 
         let mut optimizer = LocalModeOptimizer::new(cache_ref.clone());
-        if let Some(max_bytes) = self.max_scan_bytes {
-            optimizer = optimizer.with_max_scan_bytes(max_bytes);
+        if let Some(filter) = self.scan_filter {
+            optimizer = optimizer.with_scan_filter(filter);
         }
 
         let state = datafusion::execution::SessionStateBuilder::new()
