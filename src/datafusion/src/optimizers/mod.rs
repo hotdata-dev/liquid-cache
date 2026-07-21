@@ -5,11 +5,22 @@ mod squeeze_hint;
 use std::sync::Arc;
 
 use datafusion::{
+    arrow::datatypes::SchemaRef,
     catalog::memory::DataSourceExec,
-    common::tree_node::{Transformed, TreeNode, TreeNodeRecursion},
+    common::{
+        Statistics,
+        pruning::PrunableStatistics,
+        stats::Precision,
+        tree_node::{Transformed, TreeNode, TreeNodeRecursion},
+    },
     config::ConfigOptions,
-    datasource::{physical_plan::ParquetSource, source::DataSource},
-    physical_optimizer::PhysicalOptimizerRule,
+    datasource::{
+        listing::PartitionedFile,
+        physical_plan::{FileScanConfig, FileSource, ParquetSource},
+        source::DataSource,
+    },
+    physical_expr::utils::collect_columns,
+    physical_optimizer::{PhysicalOptimizerRule, pruning::PruningPredicate},
     physical_plan::ExecutionPlan,
 };
 
@@ -17,6 +28,25 @@ pub(crate) use squeeze_hint::HintAnalyzer;
 pub use squeeze_hint::SqueezeHintMap;
 
 use crate::{LiquidCacheParquetRef, LiquidParquetSource, cache::ColumnSqueezeHints};
+
+/// Parameters for the footprint-based admission gate.
+///
+/// A parquet scan is routed through LiquidCache only if its estimated in-memory
+/// liquid footprint fits the cache budget; oversized scans are left as vanilla
+/// parquet reads (which, if the object store is a cached mount, read from it).
+///
+/// The estimate multiplies the raw required parquet bytes by `expansion`
+/// (parquet -> liquid in-memory blow-up) and `safety` (extra margin); both are
+/// `>= 1.0` so the estimate is conservative. The multipliers are applied to the
+/// *estimate*, never to the budget, so raising them only makes admission
+/// stricter.
+#[derive(Debug, Clone, Copy)]
+pub struct AdmissionGate {
+    /// Parquet-bytes -> liquid-in-memory-bytes multiplier (>= 1.0).
+    pub expansion: f64,
+    /// Extra safety margin on the estimate (>= 1.0).
+    pub safety: f64,
+}
 
 /// Physical optimizer rule for local mode liquid cache.
 ///
@@ -26,10 +56,10 @@ use crate::{LiquidCacheParquetRef, LiquidParquetSource, cache::ColumnSqueezeHint
 #[derive(Debug)]
 pub struct LocalModeOptimizer {
     cache: LiquidCacheParquetRef,
-    /// When set, parquet scans whose total file size exceeds this threshold
-    /// are left as vanilla DataFusion reads instead of being wrapped by
-    /// LiquidCache. `None` means cache every scan.
-    max_scan_bytes: Option<u64>,
+    /// When set, a scan whose estimated footprint exceeds the cache budget is
+    /// left as a vanilla parquet read instead of being wrapped by LiquidCache.
+    /// `None` means cache every scan.
+    admission: Option<AdmissionGate>,
 }
 
 impl LocalModeOptimizer {
@@ -37,7 +67,7 @@ impl LocalModeOptimizer {
     pub fn new(cache: LiquidCacheParquetRef) -> Self {
         Self {
             cache,
-            max_scan_bytes: None,
+            admission: None,
         }
     }
 
@@ -45,15 +75,16 @@ impl LocalModeOptimizer {
     pub fn with_cache(cache: LiquidCacheParquetRef) -> Self {
         Self {
             cache,
-            max_scan_bytes: None,
+            admission: None,
         }
     }
 
-    /// Set the maximum total file size (in bytes) for a parquet scan to be
-    /// routed through LiquidCache. Scans exceeding this are read directly
-    /// from the underlying parquet source, bypassing the cache.
-    pub fn with_max_scan_bytes(mut self, max_bytes: u64) -> Self {
-        self.max_scan_bytes = Some(max_bytes);
+    /// Enable the footprint-based admission gate. A parquet scan is cached only
+    /// when its estimated liquid footprint (raw required bytes x `expansion` x
+    /// `safety`) fits the cache's memory budget; otherwise it is read directly
+    /// from the parquet source, bypassing the cache. See [`AdmissionGate`].
+    pub fn with_admission_gate(mut self, expansion: f64, safety: f64) -> Self {
+        self.admission = Some(AdmissionGate { expansion, safety });
         self
     }
 }
@@ -66,11 +97,14 @@ impl PhysicalOptimizerRule for LocalModeOptimizer {
     ) -> Result<Arc<dyn ExecutionPlan>, datafusion::error::DataFusionError> {
         let analysis = HintAnalyzer::analyze(&plan);
         let cache = self.cache.clone();
-        let max_scan_bytes = self.max_scan_bytes;
+        let admission = self.admission;
+        let budget = self.cache.max_memory_bytes() as u64;
         let mut convert = |node: &Arc<dyn ExecutionPlan>, hints: ColumnSqueezeHints| {
-            // Leave oversized scans as vanilla parquet reads, bypassing the cache.
-            if let Some(max_bytes) = max_scan_bytes
-                && parquet_scan_total_bytes(node).is_some_and(|total| total > max_bytes)
+            // Leave scans whose estimated liquid footprint exceeds the budget as
+            // vanilla parquet reads, so oversized scans don't thrash the cache.
+            if let Some(gate) = admission
+                && let Some((cfg, src)) = parquet_scan_parts(node)
+                && estimate_liquid_footprint(cfg, src, gate) > budget
             {
                 return None;
             }
@@ -125,19 +159,110 @@ pub fn rewrite_data_source_plan(
     rewrite_data_source_plan_with_hints(plan, cache, &ColumnSqueezeHints::default())
 }
 
-/// Total size in bytes of all files scanned by a parquet `DataSourceExec`, or
-/// `None` if `node` is not such a scan.
-fn parquet_scan_total_bytes(node: &Arc<dyn ExecutionPlan>) -> Option<u64> {
-    let data_source_exec = node.downcast_ref::<DataSourceExec>()?;
-    let (file_scan_config, _) = data_source_exec.downcast_to_file_source::<ParquetSource>()?;
-    Some(
-        file_scan_config
-            .file_groups
-            .iter()
-            .flat_map(|g| g.files())
-            .map(|f| f.object_meta.size)
-            .sum(),
-    )
+/// If `node` is a parquet `DataSourceExec`, return its `FileScanConfig` and
+/// `ParquetSource`.
+fn parquet_scan_parts(
+    node: &Arc<dyn ExecutionPlan>,
+) -> Option<(&FileScanConfig, &ParquetSource)> {
+    let dse = node.downcast_ref::<DataSourceExec>()?;
+    dse.downcast_to_file_source::<ParquetSource>()
+}
+
+/// Estimate the in-memory liquid footprint (bytes) a parquet scan would occupy
+/// if cached: the required-column bytes of the files that survive the scan's
+/// predicate, scaled by the admission gate's expansion + safety factors.
+///
+/// "Required columns" is the output projection **unioned with the predicate
+/// columns**, since LiquidCache materializes both. Byte sizing uses only
+/// `Exact` per-column sizes; anything else falls back to the whole file size,
+/// so the estimate never *under*-counts (which could wrongly admit an oversized
+/// scan and thrash the cache).
+fn estimate_liquid_footprint(cfg: &FileScanConfig, src: &ParquetSource, gate: AdmissionGate) -> u64 {
+    let file_schema = cfg.file_schema();
+
+    let mut required: Vec<usize> = {
+        // Removed in df58; we are pinned to df54.
+        #[allow(deprecated)]
+        match cfg.file_column_projection_indices() {
+            Some(cols) => cols,
+            None => (0..file_schema.fields().len()).collect(),
+        }
+    };
+    if let Some(pred) = src.filter() {
+        for col in collect_columns(&pred) {
+            required.push(col.index());
+        }
+    }
+    required.sort_unstable();
+    required.dedup();
+
+    let files: Vec<&PartitionedFile> = cfg.file_groups.iter().flat_map(|g| g.files()).collect();
+    if files.is_empty() {
+        return 0;
+    }
+
+    let surviving = surviving_files(src, file_schema, &files);
+
+    let raw: u64 = files
+        .iter()
+        .zip(surviving.iter())
+        .filter(|(_, keep)| **keep)
+        .map(|(f, _)| {
+            file_required_bytes(f.statistics.as_deref(), f.object_meta.size, &required)
+        })
+        .sum();
+
+    ((raw as f64) * gate.expansion.max(1.0) * gate.safety.max(1.0)) as u64
+}
+
+/// Boolean per file: `true` if the file may match the predicate (keep it),
+/// `false` if the predicate's stats prove it cannot match (prune it).
+/// Conservative: no predicate, missing stats, or any pruning error keeps files.
+fn surviving_files(
+    src: &ParquetSource,
+    file_schema: &SchemaRef,
+    files: &[&PartitionedFile],
+) -> Vec<bool> {
+    let Some(pred) = src.filter() else {
+        return vec![true; files.len()];
+    };
+    let pruning = match PruningPredicate::try_new(pred, file_schema.clone()) {
+        Ok(p) => p,
+        Err(_) => return vec![true; files.len()],
+    };
+    let stats: Vec<Arc<Statistics>> = files
+        .iter()
+        .map(|f| {
+            f.statistics
+                .clone()
+                .unwrap_or_else(|| Arc::new(Statistics::new_unknown(file_schema)))
+        })
+        .collect();
+    let prunable = PrunableStatistics::new(stats, file_schema.clone());
+    match pruning.prune(&prunable) {
+        Ok(mask) if mask.len() == files.len() => mask,
+        _ => vec![true; files.len()],
+    }
+}
+
+/// Bytes the `required` columns of one file contribute to the footprint.
+///
+/// Uses only `Exact` per-column byte sizes. If the file has no stats, or any
+/// required column lacks an exact size, fall back to the whole-file size — a
+/// deliberate over-estimate, since under-counting could wrongly admit an
+/// oversized scan.
+fn file_required_bytes(stats: Option<&Statistics>, object_size: u64, required: &[usize]) -> u64 {
+    let Some(stats) = stats else {
+        return object_size;
+    };
+    let mut sum: u64 = 0;
+    for &c in required {
+        match stats.column_statistics.get(c).map(|cs| &cs.byte_size) {
+            Some(Precision::Exact(n)) => sum += *n as u64,
+            _ => return object_size,
+        }
+    }
+    sum
 }
 
 /// If `node` is a `DataSourceExec` over a `ParquetSource`, return an equivalent
@@ -228,6 +353,10 @@ mod tests {
     }
 
     async fn build_cache() -> LiquidCacheParquetRef {
+        build_cache_with_budget(1_000_000).await
+    }
+
+    async fn build_cache_with_budget(max_memory_bytes: usize) -> LiquidCacheParquetRef {
         let tmp_dir = tempfile::tempdir().unwrap();
         let store = t4::mount(tmp_dir.path().join("liquid_cache.t4"))
             .await
@@ -235,7 +364,7 @@ mod tests {
         Arc::new(
             LiquidCacheParquet::new(
                 8192,
-                1000000,
+                max_memory_bytes,
                 usize::MAX,
                 store,
                 Box::new(LiquidPolicy::new()),
@@ -266,11 +395,10 @@ mod tests {
         found
     }
 
-    /// A parquet scan whose total file size exceeds `max_scan_bytes` is left as
-    /// a plain `ParquetSource`; one under the threshold is still wrapped in
-    /// `LiquidParquetSource`.
+    /// The admission gate bypasses a scan whose estimated footprint exceeds the
+    /// budget (large expansion here forces that), and caches one that fits.
     #[tokio::test]
-    async fn test_max_scan_bytes_pass_through() {
+    async fn test_admission_gate_pass_through() {
         let ctx = SessionContext::new();
         ctx.register_parquet(
             "nano_hits",
@@ -288,24 +416,89 @@ mod tests {
             .unwrap();
         let config = ConfigOptions::default();
 
-        // Threshold below the file size → scan bypasses the cache.
+        // A huge expansion inflates the estimate past the 1 MB budget → bypass.
         let capped = LocalModeOptimizer::new(build_cache().await)
-            .with_max_scan_bytes(1)
+            .with_admission_gate(1e9, 1.0)
             .optimize(plan.clone(), &config)
             .unwrap();
         assert!(
             !has_liquid_source(&capped),
-            "oversized scan should stay a plain ParquetSource"
+            "oversized estimate should stay a plain ParquetSource"
         );
 
-        // Threshold above the file size → scan is cached as usual.
-        let uncapped = LocalModeOptimizer::new(build_cache().await)
-            .with_max_scan_bytes(u64::MAX)
+        // With a large budget the footprint fits (expansion 1.0) → cached.
+        let uncapped = LocalModeOptimizer::new(build_cache_with_budget(usize::MAX).await)
+            .with_admission_gate(1.0, 1.0)
             .optimize(plan, &config)
             .unwrap();
         assert!(
             has_liquid_source(&uncapped),
-            "under-threshold scan should be wrapped in LiquidParquetSource"
+            "fitting scan should be wrapped in LiquidParquetSource"
         );
+    }
+}
+
+/// Pure unit tests for the footprint byte-math (no cache / no t4 mount, so they
+/// run everywhere). These cover the correctness-critical fallback direction:
+/// under-counting could wrongly admit an oversized scan, so anything not backed
+/// by an `Exact` per-column byte size must fall back to the whole-file size.
+#[cfg(test)]
+mod footprint_tests {
+    use super::file_required_bytes;
+    use datafusion::common::{ColumnStatistics, Statistics, stats::Precision};
+
+    fn col(byte_size: Precision<usize>) -> ColumnStatistics {
+        let mut c = ColumnStatistics::new_unknown();
+        c.byte_size = byte_size;
+        c
+    }
+
+    fn stats(cols: Vec<ColumnStatistics>) -> Statistics {
+        Statistics {
+            num_rows: Precision::Absent,
+            total_byte_size: Precision::Absent,
+            column_statistics: cols,
+        }
+    }
+
+    #[test]
+    fn no_stats_falls_back_to_full_file() {
+        assert_eq!(file_required_bytes(None, 5000, &[0, 1]), 5000);
+    }
+
+    #[test]
+    fn sums_only_required_exact_columns() {
+        let s = stats(vec![
+            col(Precision::Exact(100)),
+            col(Precision::Exact(200)),
+            col(Precision::Exact(400)),
+        ]);
+        // required = cols 0 and 2 → 100 + 400, ignoring col 1.
+        assert_eq!(file_required_bytes(Some(&s), 9999, &[0, 2]), 500);
+    }
+
+    #[test]
+    fn inexact_required_column_falls_back_to_full_file() {
+        let s = stats(vec![
+            col(Precision::Exact(100)),
+            col(Precision::Inexact(200)),
+        ]);
+        // col 1 inexact → not a safe upper bound → whole file.
+        assert_eq!(file_required_bytes(Some(&s), 7000, &[0, 1]), 7000);
+        // col 0 alone is exact → its bytes only.
+        assert_eq!(file_required_bytes(Some(&s), 7000, &[0]), 100);
+    }
+
+    #[test]
+    fn missing_required_column_falls_back_to_full_file() {
+        let s = stats(vec![col(Precision::Exact(100))]);
+        // required col 5 doesn't exist → conservative whole file.
+        assert_eq!(file_required_bytes(Some(&s), 3000, &[0, 5]), 3000);
+    }
+
+    #[test]
+    fn absent_byte_size_falls_back_to_full_file() {
+        let s = stats(vec![col(Precision::Absent)]);
+        assert_eq!(file_required_bytes(Some(&s), 2000, &[0]), 2000);
     }
 }

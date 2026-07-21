@@ -69,8 +69,9 @@ pub struct LiquidCacheLocalBuilder {
     squeeze_policy: Box<dyn SqueezePolicy>,
     /// Hydration policy
     hydration_policy: Box<dyn HydrationPolicy>,
-    /// Maximum total file size for a scan to be routed through LiquidCache.
-    max_scan_bytes: Option<u64>,
+    /// Footprint-based admission gate `(expansion, safety)`. When set, a scan is
+    /// cached only if its estimated liquid footprint fits the memory budget.
+    admission: Option<(f64, f64)>,
     span: fastrace::Span,
 }
 
@@ -86,7 +87,7 @@ impl Default for LiquidCacheLocalBuilder {
             cache_policy: Box::new(LiquidPolicy::new()),
             squeeze_policy: Box::new(TranscodeSqueezeEvict),
             hydration_policy: Box::new(AlwaysHydrate::new()),
-            max_scan_bytes: None,
+            admission: None,
             span: fastrace::Span::enter_with_local_parent("liquid_cache_datafusion_local_builder"),
         }
     }
@@ -148,11 +149,12 @@ impl LiquidCacheLocalBuilder {
         self
     }
 
-    /// Set the maximum total file size (in bytes) for a scan to be routed
-    /// through LiquidCache. Scans exceeding this threshold are read directly
-    /// from the parquet source, bypassing the cache entirely.
-    pub fn with_max_scan_bytes(mut self, max_bytes: u64) -> Self {
-        self.max_scan_bytes = Some(max_bytes);
+    /// Enable the footprint-based admission gate. A scan is cached only when its
+    /// estimated liquid footprint (raw required bytes x `expansion` x `safety`)
+    /// fits the cache's memory budget; oversized scans are read directly from the
+    /// parquet source, bypassing the cache. `expansion` and `safety` are `>= 1.0`.
+    pub fn with_admission_gate(mut self, expansion: f64, safety: f64) -> Self {
+        self.admission = Some((expansion, safety));
         self
     }
 
@@ -202,8 +204,8 @@ impl LiquidCacheLocalBuilder {
         let cache_ref = Arc::new(cache);
 
         let mut optimizer = LocalModeOptimizer::new(cache_ref.clone());
-        if let Some(max_bytes) = self.max_scan_bytes {
-            optimizer = optimizer.with_max_scan_bytes(max_bytes);
+        if let Some((expansion, safety)) = self.admission {
+            optimizer = optimizer.with_admission_gate(expansion, safety);
         }
 
         let state = datafusion::execution::SessionStateBuilder::new()
