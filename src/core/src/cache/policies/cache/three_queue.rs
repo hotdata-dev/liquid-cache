@@ -269,11 +269,23 @@ impl CachePolicy for LiquidPolicy {
         victims
     }
 
-    fn notify_access(&self, entry_id: &EntryID, _batch_type: CachedBatchType) {
-        // A cache hit marks the entry as reused, protecting it from the next
-        // victim search (see `find_memory_victim`).
-        let mut inner = self.inner.lock().unwrap();
-        inner.set_referenced(entry_id, true);
+    fn notify_access(&self, entry_id: &EntryID, batch_type: CachedBatchType) {
+        // Only a memory-resident hit counts as reuse for CLOCK. A disk hit must
+        // not set the bit: the disk read path calls `notify_access` before
+        // hydration, and the subsequent Disk->Memory `notify_insert` preserves
+        // the bit — so a batch read once from disk would arrive in memory
+        // looking hot and could evict a genuinely reused memory batch during a
+        // large one-pass scan.
+        let is_memory = matches!(
+            batch_type,
+            CachedBatchType::MemoryArrow
+                | CachedBatchType::MemoryLiquid
+                | CachedBatchType::MemorySqueezedLiquid
+        );
+        if is_memory {
+            let mut inner = self.inner.lock().unwrap();
+            inner.set_referenced(entry_id, true);
+        }
     }
 
     fn notify_remove(&self, entry_id: &EntryID) {
@@ -329,6 +341,26 @@ mod tests {
         // `a` survived the longest and is evicted last (its bit was cleared when
         // it was passed over, so it gets no further reprieve).
         assert_eq!(policy.find_memory_victim(1), vec![a]);
+    }
+
+    #[test]
+    fn test_disk_hit_does_not_protect_only_memory_hit_does() {
+        // A hit served from disk must NOT protect the entry — otherwise a
+        // one-pass disk-backed scan arrives hot on hydration and evicts the
+        // real working set. Only a memory hit grants a second chance.
+        let policy = LiquidPolicy::new();
+        let a = entry(1);
+        let b = entry(2);
+        let c = entry(3);
+        for id in [&a, &b, &c] {
+            policy.notify_insert(id, CachedBatchType::MemoryArrow);
+        }
+        policy.notify_access(&a, CachedBatchType::DiskArrow); // must not protect
+        policy.notify_access(&b, CachedBatchType::MemoryArrow); // protects
+
+        // `a` (disk hit) and `c` (untouched) evicted; `b` (memory hit) survives.
+        assert_eq!(policy.find_memory_victim(2), vec![a, c]);
+        assert_eq!(policy.find_memory_victim(1), vec![b]);
     }
 
     #[test]
