@@ -178,19 +178,29 @@ fn parquet_scan_parts(
 /// so the estimate never *under*-counts (which could wrongly admit an oversized
 /// scan and thrash the cache).
 fn estimate_liquid_footprint(cfg: &FileScanConfig, src: &ParquetSource, gate: AdmissionGate) -> u64 {
-    let file_schema = cfg.file_schema();
+    let num_file_cols = cfg.file_schema().fields().len();
+    // Full table schema (file + partition columns). The pushed-down predicate
+    // and `PartitionedFile` stats are expressed against it, so file pruning must
+    // use it; byte accounting still charges only file columns.
+    let table_schema = cfg.file_source.table_schema().table_schema().clone();
 
     let mut required: Vec<usize> = {
-        // Removed in df58; we are pinned to df54.
+        // Removed in df58; we are pinned to df54. Returns file-column indices.
         #[allow(deprecated)]
         match cfg.file_column_projection_indices() {
             Some(cols) => cols,
-            None => (0..file_schema.fields().len()).collect(),
+            None => (0..num_file_cols).collect(),
         }
     };
     if let Some(pred) = src.filter() {
         for col in collect_columns(&pred) {
-            required.push(col.index());
+            let idx = col.index();
+            // Partition columns are appended after file columns in the table
+            // schema and are literals (never materialized in LiquidCache), so
+            // only file columns contribute to the footprint.
+            if idx < num_file_cols {
+                required.push(idx);
+            }
         }
     }
     required.sort_unstable();
@@ -201,7 +211,7 @@ fn estimate_liquid_footprint(cfg: &FileScanConfig, src: &ParquetSource, gate: Ad
         return 0;
     }
 
-    let surviving = surviving_files(src, file_schema, &files);
+    let surviving = surviving_files(src, &table_schema, &files);
 
     let raw: u64 = files
         .iter()
@@ -217,28 +227,32 @@ fn estimate_liquid_footprint(cfg: &FileScanConfig, src: &ParquetSource, gate: Ad
 
 /// Boolean per file: `true` if the file may match the predicate (keep it),
 /// `false` if the predicate's stats prove it cannot match (prune it).
-/// Conservative: no predicate, missing stats, or any pruning error keeps files.
+/// Conservative: no predicate, missing/mismatched stats, or any pruning error
+/// keeps files. `table_schema` (file + partition columns) is used so predicates
+/// on partition columns resolve, matching `PartitionedFile::statistics`.
 fn surviving_files(
     src: &ParquetSource,
-    file_schema: &SchemaRef,
+    table_schema: &SchemaRef,
     files: &[&PartitionedFile],
 ) -> Vec<bool> {
     let Some(pred) = src.filter() else {
         return vec![true; files.len()];
     };
-    let pruning = match PruningPredicate::try_new(pred, file_schema.clone()) {
+    let pruning = match PruningPredicate::try_new(pred, table_schema.clone()) {
         Ok(p) => p,
         Err(_) => return vec![true; files.len()],
     };
+    let expected = table_schema.fields().len();
     let stats: Vec<Arc<Statistics>> = files
         .iter()
-        .map(|f| {
-            f.statistics
-                .clone()
-                .unwrap_or_else(|| Arc::new(Statistics::new_unknown(file_schema)))
+        .map(|f| match &f.statistics {
+            // Only trust stats whose width matches the table schema; otherwise
+            // treat as unknown (kept, not pruned) to avoid a schema mismatch.
+            Some(s) if s.column_statistics.len() == expected => s.clone(),
+            _ => Arc::new(Statistics::new_unknown(table_schema)),
         })
         .collect();
-    let prunable = PrunableStatistics::new(stats, file_schema.clone());
+    let prunable = PrunableStatistics::new(stats, table_schema.clone());
     match pruning.prune(&prunable) {
         Ok(mask) if mask.len() == files.len() => mask,
         _ => vec![true; files.len()],
