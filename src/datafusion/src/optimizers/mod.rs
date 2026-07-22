@@ -55,6 +55,11 @@ pub struct AdmissionGate {
     /// thrashing, so caching still wins in that band. This is the one *relaxing*
     /// knob, so it is clamped to `[1.0, 5.0]` (5.0 = the measured crossover).
     pub tolerance: f64,
+    /// Fail-loud mode. When `true`, a panic during footprint estimation is *not*
+    /// caught — it aborts the query — so estimation bugs surface immediately.
+    /// When `false`, the panic is caught, logged at ERROR, and the scan is cached
+    /// normally so the query survives. The caller chooses the default.
+    pub strict: bool,
 }
 
 /// Physical optimizer rule for local mode liquid cache.
@@ -98,8 +103,15 @@ impl LocalModeOptimizer {
     /// effect is to inflate the estimate, the conservative direction), and
     /// `tolerance` — the one *relaxing* knob — is forced finite and clamped to
     /// `[1.0, 5.0]` (5.0 = the measured compaction crossover), defaulting to 3.0
-    /// if non-finite.
-    pub fn with_admission_gate(mut self, expansion: f64, safety: f64, tolerance: f64) -> Self {
+    /// if non-finite. `strict` (see [`AdmissionGate::strict`]) turns off the
+    /// panic guard so estimation bugs fail loud.
+    pub fn with_admission_gate(
+        mut self,
+        expansion: f64,
+        safety: f64,
+        tolerance: f64,
+        strict: bool,
+    ) -> Self {
         let estimate_factor = |v: f64| if v.is_finite() && v >= 1.0 { v } else { 1.0 };
         let tolerance = if tolerance.is_finite() {
             tolerance.clamp(1.0, 5.0)
@@ -110,6 +122,7 @@ impl LocalModeOptimizer {
             expansion: estimate_factor(expansion),
             safety: estimate_factor(safety),
             tolerance,
+            strict,
         });
         self
     }
@@ -281,30 +294,57 @@ fn should_bypass(
     footprint / (budget as f64) > gate.tolerance
 }
 
-/// [`should_bypass`], guarded against panics.
+/// [`should_bypass`], with an optional panic guard.
 ///
-/// The gate is a pure performance optimization: caching a scan or reading it
-/// as vanilla parquet yields identical results. So if footprint estimation ever
+/// The gate is a pure performance optimization: caching a scan or reading it as
+/// vanilla parquet yields identical results. So if footprint estimation ever
 /// panics — e.g. a DataFusion API that panics on an unusual plan shape, the
-/// class of bug that `ordered_column_indices` was — we must not let it abort the
-/// query. Catch it, log it (so it is observable, not silently swallowed), and
-/// fall back to caching the scan normally, exactly as if the gate were off.
+/// class of bug that `ordered_column_indices` was — a non-strict gate must not
+/// let it abort the query.
+///
+/// Either way the panic is caught and logged at ERROR with its message (never
+/// silently swallowed), and the log advises the `LIQUID_CACHE_ADMISSION_STRICT`
+/// flag as the alternative behavior:
+///
+/// - `gate.strict == true`: log, then re-raise so the panic aborts the query and
+///   the bug surfaces immediately. The log advises turning the flag *off* to
+///   keep queries running while it is fixed.
+/// - `gate.strict == false`: log, then cache the scan normally so the query
+///   survives. The log advises turning the flag *on* to fail loud instead.
 fn should_bypass_guarded(
     cfg: &FileScanConfig,
     src: &ParquetSource,
     gate: AdmissionGate,
     budget: u64,
 ) -> bool {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         should_bypass(cfg, src, gate, budget)
-    }))
-    .unwrap_or_else(|_| {
-        log::warn!(
-            "liquid-cache admission gate panicked during footprint estimation; \
-             caching scan normally"
-        );
-        false
-    })
+    }));
+    match result {
+        Ok(bypass) => bypass,
+        Err(payload) => {
+            let msg = payload
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("<non-string panic payload>");
+            if gate.strict {
+                log::error!(
+                    "liquid-cache admission gate panicked during footprint estimation: \
+                     {msg}. Aborting query (strict mode). Set \
+                     LIQUID_CACHE_ADMISSION_STRICT=off to fall back to caching and keep \
+                     queries running while this is fixed."
+                );
+                std::panic::resume_unwind(payload);
+            }
+            log::error!(
+                "liquid-cache admission gate panicked during footprint estimation: {msg}; \
+                 caching scan normally. Set LIQUID_CACHE_ADMISSION_STRICT=on to fail loud \
+                 instead."
+            );
+            false
+        }
+    }
 }
 
 /// Boolean per file: `true` if the file may match the predicate (keep it),
@@ -612,7 +652,7 @@ mod tests {
 
         // A huge expansion inflates the estimate past the 1 MB budget → bypass.
         let capped = LocalModeOptimizer::new(build_cache().await)
-            .with_admission_gate(1e9, 1.0, 1.0)
+            .with_admission_gate(1e9, 1.0, 1.0, false)
             .optimize(plan.clone(), &config)
             .unwrap();
         assert!(
@@ -622,7 +662,7 @@ mod tests {
 
         // With a large budget the footprint fits (expansion 1.0) → cached.
         let uncapped = LocalModeOptimizer::new(build_cache_with_budget(usize::MAX).await)
-            .with_admission_gate(1.0, 1.0, 1.0)
+            .with_admission_gate(1.0, 1.0, 1.0, false)
             .optimize(plan, &config)
             .unwrap();
         assert!(
