@@ -2,6 +2,7 @@
 
 mod squeeze_hint;
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use datafusion::{
@@ -284,11 +285,21 @@ fn estimate_required_bytes(cfg: &FileScanConfig, src: &ParquetSource) -> Footpri
 
     let surviving = surviving_files(src, &table_schema, &files);
 
+    // Dedupe by physical file path. DataFusion splits one file into several
+    // byte-range `PartitionedFile`s for parallelism, each a *clone* of the whole
+    // file's statistics (and whole-file object size). Counting every range would
+    // multiply a single file's footprint by the split count, so charge each
+    // distinct file once — pruning is file-granular, so a surviving file means
+    // caching its whole required columns regardless of how it was split.
+    let mut seen: HashSet<object_store::path::Path> = HashSet::new();
     let mut raw_bytes = 0u64;
     let mut surviving_files = 0usize;
     let mut fallback_files = 0usize;
     for (f, keep) in files.iter().zip(surviving.iter()) {
         if !*keep {
+            continue;
+        }
+        if !seen.insert(f.object_meta.location.clone()) {
             continue;
         }
         surviving_files += 1;
