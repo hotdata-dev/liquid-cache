@@ -211,13 +211,20 @@ fn estimate_required_bytes(cfg: &FileScanConfig, src: &ParquetSource) -> u64 {
     // use it; byte accounting still charges only file columns.
     let table_schema = cfg.file_source.table_schema().table_schema().clone();
 
-    let mut required: Vec<usize> = {
-        // Removed in df58; we are pinned to df54. Returns file-column indices.
-        #[allow(deprecated)]
-        match cfg.file_column_projection_indices() {
-            Some(cols) => cols,
-            None => (0..num_file_cols).collect(),
-        }
+    // Columns the scan projects. `column_indices()` collects the source columns
+    // referenced by each projection expression, so it is correct for compound
+    // projections (e.g. `a * b` reads a and b) and — unlike the deprecated
+    // `FileScanConfig::file_column_projection_indices` /
+    // `ProjectionExprs::ordered_column_indices` — does not panic on a
+    // non-column projection expression. Indices are table-schema-relative; keep
+    // only file columns (partition columns are literals, never materialized).
+    let mut required: Vec<usize> = match src.projection() {
+        Some(p) => p
+            .column_indices()
+            .into_iter()
+            .filter(|&i| i < num_file_cols)
+            .collect(),
+        None => (0..num_file_cols).collect(),
     };
     if let Some(pred) = src.filter() {
         for col in collect_columns(&pred) {
@@ -395,6 +402,94 @@ mod tests {
                 Ok(TreeNodeRecursion::Continue)
             })
             .unwrap();
+    }
+
+    /// Regression: a `get_field` on a struct column is pushed into the scan
+    /// projection as a non-`Column` expression (via
+    /// `enable_leaf_expression_pushdown`). The footprint gate must estimate such
+    /// a scan without panicking (the old code called the deprecated
+    /// `ordered_column_indices`, which `.expect`s a bare column and killed the
+    /// query). Runs everywhere: it builds a physical plan and calls the estimate
+    /// directly, so it needs no cache / t4 mount.
+    #[tokio::test]
+    async fn estimate_survives_non_column_scan_projection() {
+        use arrow::array::{ArrayRef, Int64Array, RecordBatch, StructArray};
+        use arrow_schema::{DataType, Field, Fields};
+        use datafusion::physical_expr::expressions::Column;
+        use parquet::arrow::ArrowWriter;
+
+        // A struct column `s {a, b}` plus a flat column `p`.
+        let struct_fields = Fields::from(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Int64, false),
+        ]);
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            Field::new("s", DataType::Struct(struct_fields.clone()), false),
+            Field::new("p", DataType::Int64, false),
+        ]));
+        let s = StructArray::new(
+            struct_fields,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![4, 5, 6])) as ArrayRef,
+            ],
+            None,
+        );
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(s) as ArrayRef,
+                Arc::new(Int64Array::from(vec![7, 8, 9])),
+            ],
+        )
+        .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("structs.parquet");
+        let file = std::fs::File::create(&path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let ctx = SessionContext::new();
+        ctx.register_parquet("t", path.to_str().unwrap(), Default::default())
+            .await
+            .unwrap();
+        let plan = ctx
+            .sql("SELECT s.a FROM t")
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+
+        // Locate the parquet scan and assert its projection really does carry a
+        // non-column expression — otherwise the test wouldn't exercise the bug.
+        let mut parts = None;
+        plan.apply(|node| {
+            if let Some((cfg, src)) = parquet_scan_parts(node) {
+                let has_expr = src
+                    .projection()
+                    .map(|p| p.iter().any(|e| e.expr.downcast_ref::<Column>().is_none()))
+                    .unwrap_or(false);
+                assert!(
+                    has_expr,
+                    "expected a non-column scan projection to exercise the gate; \
+                     if this fails, DataFusion changed leaf-expression pushdown"
+                );
+                parts = Some((cfg.clone(), src.clone()));
+                return Ok(TreeNodeRecursion::Stop);
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })
+        .unwrap();
+        let (cfg, src) = parts.expect("no parquet scan in plan");
+
+        // The call that used to panic. It must return a finite estimate; `s`
+        // (the struct column read by `s.a`) is the one required file column.
+        let bytes = estimate_required_bytes(&cfg, &src);
+        // Whole-file fallback (no per-column Exact stats here) → non-zero, finite.
+        assert!(bytes > 0, "estimate should be a real byte count");
     }
 
     #[tokio::test]
