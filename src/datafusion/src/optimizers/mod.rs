@@ -214,10 +214,12 @@ struct FootprintEstimate {
     raw_bytes: u64,
     /// Number of file columns the scan materializes (projection ∪ predicate).
     required_cols: usize,
-    /// Files kept after predicate pruning (only these are charged).
-    surviving_files: usize,
-    /// Total files in the scan before pruning.
-    total_files: usize,
+    /// Distinct physical files charged (survived pruning, deduped across the
+    /// byte-range splits of the same file).
+    charged_files: usize,
+    /// Raw `PartitionedFile` count before dedupe (one file may be split into
+    /// several byte-range partitions for parallelism).
+    partitioned_files: usize,
     /// Surviving files charged the *whole file* size because they lacked
     /// per-column byte sizes. A non-zero count means the catalog has no
     /// `column_size_bytes` for this table, so the estimate is coarse and
@@ -285,24 +287,26 @@ fn estimate_required_bytes(cfg: &FileScanConfig, src: &ParquetSource) -> Footpri
 
     let surviving = surviving_files(src, &table_schema, &files);
 
-    // Dedupe by physical file path. DataFusion splits one file into several
-    // byte-range `PartitionedFile`s for parallelism, each a *clone* of the whole
-    // file's statistics (and whole-file object size). Counting every range would
-    // multiply a single file's footprint by the split count, so charge each
-    // distinct file once — pruning is file-granular, so a surviving file means
-    // caching its whole required columns regardless of how it was split.
-    let mut seen: HashSet<object_store::path::Path> = HashSet::new();
+    // Dedupe by physical file identity (path + size). DataFusion splits one file
+    // into several byte-range `PartitionedFile`s for parallelism, each a *clone*
+    // of the whole file's statistics (and whole-file object size), differing only
+    // in `range`. Counting every range would multiply a single file's footprint
+    // by the split count, so charge each distinct file once — pruning is
+    // file-granular, so a surviving file means caching its whole required columns
+    // regardless of how it was split. Size is part of the key so two genuinely
+    // distinct objects that share a path are never collapsed.
+    let mut seen: HashSet<(object_store::path::Path, u64)> = HashSet::new();
     let mut raw_bytes = 0u64;
-    let mut surviving_files = 0usize;
+    let mut charged_files = 0usize;
     let mut fallback_files = 0usize;
     for (f, keep) in files.iter().zip(surviving.iter()) {
         if !*keep {
             continue;
         }
-        if !seen.insert(f.object_meta.location.clone()) {
+        if !seen.insert((f.object_meta.location.clone(), f.object_meta.size)) {
             continue;
         }
-        surviving_files += 1;
+        charged_files += 1;
         let (bytes, fell_back) =
             file_required_bytes(f.statistics.as_deref(), f.object_meta.size, &required);
         if fell_back {
@@ -314,8 +318,8 @@ fn estimate_required_bytes(cfg: &FileScanConfig, src: &ParquetSource) -> Footpri
     FootprintEstimate {
         raw_bytes,
         required_cols,
-        surviving_files,
-        total_files: files.len(),
+        charged_files,
+        partitioned_files: files.len(),
         fallback_files,
     }
 }
@@ -360,13 +364,14 @@ fn should_bypass(
         .unwrap_or("<none>");
     log::info!(
         target: "liquid_cache::admission",
-        "admission {verdict}: file={path} projected_cols={cols} files={surv}/{total} \
+        "admission {verdict}: file={path} projected_cols={cols} \
+         charged_files={charged} partitioned_files={total} \
          fallback_files={fb} raw_bytes={raw} footprint_bytes={fp} budget_bytes={budget} \
          threshold_bytes={thr} expansion={exp} safety={saf} tolerance={tol}",
         verdict = if bypass { "BYPASS" } else { "ADMIT" },
         cols = est.required_cols,
-        surv = est.surviving_files,
-        total = est.total_files,
+        charged = est.charged_files,
+        total = est.partitioned_files,
         fb = est.fallback_files,
         raw = est.raw_bytes,
         fp = footprint as u64,
