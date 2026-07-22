@@ -393,8 +393,8 @@ fn should_bypass(
 /// let it abort the query.
 ///
 /// Either way the panic is caught and logged at ERROR with its message (never
-/// silently swallowed), and the log advises the `LIQUID_CACHE_ADMISSION_STRICT`
-/// flag as the alternative behavior:
+/// silently swallowed), and the log advises flipping the admission gate's
+/// `strict` flag for the alternative behavior:
 ///
 /// - `gate.strict == true`: log, then re-raise so the panic aborts the query and
 ///   the bug surfaces immediately. The log advises turning the flag *off* to
@@ -421,16 +421,16 @@ fn should_bypass_guarded(
             if gate.strict {
                 log::error!(
                     "liquid-cache admission gate panicked during footprint estimation: \
-                     {msg}. Aborting query (strict mode). Set \
-                     LIQUID_CACHE_ADMISSION_STRICT=off to fall back to caching and keep \
-                     queries running while this is fixed."
+                     {msg}. Aborting query (admission gate is in strict mode). Configure the \
+                     admission gate with strict=false to fall back to caching and keep queries \
+                     running while this is fixed."
                 );
                 std::panic::resume_unwind(payload);
             }
             log::error!(
                 "liquid-cache admission gate panicked during footprint estimation: {msg}; \
-                 caching scan normally. Set LIQUID_CACHE_ADMISSION_STRICT=on to fail loud \
-                 instead."
+                 caching scan normally. Configure the admission gate with strict=true to fail \
+                 loud instead."
             );
             false
         }
