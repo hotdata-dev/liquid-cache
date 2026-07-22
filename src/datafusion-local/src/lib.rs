@@ -69,9 +69,10 @@ pub struct LiquidCacheLocalBuilder {
     squeeze_policy: Box<dyn SqueezePolicy>,
     /// Hydration policy
     hydration_policy: Box<dyn HydrationPolicy>,
-    /// Footprint-based admission gate `(expansion, safety)`. When set, a scan is
-    /// cached only if its estimated liquid footprint fits the memory budget.
-    admission: Option<(f64, f64)>,
+    /// Footprint-based admission gate `(expansion, safety, tolerance)`. When set,
+    /// a scan is cached only if its estimated liquid footprint stays within
+    /// `budget × tolerance`.
+    admission: Option<(f64, f64, f64)>,
     span: fastrace::Span,
 }
 
@@ -151,10 +152,12 @@ impl LiquidCacheLocalBuilder {
 
     /// Enable the footprint-based admission gate. A scan is cached only when its
     /// estimated liquid footprint (raw required bytes x `expansion` x `safety`)
-    /// fits the cache's memory budget; oversized scans are read directly from the
-    /// parquet source, bypassing the cache. `expansion` and `safety` are `>= 1.0`.
-    pub fn with_admission_gate(mut self, expansion: f64, safety: f64) -> Self {
-        self.admission = Some((expansion, safety));
+    /// stays within `budget × tolerance`; larger scans are read directly from the
+    /// parquet source, bypassing the cache. `expansion`/`safety` are `>= 1.0`
+    /// (inflate the estimate); `tolerance` is `>= 1.0` (overcommit the budget,
+    /// clamped to the measured ~5x compaction crossover).
+    pub fn with_admission_gate(mut self, expansion: f64, safety: f64, tolerance: f64) -> Self {
+        self.admission = Some((expansion, safety, tolerance));
         self
     }
 
@@ -204,8 +207,8 @@ impl LiquidCacheLocalBuilder {
         let cache_ref = Arc::new(cache);
 
         let mut optimizer = LocalModeOptimizer::new(cache_ref.clone());
-        if let Some((expansion, safety)) = self.admission {
-            optimizer = optimizer.with_admission_gate(expansion, safety);
+        if let Some((expansion, safety, tolerance)) = self.admission {
+            optimizer = optimizer.with_admission_gate(expansion, safety, tolerance);
         }
 
         let state = datafusion::execution::SessionStateBuilder::new()

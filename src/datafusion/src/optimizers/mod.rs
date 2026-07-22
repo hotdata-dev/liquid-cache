@@ -32,20 +32,29 @@ use crate::{LiquidCacheParquetRef, LiquidParquetSource, cache::ColumnSqueezeHint
 /// Parameters for the footprint-based admission gate.
 ///
 /// A parquet scan is routed through LiquidCache only if its estimated in-memory
-/// liquid footprint fits the cache budget; oversized scans are left as vanilla
-/// parquet reads (which, if the object store is a cached mount, read from it).
+/// liquid footprint stays within `budget × tolerance`; larger scans are left as
+/// vanilla parquet reads (which, if the object store is a cached mount, read
+/// from it).
 ///
 /// The estimate multiplies the raw required parquet bytes by `expansion`
 /// (parquet -> liquid in-memory blow-up) and `safety` (extra margin); both are
-/// `>= 1.0` so the estimate is conservative. The multipliers are applied to the
-/// *estimate*, never to the budget, so raising them only makes admission
-/// stricter.
+/// `>= 1.0` so the estimate is conservative (over-counts). `tolerance` (`>= 1.0`)
+/// is the one knob applied to the *budget*: it encodes that LiquidCache compacts
+/// in RAM and still beats the fallback mount until footprint reaches ~5x the
+/// budget, so the gate tolerates that overcommit before bypassing.
 #[derive(Debug, Clone, Copy)]
 pub struct AdmissionGate {
-    /// Parquet-bytes -> liquid-in-memory-bytes multiplier (>= 1.0).
+    /// Parquet-bytes -> liquid-in-memory-bytes multiplier (>= 1.0). Inflates the
+    /// estimate (conservative direction).
     pub expansion: f64,
-    /// Extra safety margin on the estimate (>= 1.0).
+    /// Extra safety margin on the estimate (>= 1.0). Conservative direction.
     pub safety: f64,
+    /// Overcommit tolerance: how far the estimated liquid footprint may exceed
+    /// the budget before the scan is denied, in multiples of the budget.
+    /// LiquidCache compacts in RAM up to ~5x over budget before it starts
+    /// thrashing, so caching still wins in that band. This is the one *relaxing*
+    /// knob, so it is clamped to `[1.0, 5.0]` (5.0 = the measured crossover).
+    pub tolerance: f64,
 }
 
 /// Physical optimizer rule for local mode liquid cache.
@@ -81,10 +90,27 @@ impl LocalModeOptimizer {
 
     /// Enable the footprint-based admission gate. A parquet scan is cached only
     /// when its estimated liquid footprint (raw required bytes x `expansion` x
-    /// `safety`) fits the cache's memory budget; otherwise it is read directly
+    /// `safety`) stays within `budget × tolerance`; otherwise it is read directly
     /// from the parquet source, bypassing the cache. See [`AdmissionGate`].
-    pub fn with_admission_gate(mut self, expansion: f64, safety: f64) -> Self {
-        self.admission = Some(AdmissionGate { expansion, safety });
+    ///
+    /// Inputs are sanitized so a misconfigured value can never make the gate
+    /// unsound: `expansion`/`safety` are forced finite and `>= 1.0` (their only
+    /// effect is to inflate the estimate, the conservative direction), and
+    /// `tolerance` — the one *relaxing* knob — is forced finite and clamped to
+    /// `[1.0, 5.0]` (5.0 = the measured compaction crossover), defaulting to 3.0
+    /// if non-finite.
+    pub fn with_admission_gate(mut self, expansion: f64, safety: f64, tolerance: f64) -> Self {
+        let estimate_factor = |v: f64| if v.is_finite() && v >= 1.0 { v } else { 1.0 };
+        let tolerance = if tolerance.is_finite() {
+            tolerance.clamp(1.0, 5.0)
+        } else {
+            3.0
+        };
+        self.admission = Some(AdmissionGate {
+            expansion: estimate_factor(expansion),
+            safety: estimate_factor(safety),
+            tolerance,
+        });
         self
     }
 }
@@ -104,7 +130,7 @@ impl PhysicalOptimizerRule for LocalModeOptimizer {
             // vanilla parquet reads, so oversized scans don't thrash the cache.
             if let Some(gate) = admission
                 && let Some((cfg, src)) = parquet_scan_parts(node)
-                && estimate_liquid_footprint(cfg, src, gate) > budget
+                && should_bypass(cfg, src, gate, budget)
             {
                 return None;
             }
@@ -161,23 +187,24 @@ pub fn rewrite_data_source_plan(
 
 /// If `node` is a parquet `DataSourceExec`, return its `FileScanConfig` and
 /// `ParquetSource`.
-fn parquet_scan_parts(
-    node: &Arc<dyn ExecutionPlan>,
-) -> Option<(&FileScanConfig, &ParquetSource)> {
+fn parquet_scan_parts(node: &Arc<dyn ExecutionPlan>) -> Option<(&FileScanConfig, &ParquetSource)> {
     let dse = node.downcast_ref::<DataSourceExec>()?;
     dse.downcast_to_file_source::<ParquetSource>()
 }
 
-/// Estimate the in-memory liquid footprint (bytes) a parquet scan would occupy
-/// if cached: the required-column bytes of the files that survive the scan's
-/// predicate, scaled by the admission gate's expansion + safety factors.
+/// Estimate the raw required-column parquet bytes a scan reads: the sum, over
+/// the files that survive the scan's predicate, of the byte sizes of the columns
+/// it materializes. This is the byte-accurate, filter-aware size the admission
+/// decision is built on (see [`should_bypass`]); the expansion/safety/tolerance
+/// factors are applied there, not here.
 ///
 /// "Required columns" is the output projection **unioned with the predicate
 /// columns**, since LiquidCache materializes both. Byte sizing uses only
 /// `Exact` per-column sizes; anything else falls back to the whole file size,
 /// so the estimate never *under*-counts (which could wrongly admit an oversized
-/// scan and thrash the cache).
-fn estimate_liquid_footprint(cfg: &FileScanConfig, src: &ParquetSource, gate: AdmissionGate) -> u64 {
+/// scan and thrash the cache). The sum saturates rather than overflowing on
+/// pathological file lists.
+fn estimate_required_bytes(cfg: &FileScanConfig, src: &ParquetSource) -> u64 {
     let num_file_cols = cfg.file_schema().fields().len();
     // Full table schema (file + partition columns). The pushed-down predicate
     // and `PartitionedFile` stats are expressed against it, so file pruning must
@@ -213,16 +240,38 @@ fn estimate_liquid_footprint(cfg: &FileScanConfig, src: &ParquetSource, gate: Ad
 
     let surviving = surviving_files(src, &table_schema, &files);
 
-    let raw: u64 = files
+    files
         .iter()
         .zip(surviving.iter())
         .filter(|(_, keep)| **keep)
-        .map(|(f, _)| {
-            file_required_bytes(f.statistics.as_deref(), f.object_meta.size, &required)
-        })
-        .sum();
+        .map(|(f, _)| file_required_bytes(f.statistics.as_deref(), f.object_meta.size, &required))
+        .fold(0u64, u64::saturating_add)
+}
 
-    ((raw as f64) * gate.expansion.max(1.0) * gate.safety.max(1.0)) as u64
+/// Decide whether a parquet scan should bypass the cache (read as vanilla
+/// parquet) rather than be transcoded into LiquidCache.
+///
+/// The scan's estimated liquid footprint is `raw × expansion × safety`, where
+/// `raw` is [`estimate_required_bytes`]. It bypasses when that footprint exceeds
+/// `budget × tolerance` — equivalently, when the pressure ratio
+/// `footprint / budget` exceeds `tolerance`. The comparison is done in finite
+/// `f64` space to avoid the overflow/truncation of integer `budget × tolerance`.
+///
+/// `budget == 0` (cache disabled / unsized) bypasses any non-empty scan and
+/// admits only zero-footprint ones.
+fn should_bypass(
+    cfg: &FileScanConfig,
+    src: &ParquetSource,
+    gate: AdmissionGate,
+    budget: u64,
+) -> bool {
+    let raw = estimate_required_bytes(cfg, src);
+    // Multipliers are already sanitized to finite, >= 1.0 in `with_admission_gate`.
+    let footprint = (raw as f64) * gate.expansion * gate.safety;
+    if budget == 0 {
+        return footprint > 0.0;
+    }
+    footprint / (budget as f64) > gate.tolerance
 }
 
 /// Boolean per file: `true` if the file may match the predicate (keep it),
@@ -432,7 +481,7 @@ mod tests {
 
         // A huge expansion inflates the estimate past the 1 MB budget → bypass.
         let capped = LocalModeOptimizer::new(build_cache().await)
-            .with_admission_gate(1e9, 1.0)
+            .with_admission_gate(1e9, 1.0, 1.0)
             .optimize(plan.clone(), &config)
             .unwrap();
         assert!(
@@ -442,7 +491,7 @@ mod tests {
 
         // With a large budget the footprint fits (expansion 1.0) → cached.
         let uncapped = LocalModeOptimizer::new(build_cache_with_budget(usize::MAX).await)
-            .with_admission_gate(1.0, 1.0)
+            .with_admission_gate(1.0, 1.0, 1.0)
             .optimize(plan, &config)
             .unwrap();
         assert!(
