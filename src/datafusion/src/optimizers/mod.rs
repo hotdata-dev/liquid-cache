@@ -130,7 +130,7 @@ impl PhysicalOptimizerRule for LocalModeOptimizer {
             // vanilla parquet reads, so oversized scans don't thrash the cache.
             if let Some(gate) = admission
                 && let Some((cfg, src)) = parquet_scan_parts(node)
-                && should_bypass(cfg, src, gate, budget)
+                && should_bypass_guarded(cfg, src, gate, budget)
             {
                 return None;
             }
@@ -279,6 +279,32 @@ fn should_bypass(
         return footprint > 0.0;
     }
     footprint / (budget as f64) > gate.tolerance
+}
+
+/// [`should_bypass`], guarded against panics.
+///
+/// The gate is a pure performance optimization: caching a scan or reading it
+/// as vanilla parquet yields identical results. So if footprint estimation ever
+/// panics — e.g. a DataFusion API that panics on an unusual plan shape, the
+/// class of bug that `ordered_column_indices` was — we must not let it abort the
+/// query. Catch it, log it (so it is observable, not silently swallowed), and
+/// fall back to caching the scan normally, exactly as if the gate were off.
+fn should_bypass_guarded(
+    cfg: &FileScanConfig,
+    src: &ParquetSource,
+    gate: AdmissionGate,
+    budget: u64,
+) -> bool {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        should_bypass(cfg, src, gate, budget)
+    }))
+    .unwrap_or_else(|_| {
+        log::warn!(
+            "liquid-cache admission gate panicked during footprint estimation; \
+             caching scan normally"
+        );
+        false
+    })
 }
 
 /// Boolean per file: `true` if the file may match the predicate (keep it),
