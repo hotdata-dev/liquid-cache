@@ -199,11 +199,11 @@ fn parquet_scan_parts(node: &Arc<dyn ExecutionPlan>) -> Option<(&FileScanConfig,
 /// factors are applied there, not here.
 ///
 /// "Required columns" is the output projection **unioned with the predicate
-/// columns**, since LiquidCache materializes both. Byte sizing uses only
-/// `Exact` per-column sizes; anything else falls back to the whole file size,
-/// so the estimate never *under*-counts (which could wrongly admit an oversized
-/// scan and thrash the cache). The sum saturates rather than overflowing on
-/// pathological file lists.
+/// columns**, since LiquidCache materializes both. Byte sizing uses `Exact` or
+/// `Inexact` per-column sizes (DuckLake records real column sizes but labels
+/// them `Inexact`); a column with an `Absent` size or a file with no stats
+/// falls back to the whole file size. The sum saturates rather than overflowing
+/// on pathological file lists.
 fn estimate_required_bytes(cfg: &FileScanConfig, src: &ParquetSource) -> u64 {
     let num_file_cols = cfg.file_schema().fields().len();
     // Full table schema (file + partition columns). The pushed-down predicate
@@ -317,10 +317,18 @@ fn surviving_files(
 
 /// Bytes the `required` columns of one file contribute to the footprint.
 ///
-/// Uses only `Exact` per-column byte sizes. If the file has no stats, or any
-/// required column lacks an exact size, fall back to the whole-file size — a
-/// deliberate over-estimate, since under-counting could wrongly admit an
-/// oversized scan.
+/// Uses per-column byte sizes that are either `Exact` or `Inexact`. DuckLake
+/// records the real compressed on-disk column size but always labels it
+/// `Inexact` (catalog stats can go stale after deletes/compaction), so
+/// rejecting `Inexact` would make the gate fall back to the whole-file size on
+/// *every* DuckLake scan — charging all columns for a single-column read and
+/// bypassing everything. `Inexact` is a real measurement, not a guess; the
+/// caller's `expansion`/`safety` margin absorbs modest drift, and even a large
+/// stale-low under-count only risks a too-eager admit (perf), never wrong
+/// results.
+///
+/// If the file has no stats, or any required column's size is `Absent`, fall
+/// back to the whole-file size — a deliberate over-estimate.
 fn file_required_bytes(stats: Option<&Statistics>, object_size: u64, required: &[usize]) -> u64 {
     let Some(stats) = stats else {
         return object_size;
@@ -328,7 +336,9 @@ fn file_required_bytes(stats: Option<&Statistics>, object_size: u64, required: &
     let mut sum: u64 = 0;
     for &c in required {
         match stats.column_statistics.get(c).map(|cs| &cs.byte_size) {
-            Some(Precision::Exact(n)) => sum += *n as u64,
+            Some(Precision::Exact(n) | Precision::Inexact(n)) => {
+                sum = sum.saturating_add(*n as u64)
+            }
             _ => return object_size,
         }
     }
@@ -597,9 +607,9 @@ mod tests {
 }
 
 /// Pure unit tests for the footprint byte-math (no cache / no t4 mount, so they
-/// run everywhere). These cover the correctness-critical fallback direction:
-/// under-counting could wrongly admit an oversized scan, so anything not backed
-/// by an `Exact` per-column byte size must fall back to the whole-file size.
+/// run everywhere). These cover the fallback direction: a column with an
+/// `Absent` size (or a file with no stats) falls back to the whole-file size,
+/// while `Exact`/`Inexact` per-column sizes are counted.
 #[cfg(test)]
 mod footprint_tests {
     use super::file_required_bytes;
@@ -636,15 +646,28 @@ mod footprint_tests {
     }
 
     #[test]
-    fn inexact_required_column_falls_back_to_full_file() {
+    fn inexact_required_column_is_counted() {
         let s = stats(vec![
             col(Precision::Exact(100)),
             col(Precision::Inexact(200)),
         ]);
-        // col 1 inexact → not a safe upper bound → whole file.
-        assert_eq!(file_required_bytes(Some(&s), 7000, &[0, 1]), 7000);
-        // col 0 alone is exact → its bytes only.
-        assert_eq!(file_required_bytes(Some(&s), 7000, &[0]), 100);
+        // Inexact is a real (possibly-stale) size, so it counts. DuckLake always
+        // labels byte_size Inexact; rejecting it would bypass every scan.
+        assert_eq!(file_required_bytes(Some(&s), 7000, &[0, 1]), 300);
+        assert_eq!(file_required_bytes(Some(&s), 7000, &[1]), 200);
+    }
+
+    #[test]
+    fn absent_among_sized_columns_falls_back_to_full_file() {
+        let s = stats(vec![
+            col(Precision::Exact(100)),
+            col(Precision::Inexact(200)),
+            col(Precision::Absent),
+        ]);
+        // Any Absent required column → whole file, even mixed with sized ones.
+        assert_eq!(file_required_bytes(Some(&s), 8000, &[0, 1, 2]), 8000);
+        // Dropping the absent column, Exact + Inexact are summed.
+        assert_eq!(file_required_bytes(Some(&s), 8000, &[0, 1]), 300);
     }
 
     #[test]
