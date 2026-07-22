@@ -22,15 +22,15 @@ event=hydrate entry=851968 cached=DiskLiquid new=MemoryLiquid
 event=insert_success entry=851968 kind=MemoryLiquid
 event=insert_success entry=851969 kind=MemoryArrow
 event=insert_failed entry=917505 kind=MemoryArrow
-event=squeeze_begin victims=[851969,917504,851968]
+event=squeeze_begin victims=[851969,851968,917504]
 event=squeeze_victim entry=851969
 event=insert_success entry=851969 kind=MemoryLiquid
-event=squeeze_victim entry=917504
-event=io_write entry=917504 kind=MemorySqueezedLiquid bytes=136440
-event=insert_success entry=917504 kind=MemorySqueezedLiquid
 event=squeeze_victim entry=851968
 event=io_write entry=851968 kind=DiskLiquid bytes=139416
 event=insert_success entry=851968 kind=DiskLiquid
+event=squeeze_victim entry=917504
+event=io_write entry=917504 kind=MemorySqueezedLiquid bytes=136440
+event=insert_success entry=917504 kind=MemorySqueezedLiquid
 event=insert_success entry=917505 kind=MemoryArrow
 event=eval_predicate entry=917505 selection=true cached=MemoryArrow
 event=read entry=851969 selection=true expr=None cached=MemoryLiquid
