@@ -205,6 +205,26 @@ fn parquet_scan_parts(node: &Arc<dyn ExecutionPlan>) -> Option<(&FileScanConfig,
     dse.downcast_to_file_source::<ParquetSource>()
 }
 
+/// A scan's footprint estimate plus the breakdown behind it, for the admission
+/// decision ([`should_bypass`]) and its diagnostic log line.
+#[derive(Debug, Default, Clone, Copy)]
+struct FootprintEstimate {
+    /// Raw required-column parquet bytes (the decision input).
+    raw_bytes: u64,
+    /// Number of file columns the scan materializes (projection ∪ predicate).
+    required_cols: usize,
+    /// Files kept after predicate pruning (only these are charged).
+    surviving_files: usize,
+    /// Total files in the scan before pruning.
+    total_files: usize,
+    /// Surviving files charged the *whole file* size because they lacked
+    /// per-column byte sizes. A non-zero count means the catalog has no
+    /// `column_size_bytes` for this table, so the estimate is coarse and
+    /// over-counts — the signal that the DuckLake write-side size stat is
+    /// missing for this table.
+    fallback_files: usize,
+}
+
 /// Estimate the raw required-column parquet bytes a scan reads: the sum, over
 /// the files that survive the scan's predicate, of the byte sizes of the columns
 /// it materializes. This is the byte-accurate, filter-aware size the admission
@@ -217,7 +237,7 @@ fn parquet_scan_parts(node: &Arc<dyn ExecutionPlan>) -> Option<(&FileScanConfig,
 /// them `Inexact`); a column with an `Absent` size or a file with no stats
 /// falls back to the whole file size. The sum saturates rather than overflowing
 /// on pathological file lists.
-fn estimate_required_bytes(cfg: &FileScanConfig, src: &ParquetSource) -> u64 {
+fn estimate_required_bytes(cfg: &FileScanConfig, src: &ParquetSource) -> FootprintEstimate {
     let num_file_cols = cfg.file_schema().fields().len();
     // Full table schema (file + partition columns). The pushed-down predicate
     // and `PartitionedFile` stats are expressed against it, so file pruning must
@@ -254,18 +274,39 @@ fn estimate_required_bytes(cfg: &FileScanConfig, src: &ParquetSource) -> u64 {
     required.dedup();
 
     let files: Vec<&PartitionedFile> = cfg.file_groups.iter().flat_map(|g| g.files()).collect();
+    let required_cols = required.len();
     if files.is_empty() {
-        return 0;
+        return FootprintEstimate {
+            required_cols,
+            ..FootprintEstimate::default()
+        };
     }
 
     let surviving = surviving_files(src, &table_schema, &files);
 
-    files
-        .iter()
-        .zip(surviving.iter())
-        .filter(|(_, keep)| **keep)
-        .map(|(f, _)| file_required_bytes(f.statistics.as_deref(), f.object_meta.size, &required))
-        .fold(0u64, u64::saturating_add)
+    let mut raw_bytes = 0u64;
+    let mut surviving_files = 0usize;
+    let mut fallback_files = 0usize;
+    for (f, keep) in files.iter().zip(surviving.iter()) {
+        if !*keep {
+            continue;
+        }
+        surviving_files += 1;
+        let (bytes, fell_back) =
+            file_required_bytes(f.statistics.as_deref(), f.object_meta.size, &required);
+        if fell_back {
+            fallback_files += 1;
+        }
+        raw_bytes = raw_bytes.saturating_add(bytes);
+    }
+
+    FootprintEstimate {
+        raw_bytes,
+        required_cols,
+        surviving_files,
+        total_files: files.len(),
+        fallback_files,
+    }
 }
 
 /// Decide whether a parquet scan should bypass the cache (read as vanilla
@@ -285,13 +326,46 @@ fn should_bypass(
     gate: AdmissionGate,
     budget: u64,
 ) -> bool {
-    let raw = estimate_required_bytes(cfg, src);
+    let est = estimate_required_bytes(cfg, src);
     // Multipliers are already sanitized to finite, >= 1.0 in `with_admission_gate`.
-    let footprint = (raw as f64) * gate.expansion * gate.safety;
-    if budget == 0 {
-        return footprint > 0.0;
-    }
-    footprint / (budget as f64) > gate.tolerance
+    let footprint = (est.raw_bytes as f64) * gate.expansion * gate.safety;
+    let bypass = if budget == 0 {
+        footprint > 0.0
+    } else {
+        footprint / (budget as f64) > gate.tolerance
+    };
+
+    // One line per admission decision. Without this the gate is a black box and
+    // every tuning cycle costs a benchmark run to infer decisions from side
+    // effects. `fallback_files > 0` is the flag that the catalog has no
+    // per-column sizes for this table (estimate is coarse / over-counts).
+    let threshold = (budget as f64) * gate.tolerance;
+    let path = cfg
+        .file_groups
+        .iter()
+        .flat_map(|g| g.files())
+        .next()
+        .map(|f| f.object_meta.location.as_ref())
+        .unwrap_or("<none>");
+    log::info!(
+        target: "liquid_cache::admission",
+        "admission {verdict}: file={path} projected_cols={cols} files={surv}/{total} \
+         fallback_files={fb} raw_bytes={raw} footprint_bytes={fp} budget_bytes={budget} \
+         threshold_bytes={thr} expansion={exp} safety={saf} tolerance={tol}",
+        verdict = if bypass { "BYPASS" } else { "ADMIT" },
+        cols = est.required_cols,
+        surv = est.surviving_files,
+        total = est.total_files,
+        fb = est.fallback_files,
+        raw = est.raw_bytes,
+        fp = footprint as u64,
+        thr = threshold as u64,
+        exp = gate.expansion,
+        saf = gate.safety,
+        tol = gate.tolerance,
+    );
+
+    bypass
 }
 
 /// [`should_bypass`], with an optional panic guard.
@@ -395,9 +469,17 @@ fn surviving_files(
 ///
 /// If the file has no stats, or any required column's size is `Absent`, fall
 /// back to the whole-file size — a deliberate over-estimate.
-fn file_required_bytes(stats: Option<&Statistics>, object_size: u64, required: &[usize]) -> u64 {
+///
+/// Returns `(bytes, fell_back)`, where `fell_back` is `true` when the whole-file
+/// over-estimate was used (surfaced in the decision log as the "no per-column
+/// sizes in the catalog" signal).
+fn file_required_bytes(
+    stats: Option<&Statistics>,
+    object_size: u64,
+    required: &[usize],
+) -> (u64, bool) {
     let Some(stats) = stats else {
-        return object_size;
+        return (object_size, true);
     };
     let mut sum: u64 = 0;
     for &c in required {
@@ -405,10 +487,10 @@ fn file_required_bytes(stats: Option<&Statistics>, object_size: u64, required: &
             Some(Precision::Exact(n) | Precision::Inexact(n)) => {
                 sum = sum.saturating_add(*n as u64)
             }
-            _ => return object_size,
+            _ => return (object_size, true),
         }
     }
-    sum
+    (sum, false)
 }
 
 /// If `node` is a `DataSourceExec` over a `ParquetSource`, return an equivalent
@@ -563,9 +645,9 @@ mod tests {
 
         // The call that used to panic. It must return a finite estimate; `s`
         // (the struct column read by `s.a`) is the one required file column.
-        let bytes = estimate_required_bytes(&cfg, &src);
+        let est = estimate_required_bytes(&cfg, &src);
         // Whole-file fallback (no per-column Exact stats here) → non-zero, finite.
-        assert!(bytes > 0, "estimate should be a real byte count");
+        assert!(est.raw_bytes > 0, "estimate should be a real byte count");
     }
 
     #[tokio::test]
@@ -697,7 +779,7 @@ mod footprint_tests {
 
     #[test]
     fn no_stats_falls_back_to_full_file() {
-        assert_eq!(file_required_bytes(None, 5000, &[0, 1]), 5000);
+        assert_eq!(file_required_bytes(None, 5000, &[0, 1]), (5000, true));
     }
 
     #[test]
@@ -707,8 +789,8 @@ mod footprint_tests {
             col(Precision::Exact(200)),
             col(Precision::Exact(400)),
         ]);
-        // required = cols 0 and 2 → 100 + 400, ignoring col 1.
-        assert_eq!(file_required_bytes(Some(&s), 9999, &[0, 2]), 500);
+        // required = cols 0 and 2 → 100 + 400, ignoring col 1. No fallback.
+        assert_eq!(file_required_bytes(Some(&s), 9999, &[0, 2]), (500, false));
     }
 
     #[test]
@@ -717,10 +799,10 @@ mod footprint_tests {
             col(Precision::Exact(100)),
             col(Precision::Inexact(200)),
         ]);
-        // Inexact is a real (possibly-stale) size, so it counts. DuckLake always
-        // labels byte_size Inexact; rejecting it would bypass every scan.
-        assert_eq!(file_required_bytes(Some(&s), 7000, &[0, 1]), 300);
-        assert_eq!(file_required_bytes(Some(&s), 7000, &[1]), 200);
+        // Inexact is a real (possibly-stale) size, so it counts (no fallback).
+        // DuckLake always labels byte_size Inexact; rejecting it would bypass all.
+        assert_eq!(file_required_bytes(Some(&s), 7000, &[0, 1]), (300, false));
+        assert_eq!(file_required_bytes(Some(&s), 7000, &[1]), (200, false));
     }
 
     #[test]
@@ -730,22 +812,25 @@ mod footprint_tests {
             col(Precision::Inexact(200)),
             col(Precision::Absent),
         ]);
-        // Any Absent required column → whole file, even mixed with sized ones.
-        assert_eq!(file_required_bytes(Some(&s), 8000, &[0, 1, 2]), 8000);
-        // Dropping the absent column, Exact + Inexact are summed.
-        assert_eq!(file_required_bytes(Some(&s), 8000, &[0, 1]), 300);
+        // Any Absent required column → whole file (fallback), even mixed with sized ones.
+        assert_eq!(
+            file_required_bytes(Some(&s), 8000, &[0, 1, 2]),
+            (8000, true)
+        );
+        // Dropping the absent column, Exact + Inexact are summed (no fallback).
+        assert_eq!(file_required_bytes(Some(&s), 8000, &[0, 1]), (300, false));
     }
 
     #[test]
     fn missing_required_column_falls_back_to_full_file() {
         let s = stats(vec![col(Precision::Exact(100))]);
-        // required col 5 doesn't exist → conservative whole file.
-        assert_eq!(file_required_bytes(Some(&s), 3000, &[0, 5]), 3000);
+        // required col 5 doesn't exist → conservative whole file (fallback).
+        assert_eq!(file_required_bytes(Some(&s), 3000, &[0, 5]), (3000, true));
     }
 
     #[test]
     fn absent_byte_size_falls_back_to_full_file() {
         let s = stats(vec![col(Precision::Absent)]);
-        assert_eq!(file_required_bytes(Some(&s), 2000, &[0]), 2000);
+        assert_eq!(file_required_bytes(Some(&s), 2000, &[0]), (2000, true));
     }
 }
