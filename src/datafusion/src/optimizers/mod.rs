@@ -32,17 +32,21 @@ use crate::{LiquidCacheParquetRef, LiquidParquetSource, cache::ColumnSqueezeHint
 
 /// Parameters for the footprint-based admission gate.
 ///
-/// A parquet scan is routed through LiquidCache only if its estimated in-memory
-/// liquid footprint stays within `budget × tolerance`; larger scans are left as
+/// A parquet scan is routed through LiquidCache only if its estimated liquid
+/// footprint stays within the admission threshold; larger scans are left as
 /// vanilla parquet reads (which, if the object store is a cached mount, read
 /// from it).
 ///
+/// The threshold spans both cache tiers, weighted differently (see
+/// [`admission_threshold`]): `memory × tolerance + disk`. A scan that overflows
+/// RAM spills to the on-disk liquid tier rather than thrashing, so disk capacity
+/// counts toward what fits — at face value, since only the RAM tier has the
+/// measured compaction overcommit. With the disk tier off it is just
+/// `memory × tolerance`.
+///
 /// The estimate multiplies the raw required parquet bytes by `expansion`
 /// (parquet -> liquid in-memory blow-up) and `safety` (extra margin); both are
-/// `>= 1.0` so the estimate is conservative (over-counts). `tolerance` (`>= 1.0`)
-/// is the one knob applied to the *budget*: it encodes that LiquidCache compacts
-/// in RAM and still beats the fallback mount until footprint reaches ~5x the
-/// budget, so the gate tolerates that overcommit before bypassing.
+/// `>= 1.0` so the estimate is conservative (over-counts).
 #[derive(Debug, Clone, Copy)]
 pub struct AdmissionGate {
     /// Parquet-bytes -> liquid-in-memory-bytes multiplier (>= 1.0). Inflates the
@@ -50,11 +54,13 @@ pub struct AdmissionGate {
     pub expansion: f64,
     /// Extra safety margin on the estimate (>= 1.0). Conservative direction.
     pub safety: f64,
-    /// Overcommit tolerance: how far the estimated liquid footprint may exceed
-    /// the budget before the scan is denied, in multiples of the budget.
-    /// LiquidCache compacts in RAM up to ~5x over budget before it starts
-    /// thrashing, so caching still wins in that band. This is the one *relaxing*
-    /// knob, so it is clamped to `[1.0, 5.0]` (5.0 = the measured crossover).
+    /// Overcommit tolerance on the *memory* tier: how far the estimated liquid
+    /// footprint may exceed the RAM budget before it counts against the scan, in
+    /// multiples of the RAM budget. LiquidCache compacts in RAM up to ~5x over
+    /// budget before it starts thrashing, so caching still wins in that band.
+    /// This is the one *relaxing* knob, so it is clamped to `[1.0, 5.0]` (5.0 =
+    /// the measured crossover). It applies only to memory; the disk tier is
+    /// counted at face value (see [`admission_threshold`]).
     pub tolerance: f64,
     /// Fail-loud mode. When `true`, a panic during footprint estimation is *not*
     /// caught — it aborts the query — so estimation bugs surface immediately.
@@ -96,8 +102,9 @@ impl LocalModeOptimizer {
 
     /// Enable the footprint-based admission gate. A parquet scan is cached only
     /// when its estimated liquid footprint (raw required bytes x `expansion` x
-    /// `safety`) stays within `budget × tolerance`; otherwise it is read directly
-    /// from the parquet source, bypassing the cache. See [`AdmissionGate`].
+    /// `safety`) stays within the admission threshold (`memory × tolerance +
+    /// disk`); otherwise it is read directly from the parquet source, bypassing
+    /// the cache. See [`AdmissionGate`] and [`admission_threshold`].
     ///
     /// Inputs are sanitized so a misconfigured value can never make the gate
     /// unsound: `expansion`/`safety` are forced finite and `>= 1.0` (their only
@@ -138,13 +145,21 @@ impl PhysicalOptimizerRule for LocalModeOptimizer {
         let analysis = HintAnalyzer::analyze(&plan);
         let cache = self.cache.clone();
         let admission = self.admission;
-        let budget = self.cache.max_memory_bytes() as u64;
+        // The gate sizes against both cache tiers, not just RAM: when a scan
+        // overflows memory its entries spill to the on-disk liquid tier (NVMe)
+        // instead of thrashing. They are weighted differently (see
+        // `admission_threshold`) — RAM carries the compaction overcommit, disk
+        // counts at face value — so they are passed through separately. With the
+        // disk tier off (`max_disk_bytes == 0`) the threshold is exactly the RAM
+        // budget, so gate behaviour is unchanged there.
+        let memory_budget = self.cache.max_memory_bytes() as u64;
+        let disk_budget = self.cache.max_disk_bytes() as u64;
         let mut convert = |node: &Arc<dyn ExecutionPlan>, hints: ColumnSqueezeHints| {
             // Leave scans whose estimated liquid footprint exceeds the budget as
             // vanilla parquet reads, so oversized scans don't thrash the cache.
             if let Some(gate) = admission
                 && let Some((cfg, src)) = parquet_scan_parts(node)
-                && should_bypass_guarded(cfg, src, gate, budget)
+                && should_bypass_guarded(cfg, src, gate, memory_budget, disk_budget)
             {
                 return None;
             }
@@ -324,37 +339,48 @@ fn estimate_required_bytes(cfg: &FileScanConfig, src: &ParquetSource) -> Footpri
     }
 }
 
+/// The admission threshold in bytes: the largest estimated liquid footprint the
+/// cache admits before a scan is bypassed.
+///
+/// The two tiers are weighted differently. The memory tier carries the
+/// compaction overcommit — `tolerance`, the measured RAM crossover where
+/// LiquidCache still beats the fallback mount despite spilling. The on-disk
+/// liquid tier is counted at **face value (1×)**: a scan that overflows RAM
+/// spills to NVMe without thrashing, so its capacity needs no overcommit — and
+/// extending the RAM crossover factor to disk has no evidence behind it. Hence
+/// `memory × tolerance + disk` rather than `(memory + disk) × tolerance`.
+///
+/// Computed in `f64` so the `memory × tolerance` product cannot overflow `u64`.
+/// A zero threshold (both tiers unsized / cache disabled) bypasses any non-empty
+/// scan and admits only zero-footprint ones.
+fn admission_threshold(memory_budget: u64, disk_budget: u64, tolerance: f64) -> f64 {
+    (memory_budget as f64) * tolerance + (disk_budget as f64)
+}
+
 /// Decide whether a parquet scan should bypass the cache (read as vanilla
 /// parquet) rather than be transcoded into LiquidCache.
 ///
 /// The scan's estimated liquid footprint is `raw × expansion × safety`, where
 /// `raw` is [`estimate_required_bytes`]. It bypasses when that footprint exceeds
-/// `budget × tolerance` — equivalently, when the pressure ratio
-/// `footprint / budget` exceeds `tolerance`. The comparison is done in finite
-/// `f64` space to avoid the overflow/truncation of integer `budget × tolerance`.
-///
-/// `budget == 0` (cache disabled / unsized) bypasses any non-empty scan and
-/// admits only zero-footprint ones.
+/// the [`admission_threshold`] (`memory × tolerance + disk`). The comparison is
+/// done in finite `f64` space to avoid integer overflow.
 fn should_bypass(
     cfg: &FileScanConfig,
     src: &ParquetSource,
     gate: AdmissionGate,
-    budget: u64,
+    memory_budget: u64,
+    disk_budget: u64,
 ) -> bool {
     let est = estimate_required_bytes(cfg, src);
     // Multipliers are already sanitized to finite, >= 1.0 in `with_admission_gate`.
     let footprint = (est.raw_bytes as f64) * gate.expansion * gate.safety;
-    let bypass = if budget == 0 {
-        footprint > 0.0
-    } else {
-        footprint / (budget as f64) > gate.tolerance
-    };
+    let threshold = admission_threshold(memory_budget, disk_budget, gate.tolerance);
+    let bypass = footprint > threshold;
 
     // One line per admission decision. Without this the gate is a black box and
     // every tuning cycle costs a benchmark run to infer decisions from side
     // effects. `fallback_files > 0` is the flag that the catalog has no
     // per-column sizes for this table (estimate is coarse / over-counts).
-    let threshold = (budget as f64) * gate.tolerance;
     let path = cfg
         .file_groups
         .iter()
@@ -366,8 +392,9 @@ fn should_bypass(
         target: "liquid_cache::admission",
         "admission {verdict}: file={path} projected_cols={cols} \
          charged_files={charged} partitioned_files={total} \
-         fallback_files={fb} raw_bytes={raw} footprint_bytes={fp} budget_bytes={budget} \
-         threshold_bytes={thr} expansion={exp} safety={saf} tolerance={tol}",
+         fallback_files={fb} raw_bytes={raw} footprint_bytes={fp} \
+         memory_bytes={mem} disk_bytes={disk} threshold_bytes={thr} \
+         expansion={exp} safety={saf} tolerance={tol}",
         verdict = if bypass { "BYPASS" } else { "ADMIT" },
         cols = est.required_cols,
         charged = est.charged_files,
@@ -375,6 +402,8 @@ fn should_bypass(
         fb = est.fallback_files,
         raw = est.raw_bytes,
         fp = footprint as u64,
+        mem = memory_budget,
+        disk = disk_budget,
         thr = threshold as u64,
         exp = gate.expansion,
         saf = gate.safety,
@@ -405,10 +434,11 @@ fn should_bypass_guarded(
     cfg: &FileScanConfig,
     src: &ParquetSource,
     gate: AdmissionGate,
-    budget: u64,
+    memory_budget: u64,
+    disk_budget: u64,
 ) -> bool {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        should_bypass(cfg, src, gate, budget)
+        should_bypass(cfg, src, gate, memory_budget, disk_budget)
     }));
     match result {
         Ok(bypass) => bypass,
@@ -689,6 +719,13 @@ mod tests {
     }
 
     async fn build_cache_with_budget(max_memory_bytes: usize) -> LiquidCacheParquetRef {
+        build_cache_with_mem_disk(max_memory_bytes, 0).await
+    }
+
+    async fn build_cache_with_mem_disk(
+        max_memory_bytes: usize,
+        max_disk_bytes: usize,
+    ) -> LiquidCacheParquetRef {
         let tmp_dir = tempfile::tempdir().unwrap();
         let store = t4::mount(tmp_dir.path().join("liquid_cache.t4"))
             .await
@@ -697,7 +734,7 @@ mod tests {
             LiquidCacheParquet::new(
                 8192,
                 max_memory_bytes,
-                usize::MAX,
+                max_disk_bytes,
                 store,
                 Box::new(LiquidPolicy::new()),
                 Box::new(TranscodeSqueezeEvict),
@@ -766,6 +803,52 @@ mod tests {
         assert!(
             has_liquid_source(&uncapped),
             "fitting scan should be wrapped in LiquidParquetSource"
+        );
+    }
+
+    /// The budget counts the on-disk liquid tier, not just memory: the same scan
+    /// that a memory-only budget bypasses is admitted once the disk tier has room
+    /// for it (evicted entries spill to disk instead of thrashing).
+    #[tokio::test]
+    async fn test_admission_gate_counts_disk_tier() {
+        let ctx = SessionContext::new();
+        ctx.register_parquet(
+            "nano_hits",
+            "../../examples/nano_hits.parquet",
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        let plan = ctx
+            .sql("SELECT * FROM nano_hits WHERE \"URL\" like 'https://%' limit 10")
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let config = ConfigOptions::default();
+
+        // A huge expansion inflates the estimate past the 1 MB memory budget, and
+        // with no disk tier there is nowhere else for it to fit → bypass.
+        let mem_only = LocalModeOptimizer::new(build_cache_with_mem_disk(1_000_000, 0).await)
+            .with_admission_gate(1e9, 1.0, 1.0, false)
+            .optimize(plan.clone(), &config)
+            .unwrap();
+        assert!(
+            !has_liquid_source(&mem_only),
+            "with a memory-only budget the oversized estimate should bypass"
+        );
+
+        // Same 1 MB memory and same estimate, but now a large disk tier — the
+        // budget is memory + disk, so the scan fits and is cached.
+        let with_disk =
+            LocalModeOptimizer::new(build_cache_with_mem_disk(1_000_000, usize::MAX).await)
+                .with_admission_gate(1e9, 1.0, 1.0, false)
+                .optimize(plan, &config)
+                .unwrap();
+        assert!(
+            has_liquid_source(&with_disk),
+            "the disk tier's capacity should count toward the budget and admit the scan"
         );
     }
 }
@@ -848,5 +931,48 @@ mod footprint_tests {
     fn absent_byte_size_falls_back_to_full_file() {
         let s = stats(vec![col(Precision::Absent)]);
         assert_eq!(file_required_bytes(Some(&s), 2000, &[0]), (2000, true));
+    }
+}
+
+/// Pure unit tests for the admission threshold arithmetic (no cache / no t4
+/// mount, so they run everywhere — including where `direct_io` is unavailable).
+#[cfg(test)]
+mod threshold_tests {
+    use super::admission_threshold;
+
+    #[test]
+    fn memory_carries_tolerance_disk_is_face_value() {
+        // memory × tolerance + disk = 10×3 + 100 = 130. This pins the exact
+        // formula: it is NOT (memory+disk)×tolerance (=330), max(mem,disk) (=100),
+        // nor disk alone (=100).
+        assert_eq!(admission_threshold(10, 100, 3.0), 130.0);
+    }
+
+    #[test]
+    fn disk_off_is_memory_times_tolerance() {
+        // With no disk tier the threshold is exactly the RAM budget × tolerance,
+        // so gate behaviour matches the pre-disk model.
+        assert_eq!(admission_threshold(1_000, 0, 3.0), 3_000.0);
+    }
+
+    #[test]
+    fn disk_gets_no_overcommit() {
+        // A pure-disk budget contributes at 1×, never scaled by tolerance.
+        assert_eq!(admission_threshold(0, 500, 5.0), 500.0);
+    }
+
+    #[test]
+    fn both_tiers_unsized_is_zero() {
+        // Zero threshold => any non-empty scan bypasses (cache disabled/unsized).
+        assert_eq!(admission_threshold(0, 0, 3.0), 0.0);
+    }
+
+    #[test]
+    fn large_memory_times_tolerance_does_not_overflow() {
+        // memory × tolerance is computed in f64, so a budget near u64::MAX cannot
+        // wrap (the bug an integer `budget * tolerance` would have).
+        let t = admission_threshold(u64::MAX, 0, 5.0);
+        assert!(t > u64::MAX as f64);
+        assert!(t.is_finite());
     }
 }
