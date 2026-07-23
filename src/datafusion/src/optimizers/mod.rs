@@ -37,8 +37,8 @@ use crate::{LiquidCacheParquetRef, LiquidParquetSource, cache::ColumnSqueezeHint
 /// vanilla parquet reads (which, if the object store is a cached mount, read
 /// from it).
 ///
-/// The threshold spans both cache tiers, weighted differently (see
-/// [`admission_threshold`]): `memory × tolerance + disk`. A scan that overflows
+/// The threshold spans both cache tiers, weighted differently:
+/// `memory × tolerance + disk`. A scan that overflows
 /// RAM spills to the on-disk liquid tier rather than thrashing, so disk capacity
 /// counts toward what fits — at face value, since only the RAM tier has the
 /// measured compaction overcommit. With the disk tier off it is just
@@ -60,7 +60,7 @@ pub struct AdmissionGate {
     /// budget before it starts thrashing, so caching still wins in that band.
     /// This is the one *relaxing* knob, so it is clamped to `[1.0, 5.0]` (5.0 =
     /// the measured crossover). It applies only to memory; the disk tier is
-    /// counted at face value (see [`admission_threshold`]).
+    /// counted at face value (`memory × tolerance + disk`), never scaled by it.
     pub tolerance: f64,
     /// Fail-loud mode. When `true`, a panic during footprint estimation is *not*
     /// caught — it aborts the query — so estimation bugs surface immediately.
@@ -104,7 +104,7 @@ impl LocalModeOptimizer {
     /// when its estimated liquid footprint (raw required bytes x `expansion` x
     /// `safety`) stays within the admission threshold (`memory × tolerance +
     /// disk`); otherwise it is read directly from the parquet source, bypassing
-    /// the cache. See [`AdmissionGate`] and [`admission_threshold`].
+    /// the cache. See [`AdmissionGate`].
     ///
     /// Inputs are sanitized so a misconfigured value can never make the gate
     /// unsound: `expansion`/`safety` are forced finite and `>= 1.0` (their only
