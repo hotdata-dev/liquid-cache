@@ -23,6 +23,7 @@ use datafusion::{
 
 use crate::LiquidCacheLocalBuilder;
 mod date_optimizer;
+mod page_index;
 mod squeeze;
 mod variants;
 

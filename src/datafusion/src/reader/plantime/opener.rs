@@ -176,8 +176,14 @@ impl FileOpener for LiquidParquetOpener {
 
             file_metrics.files_ranges_pruned_statistics.add_matched(1);
 
+            // `Optional`, not `Required`: the page index is an optimization, not
+            // a correctness requirement. It drives page-level pruning below,
+            // which no-ops when the index is absent. `Required` instead fails
+            // the whole read with `missing offset index` on any file that
+            // advertises a page index while one of its column chunks carries no
+            // offset index — a shape valid parquet is free to have.
             let mut options = ArrowReaderOptions::new()
-                .with_page_index_policy(parquet::file::metadata::PageIndexPolicy::Required);
+                .with_page_index_policy(parquet::file::metadata::PageIndexPolicy::Optional);
             let mut metadata_timer = file_metrics.metadata_load_time.timer();
 
             // Begin by loading the metadata from the underlying reader (note
