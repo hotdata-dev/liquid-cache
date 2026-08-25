@@ -185,9 +185,19 @@ impl LiquidCacheLocalBuilder {
         config.options_mut().execution.parquet.skip_metadata = false;
         config.options_mut().execution.batch_size = self.batch_size;
 
-        let store = t4::mount(self.cache_dir.join("liquid_cache.t4"))
-            .await
-            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+        // t4's default MountOptions enable direct_io, which only Linux
+        // supports; everywhere else the mount fails outright. Keep direct_io
+        // on Linux (production) and fall back to buffered I/O elsewhere so
+        // local mode — and its tests — run on macOS dev machines.
+        let store = t4::mount_with_options(
+            self.cache_dir.join("liquid_cache.t4"),
+            t4::MountOptions {
+                direct_io: cfg!(target_os = "linux"),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
         #[cfg(not(test))]
         let cache = LiquidCacheParquet::new(
             self.batch_size,
