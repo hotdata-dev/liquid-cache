@@ -57,9 +57,10 @@ async fn liquid_ctx(cache_dir: &Path) -> Result<SessionContext> {
     Ok(ctx)
 }
 
-/// Runs `sql` twice — the first execution reads parquet and populates the
-/// cache, the second serves from the liquid cache — and asserts the row count
-/// both times, so both read paths are covered.
+/// Runs `sql` twice and asserts the row count both times, so the second
+/// execution exercises the cached path where one exists. (Only the first
+/// `assert_rows` against a table starts from a cold cache; later calls in the
+/// same test run warm/warm.)
 async fn assert_rows(ctx: &SessionContext, sql: &str, expected: usize) {
     for run in ["cold", "warm"] {
         let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
