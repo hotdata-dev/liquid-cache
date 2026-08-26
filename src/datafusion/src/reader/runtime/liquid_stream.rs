@@ -161,6 +161,13 @@ fn build_liquid_cache_reader(
         .row_group(context.row_group_idx)
         .num_rows() as usize;
     let cache_batch_size = context.cached_row_group.batch_size();
+    // `current_batch_id` counts read batches, and the parquet fallback multiplies
+    // it by `cache_batch_size` to get a row offset. The two only agree while the
+    // read size *is* the cache size — see issue #13 for what happens otherwise.
+    debug_assert_eq!(
+        context.batch_size, cache_batch_size,
+        "reader must read in cache-sized batches"
+    );
     LiquidCacheReader::new(LiquidCacheReaderConfig {
         batch_size: context.batch_size,
         selection: context.selection,
@@ -281,9 +288,12 @@ impl LiquidStreamBuilder {
         // in cache-sized batches or it addresses the wrong rows. Take the size from
         // the cache rather than the session config; `DataSourceExec::execute` splits
         // the output down to the session batch size afterwards.
-        let batch_size = liquid_cache
-            .batch_size()
-            .min(self.metadata.file_metadata().num_rows() as usize);
+        // Not clamped to the file's row count: `take_next_batch` already stops at
+        // the end of the selection, and a clamp is the one thing that could make
+        // this diverge from `cache_batch_size` again. It would also set the size to
+        // 0 for a file whose metadata claims no rows while its row groups hold
+        // some, which reads as an empty result rather than an error.
+        let batch_size = liquid_cache.batch_size();
 
         let schema_descr = self.metadata.file_metadata().schema_descr();
         let projection_column_ids = get_root_column_ids(schema_descr, &self.projection);
@@ -388,10 +398,10 @@ impl Stream for LiquidStream {
                         Poll::Ready(Some(Err(e))) => {
                             // A decode fault belongs to this one query. Panicking
                             // here crosses the host's task boundary and takes down
-                            // a worker thread, so return the error instead. Drop the
-                            // remaining row groups so the stream ends after it.
+                            // a worker thread, so return the error instead. Dropping
+                            // the remaining row groups makes the next poll fall
+                            // through `Init` to `Ready(None)`, ending the stream.
                             self.row_groups.clear();
-                            self.state = StreamState::Init;
                             return Poll::Ready(Some(Err(e.into())));
                         }
                         Poll::Ready(None) => {
@@ -469,20 +479,7 @@ mod tests {
     use std::fs::File;
     use std::sync::Arc;
 
-    /// t4's default `MountOptions` enable `direct_io`, which only Linux supports;
-    /// everywhere else the mount fails outright. Match what
-    /// `LiquidCacheLocalBuilder` does so these tests run on macOS too.
-    async fn test_mount(dir: &std::path::Path) -> t4::Store {
-        t4::mount_with_options(
-            dir.join("liquid_cache.t4"),
-            t4::MountOptions {
-                direct_io: cfg!(target_os = "linux"),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap()
-    }
+    use crate::test_utils::mount_test_store as test_mount;
 
     fn write_two_row_group_file(path: &std::path::Path, schema: SchemaRef) {
         let file = File::create(path).unwrap();

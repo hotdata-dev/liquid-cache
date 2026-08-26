@@ -321,12 +321,20 @@ impl FileSource for LiquidParquetSource {
         Ok(Arc::new(opener))
     }
 
-    /// Deliberately ignores the session batch size: the reader indexes the cache
+    /// Deliberately ignores the requested batch size: the reader indexes the cache
     /// by batch id, and the fallback turns that id back into rows with the cache
-    /// batch size, so reading at any other size addresses the wrong rows. Callers
-    /// still get session-sized batches downstream, because `DataSourceExec::execute`
-    /// wraps every source stream in a `BatchSplitStream` sized by the session
-    /// config.
+    /// batch size, so reading at any other size addresses the wrong rows (issue
+    /// #13). Callers still get session-sized batches downstream, because
+    /// `DataSourceExec::execute` wraps every source stream in a `BatchSplitStream`
+    /// sized by the session config.
+    ///
+    /// Two consequences worth knowing. A `FileScanConfig::batch_size` override is
+    /// discarded rather than honored — `BatchSplitStream` is sized by the session
+    /// config, not by that field, so a caller setting it below the session size
+    /// gets larger batches than asked for. Nothing sets it today. And because
+    /// `BatchSplitStream` slices, and slices share the parent buffer, a scan still
+    /// holds a whole cache-sized chunk per column while its slices are alive; the
+    /// session batch size bounds batch *length*, not scan memory.
     fn with_batch_size(&self, _batch_size: usize) -> Arc<dyn FileSource> {
         Arc::new(self.clone())
     }

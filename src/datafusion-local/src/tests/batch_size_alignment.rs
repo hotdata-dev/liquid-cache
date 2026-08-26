@@ -19,20 +19,36 @@ use arrow_schema::{DataType, Field, Schema};
 use datafusion::error::Result;
 use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
 use parquet::arrow::ArrowWriter;
+use parquet::file::properties::WriterProperties;
 use tempfile::TempDir;
 
 use crate::LiquidCacheLocalBuilder;
 
 /// One row group of `rows` rows, `id` ascending from 0.
 fn write_single_row_group(path: &Path, rows: i64) {
+    write_parquet(path, rows, None, None);
+}
+
+/// `rows` rows of ascending `id`, optionally split into row groups of
+/// `row_group_rows` and data pages of `page_rows`. A small page size gives the
+/// page index enough granularity to prune *within* a row group, which is what
+/// produces a row selection that starts partway into it.
+fn write_parquet(path: &Path, rows: i64, row_group_rows: Option<usize>, page_rows: Option<usize>) {
     let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![Arc::new(Int64Array::from((0..rows).collect::<Vec<_>>()))],
     )
     .unwrap();
+    let mut props = WriterProperties::builder();
+    if let Some(n) = row_group_rows {
+        props = props.set_max_row_group_row_count(Some(n));
+    }
+    if let Some(n) = page_rows {
+        props = props.set_data_page_row_count_limit(n);
+    }
     let file = std::fs::File::create(path).unwrap();
-    let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+    let mut writer = ArrowWriter::try_new(file, schema, Some(props.build())).unwrap();
     writer.write(&batch).unwrap();
     writer.close().unwrap();
 }
@@ -44,9 +60,18 @@ async fn ctx_with_session_batch_size(
     parquet_path: &Path,
     session_batch_size: usize,
 ) -> Result<SessionContext> {
+    ctx_with_session_batch_size_and_partitions(cache_dir, parquet_path, session_batch_size, 1).await
+}
+
+async fn ctx_with_session_batch_size_and_partitions(
+    cache_dir: &Path,
+    parquet_path: &Path,
+    session_batch_size: usize,
+    target_partitions: usize,
+) -> Result<SessionContext> {
     std::fs::create_dir_all(cache_dir)?;
     let mut config = SessionConfig::new();
-    config.options_mut().execution.target_partitions = 1;
+    config.options_mut().execution.target_partitions = target_partitions;
     let (ctx, cache) = LiquidCacheLocalBuilder::new()
         .with_cache_dir(cache_dir.to_path_buf())
         .build(config)
@@ -189,5 +214,71 @@ async fn session_batch_size_still_bounds_the_batches_the_caller_receives() {
             "batches exceeded the session batch size: {oversized:?}"
         );
         assert_eq!(ids_of(&batches), (0..12000).collect::<Vec<_>>());
+    }
+}
+
+/// `current_batch_id` restarts at 0 for each row group, so a file with several of
+/// them exercises the mapping repeatedly rather than once.
+#[tokio::test]
+async fn multi_row_group_scan_stays_aligned() {
+    let tmp = TempDir::new().unwrap();
+    let parquet_path = tmp.path().join("t.parquet");
+    write_parquet(&parquet_path, 30000, Some(5000), None);
+    let ctx = ctx_with_session_batch_size(&tmp.path().join("cache"), &parquet_path, 2145)
+        .await
+        .unwrap();
+
+    for _ in 0..2 {
+        let ids = collect_ids(&ctx, "SELECT id FROM t").await;
+        assert_eq!(ids, (0..30000).collect::<Vec<_>>());
+    }
+}
+
+/// The subtle case: page-index pruning leaves a row selection that starts partway
+/// *into* a row group, so the first window is mostly `RowSelector::skip`. Batch id
+/// 0 must still mean physical rows `0..cache_batch_size` of that row group —
+/// `take_next_batch` counts skipped rows toward the window, which is what keeps
+/// the id aligned with the stored chunk. A pushed-down predicate also routes
+/// through `evaluate_selection_with_predicate(current_batch_id, ..)`, so this
+/// covers the filter path's use of the same id.
+#[tokio::test]
+async fn pruned_filtered_scan_stays_aligned() {
+    let tmp = TempDir::new().unwrap();
+    let parquet_path = tmp.path().join("t.parquet");
+    write_parquet(&parquet_path, 30000, Some(5000), Some(500));
+    let ctx = ctx_with_session_batch_size(&tmp.path().join("cache"), &parquet_path, 2145)
+        .await
+        .unwrap();
+
+    for _ in 0..2 {
+        let ids = collect_ids(&ctx, "SELECT id FROM t WHERE id >= 9500 AND id < 10500").await;
+        assert_eq!(ids, (9500..10500).collect::<Vec<_>>());
+    }
+    for _ in 0..2 {
+        let ids = collect_ids(&ctx, "SELECT id FROM t WHERE id >= 25000").await;
+        assert_eq!(ids, (25000..30000).collect::<Vec<_>>());
+    }
+}
+
+/// Several partitions read the same file concurrently, each with its own reader
+/// and its own `current_batch_id` sequence.
+#[tokio::test]
+async fn multi_partition_scan_stays_aligned() {
+    let tmp = TempDir::new().unwrap();
+    let parquet_path = tmp.path().join("t.parquet");
+    write_parquet(&parquet_path, 30000, Some(5000), None);
+    let ctx = ctx_with_session_batch_size_and_partitions(
+        &tmp.path().join("cache"),
+        &parquet_path,
+        2145,
+        4,
+    )
+    .await
+    .unwrap();
+
+    for _ in 0..2 {
+        let mut ids = collect_ids(&ctx, "SELECT id FROM t").await;
+        ids.sort_unstable();
+        assert_eq!(ids, (0..30000).collect::<Vec<_>>());
     }
 }
