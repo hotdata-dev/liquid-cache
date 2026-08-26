@@ -45,7 +45,6 @@ use super::source::CachedMetaReaderFactory;
 pub struct LiquidParquetOpener {
     partition_index: usize,
     projection: ProjectionExprs,
-    batch_size: usize,
     limit: Option<usize>,
     predicate: Option<Arc<dyn PhysicalExpr>>,
     table_schema: TableSchema,
@@ -63,7 +62,6 @@ impl LiquidParquetOpener {
     pub fn new(
         partition_index: usize,
         projection: ProjectionExprs,
-        batch_size: usize,
         limit: Option<usize>,
         predicate: Option<Arc<dyn PhysicalExpr>>,
         table_schema: TableSchema,
@@ -78,7 +76,6 @@ impl LiquidParquetOpener {
         Self {
             partition_index,
             projection,
-            batch_size,
             limit,
             predicate,
             table_schema,
@@ -112,7 +109,6 @@ impl FileOpener for LiquidParquetOpener {
             &self.metrics,
         );
 
-        let batch_size = self.batch_size;
         let logical_file_schema = Arc::clone(self.table_schema.file_schema());
         let output_schema = Arc::new(
             self.projection
@@ -310,7 +306,6 @@ impl FileOpener for LiquidParquetOpener {
 
             let mut liquid_builder =
                 LiquidStreamBuilder::new(async_file_reader, Arc::clone(reader_metadata.metadata()))
-                    .with_batch_size(batch_size)
                     .with_row_groups(row_group_indexes)
                     .with_projection(mask)
                     .with_selection(row_selection)

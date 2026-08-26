@@ -171,7 +171,6 @@ pub struct LiquidParquetSource {
     page_pruning_predicate: Option<Arc<PagePruningAccessPlanFilter>>,
     table_parquet_options: TableParquetOptions,
     liquid_cache: LiquidCacheParquetRef,
-    batch_size: Option<usize>,
     projection: ProjectionExprs,
     table_schema: TableSchema,
     span: Option<Arc<fastrace::Span>>,
@@ -263,7 +262,6 @@ impl LiquidParquetSource {
         let mut v = Self {
             table_schema,
             table_parquet_options: source.table_parquet_options().clone(),
-            batch_size: Some(liquid_cache.batch_size()),
             liquid_cache,
             projection,
             metrics: source.metrics().clone(),
@@ -308,8 +306,6 @@ impl FileSource for LiquidParquetSource {
         let opener = LiquidParquetOpener::new(
             partition,
             self.projection.clone(),
-            self.batch_size
-                .expect("Batch size must be set before creating LiquidParquetOpener"),
             base_config.limit,
             self.predicate.clone(),
             self.table_schema.clone(),
@@ -325,10 +321,14 @@ impl FileSource for LiquidParquetSource {
         Ok(Arc::new(opener))
     }
 
-    fn with_batch_size(&self, batch_size: usize) -> Arc<dyn FileSource> {
-        let mut conf = self.clone();
-        conf.batch_size = Some(batch_size);
-        Arc::new(conf)
+    /// Deliberately ignores the session batch size: the reader indexes the cache
+    /// by batch id, and the fallback turns that id back into rows with the cache
+    /// batch size, so reading at any other size addresses the wrong rows. Callers
+    /// still get session-sized batches downstream, because `DataSourceExec::execute`
+    /// wraps every source stream in a `BatchSplitStream` sized by the session
+    /// config.
+    fn with_batch_size(&self, _batch_size: usize) -> Arc<dyn FileSource> {
+        Arc::new(self.clone())
     }
 
     fn table_schema(&self) -> &TableSchema {

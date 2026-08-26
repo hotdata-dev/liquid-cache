@@ -201,8 +201,6 @@ pub struct LiquidStreamBuilder {
 
     pub(crate) metadata: Arc<ParquetMetaData>,
 
-    pub(crate) batch_size: usize,
-
     pub(crate) row_groups: Option<Vec<usize>>,
 
     pub(crate) projection: ProjectionMask,
@@ -223,7 +221,6 @@ impl LiquidStreamBuilder {
         Self {
             input,
             metadata,
-            batch_size: 1024,
             row_groups: None,
             projection: ProjectionMask::all(),
             filter: None,
@@ -232,11 +229,6 @@ impl LiquidStreamBuilder {
             offset: None,
             span: None,
         }
-    }
-
-    pub fn with_batch_size(mut self, batch_size: usize) -> Self {
-        self.batch_size = batch_size;
-        self
     }
 
     pub fn with_row_groups(mut self, row_groups: Vec<usize>) -> Self {
@@ -284,8 +276,13 @@ impl LiquidStreamBuilder {
             None => (0..self.metadata.row_groups().len()).collect(),
         };
 
-        let batch_size = self
-            .batch_size
+        // The reader indexes the cache by batch id, and the parquet fallback turns
+        // that id back into rows with the cache batch size, so the scan must read
+        // in cache-sized batches or it addresses the wrong rows. Take the size from
+        // the cache rather than the session config; `DataSourceExec::execute` splits
+        // the output down to the session batch size afterwards.
+        let batch_size = liquid_cache
+            .batch_size()
             .min(self.metadata.file_metadata().num_rows() as usize);
 
         let schema_descr = self.metadata.file_metadata().schema_descr();
@@ -389,7 +386,13 @@ impl Stream for LiquidStream {
                             return Poll::Ready(Some(Ok(batch)));
                         }
                         Poll::Ready(Some(Err(e))) => {
-                            panic!("Decoding next batch error: {e:?}");
+                            // A decode fault belongs to this one query. Panicking
+                            // here crosses the host's task boundary and takes down
+                            // a worker thread, so return the error instead. Drop the
+                            // remaining row groups so the stream ends after it.
+                            self.row_groups.clear();
+                            self.state = StreamState::Init;
+                            return Poll::Ready(Some(Err(e.into())));
                         }
                         Poll::Ready(None) => {
                             let batch_reader = *batch_reader;
@@ -466,6 +469,21 @@ mod tests {
     use std::fs::File;
     use std::sync::Arc;
 
+    /// t4's default `MountOptions` enable `direct_io`, which only Linux supports;
+    /// everywhere else the mount fails outright. Match what
+    /// `LiquidCacheLocalBuilder` does so these tests run on macOS too.
+    async fn test_mount(dir: &std::path::Path) -> t4::Store {
+        t4::mount_with_options(
+            dir.join("liquid_cache.t4"),
+            t4::MountOptions {
+                direct_io: cfg!(target_os = "linux"),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+    }
+
     fn write_two_row_group_file(path: &std::path::Path, schema: SchemaRef) {
         let file = File::create(path).unwrap();
         let mut writer = ArrowWriter::try_new(file, schema.clone(), None).unwrap();
@@ -537,9 +555,7 @@ mod tests {
             &metrics,
         );
 
-        let store = t4::mount(tmp_dir.path().join("liquid_cache.t4"))
-            .await
-            .unwrap();
+        let store = test_mount(tmp_dir.path()).await;
         let cache = Arc::new(
             LiquidCacheParquet::new(
                 4,
@@ -558,7 +574,6 @@ mod tests {
             [0, 1],
         );
         let mut builder = LiquidStreamBuilder::new(input, Arc::clone(reader_metadata.metadata()))
-            .with_batch_size(4)
             .with_row_groups(vec![0, 1])
             .with_projection(projection);
         if let Some(row_filter) = row_filter {
@@ -669,9 +684,7 @@ mod tests {
             &metrics,
         );
 
-        let store = t4::mount(tmp_dir.path().join("liquid_cache.t4"))
-            .await
-            .unwrap();
+        let store = test_mount(tmp_dir.path()).await;
         let cache = Arc::new(
             LiquidCacheParquet::new(
                 4,
@@ -690,7 +703,6 @@ mod tests {
             projection_columns,
         );
         let mut builder = LiquidStreamBuilder::new(input, Arc::clone(reader_metadata.metadata()))
-            .with_batch_size(4)
             .with_row_groups(vec![0, 1])
             .with_projection(projection);
         if let Some(row_filter) = row_filter {
@@ -727,9 +739,7 @@ mod tests {
             &metrics,
         );
 
-        let store = t4::mount(tmp_dir.path().join("liquid_cache.t4"))
-            .await
-            .unwrap();
+        let store = test_mount(tmp_dir.path()).await;
         let cache = Arc::new(
             LiquidCacheParquet::new(
                 4,
@@ -748,7 +758,6 @@ mod tests {
             projection_columns,
         );
         let stream = LiquidStreamBuilder::new(input, Arc::clone(reader_metadata.metadata()))
-            .with_batch_size(4)
             .with_row_groups(vec![0])
             .with_projection(projection)
             .build(cached_file.clone())
@@ -898,5 +907,120 @@ mod tests {
         assert!(is_cached(&row_group, 0, 1).await);
         assert!(is_cached(&row_group, 0, 2).await);
         assert!(is_cached(&row_group, 0, 3).await);
+    }
+
+    /// Build a stream over a single row group with the given cache batch size.
+    async fn make_single_row_group_stream_with_cache_batch_size(
+        row_count: i32,
+        cache_batch_size: usize,
+        limit: Option<usize>,
+    ) -> (LiquidStream, Arc<LiquidCacheParquet>, tempfile::TempDir) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let parquet_path = tmp_dir.path().join("data.parquet");
+        write_single_row_group_file(&parquet_path, schema.clone(), (0..row_count).collect());
+        let metadata_file = File::open(&parquet_path).unwrap();
+        let reader_metadata =
+            ArrowReaderMetadata::load(&metadata_file, ArrowReaderOptions::new()).unwrap();
+        let object_store = Arc::new(LocalFileSystem::new_with_prefix(tmp_dir.path()).unwrap());
+        let partitioned_file = PartitionedFile::new(
+            "data.parquet",
+            std::fs::metadata(&parquet_path).unwrap().len(),
+        );
+        let metrics = ExecutionPlanMetricsSet::new();
+        let input = CachedMetaReaderFactory::new(object_store).create_liquid_reader(
+            0,
+            partitioned_file,
+            None,
+            &metrics,
+        );
+
+        let store = test_mount(tmp_dir.path()).await;
+        let cache = Arc::new(
+            LiquidCacheParquet::new(
+                cache_batch_size,
+                1024 * 1024 * 1024,
+                1024 * 1024 * 1024,
+                store,
+                Box::new(LiquidPolicy::new()),
+                Box::new(Evict),
+                Box::new(AlwaysHydrate::new()),
+            )
+            .await,
+        );
+        let cached_file = cache.register_or_get_file("data.parquet".to_string(), schema);
+        let projection = ProjectionMask::roots(
+            reader_metadata.metadata().file_metadata().schema_descr(),
+            [0],
+        );
+        let stream = LiquidStreamBuilder::new(input, Arc::clone(reader_metadata.metadata()))
+            .with_row_groups(vec![0])
+            .with_limit(limit)
+            .with_projection(projection)
+            .build(cached_file)
+            .unwrap();
+        (stream, cache, tmp_dir)
+    }
+
+    async fn try_collect_a(stream: LiquidStream) -> Result<Vec<i32>, ParquetError> {
+        let batches: Vec<_> = stream.collect().await;
+        let mut a = Vec::new();
+        for batch in batches {
+            let batch = batch?;
+            let array = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            a.extend(array.iter().map(|value| value.unwrap()));
+        }
+        Ok(a)
+    }
+
+    /// Issue #13: the reader indexes the cache by batch id and the parquet
+    /// fallback turns that id back into rows with the cache batch size, so the
+    /// scan must read in cache-sized batches. `build` takes the size from the
+    /// cache for exactly that reason — assert the emitted batches follow it and
+    /// the rows stay in order, including when the size does not divide the row
+    /// group evenly.
+    #[tokio::test]
+    async fn stream_reads_in_cache_sized_batches() {
+        let (stream, _cache, _tmp) =
+            make_single_row_group_stream_with_cache_batch_size(20, 8, None).await;
+        let batches: Vec<_> = stream
+            .map(|batch| batch.expect("valid liquid stream batch"))
+            .collect()
+            .await;
+
+        assert_eq!(
+            batches.iter().map(|b| b.num_rows()).collect::<Vec<_>>(),
+            vec![8, 8, 4]
+        );
+        let values: Vec<i32> = batches
+            .iter()
+            .flat_map(|batch| {
+                let array = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                array.iter().map(|value| value.unwrap()).collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(values, (0..20).collect::<Vec<_>>());
+    }
+
+    /// A limit that stops the scan mid-row-group still yields aligned rows. This
+    /// is the shape that used to return rows from the wrong offsets without any
+    /// error at all.
+    #[tokio::test]
+    async fn limited_scan_stays_aligned() {
+        let (stream, _cache, _tmp) =
+            make_single_row_group_stream_with_cache_batch_size(32, 8, Some(12)).await;
+        let values = try_collect_a(stream).await.expect("stream should succeed");
+        assert_eq!(values, (0..12).collect::<Vec<_>>());
     }
 }
