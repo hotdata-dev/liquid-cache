@@ -49,7 +49,6 @@ impl ReaderFactory {
         row_group_idx: usize,
         selection: Option<RowSelection>,
         projection: ProjectionMask,
-        batch_size: usize,
     ) -> PlanResult {
         let meta = self.metadata.row_group(row_group_idx);
 
@@ -120,7 +119,6 @@ impl ReaderFactory {
         let context = PlanningContext {
             row_group_idx,
             selection,
-            batch_size,
             cached_row_group,
             cache_projection,
             projection_column_ids,
@@ -144,7 +142,6 @@ fn build_projection_schema(file_schema: &SchemaRef, projection_column_ids: &[usi
 struct PlanningContext {
     row_group_idx: usize,
     selection: RowSelection,
-    batch_size: usize,
     cached_row_group: CachedRowGroupRef,
     cache_projection: ProjectionMask,
     projection_column_ids: Vec<usize>,
@@ -160,16 +157,13 @@ fn build_liquid_cache_reader(
         .metadata
         .row_group(context.row_group_idx)
         .num_rows() as usize;
-    let cache_batch_size = context.cached_row_group.batch_size();
     // `current_batch_id` counts read batches, and the parquet fallback multiplies
-    // it by `cache_batch_size` to get a row offset. The two only agree while the
-    // read size *is* the cache size — see issue #13 for what happens otherwise.
-    debug_assert_eq!(
-        context.batch_size, cache_batch_size,
-        "reader must read in cache-sized batches"
-    );
+    // it by `cache_batch_size` to get a row offset, so the read size and the cache
+    // size must be the same number. Read it once and use it for both rather than
+    // deriving them separately — issue #13 was the two drifting apart.
+    let cache_batch_size = context.cached_row_group.batch_size();
     LiquidCacheReader::new(LiquidCacheReaderConfig {
-        batch_size: context.batch_size,
+        batch_size: cache_batch_size,
         selection: context.selection,
         row_filter: reader_factory.filter.take(),
         cached_row_group: context.cached_row_group,
@@ -283,18 +277,10 @@ impl LiquidStreamBuilder {
             None => (0..self.metadata.row_groups().len()).collect(),
         };
 
-        // The reader indexes the cache by batch id, and the parquet fallback turns
-        // that id back into rows with the cache batch size, so the scan must read
-        // in cache-sized batches or it addresses the wrong rows. Take the size from
-        // the cache rather than the session config; `DataSourceExec::execute` splits
-        // the output down to the session batch size afterwards.
-        // Not clamped to the file's row count: `take_next_batch` already stops at
-        // the end of the selection, and a clamp is the one thing that could make
-        // this diverge from `cache_batch_size` again. It would also set the size to
-        // 0 for a file whose metadata claims no rows while its row groups hold
-        // some, which reads as an empty result rather than an error.
-        let batch_size = liquid_cache.batch_size();
-
+        // No batch size is chosen here. The scan must read in cache-sized batches
+        // (see `build_liquid_cache_reader`), so the size is read from the cached row
+        // group at the one place it is used, and the session config never reaches
+        // the reader at all.
         let schema_descr = self.metadata.file_metadata().schema_descr();
         let projection_column_ids = get_root_column_ids(schema_descr, &self.projection);
         let file_schema = liquid_cache.schema();
@@ -332,7 +318,6 @@ impl LiquidStreamBuilder {
             schema,
             row_groups,
             projection: self.projection,
-            batch_size,
             selection: self.selection,
             reader: Some(reader),
             state: StreamState::Init,
@@ -350,8 +335,6 @@ pub struct LiquidStream {
 
     projection: ProjectionMask,
 
-    batch_size: usize,
-
     selection: Option<RowSelection>,
 
     /// This is an option so it can be moved into a future
@@ -367,7 +350,6 @@ impl std::fmt::Debug for LiquidStream {
         f.debug_struct("ParquetRecordBatchStream")
             .field("metadata", &self.metadata)
             .field("schema", &self.schema)
-            .field("batch_size", &self.batch_size)
             .field("projection", &self.projection)
             .field("state", &self.state)
             .finish()
@@ -428,12 +410,10 @@ impl Stream for LiquidStream {
 
                     LocalSpan::add_event(Event::new("LiquidStream::plan_row_group"));
                     let projection = self.projection.clone();
-                    let batch_size = self.batch_size;
                     let maybe_context = self.reader.as_mut().expect("lost reader").plan_row_group(
                         row_group_idx,
                         selection,
                         projection,
-                        batch_size,
                     );
                     match maybe_context {
                         Some(context) => {
