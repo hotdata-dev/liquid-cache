@@ -575,9 +575,7 @@ mod tests {
     async fn rewrite_plan_inner(plan: Arc<dyn ExecutionPlan>) {
         let expected_schema = plan.schema();
         let tmp_dir = tempfile::tempdir().unwrap();
-        let store = t4::mount(tmp_dir.path().join("liquid_cache.t4"))
-            .await
-            .unwrap();
+        let store = crate::test_utils::mount_test_store(tmp_dir.path()).await;
         let liquid_cache = Arc::new(
             LiquidCacheParquet::new(
                 8192,
@@ -727,9 +725,7 @@ mod tests {
         max_disk_bytes: usize,
     ) -> LiquidCacheParquetRef {
         let tmp_dir = tempfile::tempdir().unwrap();
-        let store = t4::mount(tmp_dir.path().join("liquid_cache.t4"))
-            .await
-            .unwrap();
+        let store = crate::test_utils::mount_test_store(tmp_dir.path()).await;
         Arc::new(
             LiquidCacheParquet::new(
                 8192,

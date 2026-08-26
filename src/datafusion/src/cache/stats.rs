@@ -182,9 +182,7 @@ mod tests {
     #[tokio::test]
     async fn test_stats_writer() -> Result<(), ParquetError> {
         let tmp_dir = tempfile::tempdir().unwrap();
-        let store = t4::mount(tmp_dir.path().join("liquid_cache.t4"))
-            .await
-            .unwrap();
+        let store = crate::test_utils::mount_test_store(tmp_dir.path()).await;
         let cache = LiquidCacheParquet::new(
             1024,
             usize::MAX,
