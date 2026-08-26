@@ -19,3 +19,6 @@ perf.data*
 probex*.parquet
 .codex
 
+
+# insta pending snapshots are local artifacts
+*.snap.new
