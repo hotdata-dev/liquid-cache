@@ -186,6 +186,9 @@ enum StreamState {
     Init,
     /// Decoding a batch from cache
     ReadFromCache(Box<LiquidCacheReader>),
+    /// A decode error ended the scan. Terminal: the stream yields `None` from
+    /// here on and never plans another row group.
+    Finished,
 }
 
 impl std::fmt::Debug for StreamState {
@@ -193,6 +196,7 @@ impl std::fmt::Debug for StreamState {
         match self {
             StreamState::Init => write!(f, "StreamState::Init"),
             StreamState::ReadFromCache(_) => write!(f, "StreamState::Decoding"),
+            StreamState::Finished => write!(f, "StreamState::Finished"),
         }
     }
 }
@@ -380,10 +384,13 @@ impl Stream for LiquidStream {
                         Poll::Ready(Some(Err(e))) => {
                             // A decode fault belongs to this one query. Panicking
                             // here crosses the host's task boundary and takes down
-                            // a worker thread, so return the error instead. Dropping
-                            // the remaining row groups makes the next poll fall
-                            // through `Init` to `Ready(None)`, ending the stream.
-                            self.row_groups.clear();
+                            // a worker thread, so return the error instead.
+                            //
+                            // Terminal, and that matters for correctness: the reader
+                            // emits this error without incrementing `current_batch_id`
+                            // and leaves itself `Ready`, so resuming would read the
+                            // next window against a stale batch id.
+                            self.state = StreamState::Finished;
                             return Poll::Ready(Some(Err(e.into())));
                         }
                         Poll::Ready(None) => {
@@ -397,6 +404,10 @@ impl Stream for LiquidStream {
                             return Poll::Pending;
                         }
                     }
+                }
+                StreamState::Finished => {
+                    self.state = StreamState::Finished;
+                    return Poll::Ready(None);
                 }
                 StreamState::Init => {
                     let row_group_idx = match self.row_groups.pop_front() {
@@ -955,6 +966,39 @@ mod tests {
             a.extend(array.iter().map(|value| value.unwrap()));
         }
         Ok(a)
+    }
+
+    /// A decode error ends the scan, and the stream stays ended.
+    ///
+    /// This load-bears for correctness rather than tidiness. On an error the
+    /// reader returns `ProcessResult::Emit(Err(..))` without incrementing
+    /// `current_batch_id` and leaves itself in `ReaderState::Ready`, so a scan
+    /// that resumed would read the next selection window against a stale batch
+    /// id — the misalignment this module exists to prevent. The file here has two
+    /// row groups, so a stream that failed to terminate would carry on into the
+    /// second one instead of stopping.
+    #[tokio::test]
+    async fn decode_error_ends_the_stream() {
+        let (stream, _cache, _cached_file, tmp_dir) =
+            make_liquid_stream(1024 * 1024, 1024 * 1024, None).await;
+
+        // Truncate the file now that the metadata is cached, so the parquet
+        // fallback's byte reads fail on the first batch.
+        File::create(tmp_dir.path().join("data.parquet")).unwrap();
+
+        let mut stream = Box::pin(stream);
+        assert!(
+            matches!(stream.next().await, Some(Err(_))),
+            "expected the truncated file to surface a decode error"
+        );
+        assert!(
+            stream.next().await.is_none(),
+            "stream must not resume into the next row group after an error"
+        );
+        assert!(
+            stream.next().await.is_none(),
+            "stream must stay ended once it has ended"
+        );
     }
 
     /// Issue #13: the reader indexes the cache by batch id and the parquet
