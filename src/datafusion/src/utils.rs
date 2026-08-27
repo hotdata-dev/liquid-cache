@@ -312,6 +312,113 @@ pub fn extract_execution_metrics(
 mod tests {
     use super::*;
 
+    /// Spells out `boolean_buffer_and_then`'s contract directly: walk `left`,
+    /// and each time it is set, take the next bit of `right`.
+    ///
+    /// The BMI2 differential tests below can only run on x86_64, so without an
+    /// independent reference the portable path — which is what executes on
+    /// aarch64, and on any x86_64 CPU without BMI2, since the fast path is
+    /// chosen at runtime — would have no test of its own at all.
+    ///
+    /// Both operands are assumed to start at bit 0. Neither implementation
+    /// handles a bit-offset (sliced) `left`, and they disagree with each other
+    /// on a bit-offset `right`; the sole caller only ever passes offset-0
+    /// buffers. Offset handling is tracked separately and is deliberately not
+    /// exercised here.
+    fn reference_and_then(left: &BooleanBuffer, right: &BooleanBuffer) -> Vec<bool> {
+        debug_assert_eq!(left.offset(), 0);
+        debug_assert_eq!(right.offset(), 0);
+        let mut right_bits = right.iter();
+        (0..left.len())
+            .map(|i| {
+                left.value(i)
+                    && right_bits
+                        .next()
+                        .expect("right must have one bit per set bit of left")
+            })
+            .collect()
+    }
+
+    fn buffer_of(bits: &[bool]) -> BooleanBuffer {
+        let mut builder = BooleanBufferBuilder::new(bits.len());
+        for &bit in bits {
+            builder.append(bit);
+        }
+        builder.finish()
+    }
+
+    fn assert_matches_reference(left: &[bool], right: &[bool]) {
+        let (left, right) = (buffer_of(left), buffer_of(right));
+        assert_eq!(
+            left.count_set_bits(),
+            right.len(),
+            "malformed case: right must have one bit per set bit of left"
+        );
+
+        let expected = reference_and_then(&left, &right);
+        let actual = boolean_buffer_and_then(&left, &right);
+
+        assert_eq!(actual.len(), left.len());
+        let actual: Vec<bool> = (0..actual.len()).map(|i| actual.value(i)).collect();
+        assert_eq!(actual, expected);
+    }
+
+    /// Lengths chosen around the 64-bit word boundary the BMI2 path iterates on:
+    /// below one word, exactly one word, and a word plus a partial tail.
+    #[test]
+    fn and_then_matches_reference_across_shapes() {
+        // Empty.
+        assert_matches_reference(&[], &[]);
+
+        // Nothing selected: `right` is empty, output is all false.
+        assert_matches_reference(&[false; 8], &[]);
+        assert_matches_reference(&[false; 100], &[]);
+
+        // Everything selected, so `left.len() == right.len()` — this is the
+        // early-return path that clones `right` outright.
+        assert_matches_reference(
+            &[true; 8],
+            &[true, false, true, false, true, false, true, true],
+        );
+
+        for len in [1, 7, 8, 9, 63, 64, 65, 127, 128, 129, 200] {
+            // Every third bit set, alternating bits in `right`.
+            let left: Vec<bool> = (0..len).map(|i| i % 3 == 0).collect();
+            let right: Vec<bool> = (0..left.iter().filter(|b| **b).count())
+                .map(|i| i % 2 == 0)
+                .collect();
+            assert_matches_reference(&left, &right);
+
+            // All set, and all of `right` set: output must equal `left`.
+            let all: Vec<bool> = vec![true; len];
+            assert_matches_reference(&all, &vec![true; len]);
+
+            // All set, none of `right` set: output must be entirely false.
+            assert_matches_reference(&all, &vec![false; len]);
+
+            // A single set bit at the very end, the tail-handling case.
+            let mut last = vec![false; len];
+            last[len - 1] = true;
+            assert_matches_reference(&last, &[true]);
+            assert_matches_reference(&last, &[false]);
+        }
+    }
+
+    /// The documented shortcut: when every bit of `left` is set, the result is
+    /// `right` unchanged.
+    #[test]
+    fn and_then_returns_right_when_left_selects_everything() {
+        let left = buffer_of(&[true; 64]);
+        let right = buffer_of(&(0..64).map(|i| i % 5 == 0).collect::<Vec<_>>());
+
+        let result = boolean_buffer_and_then(&left, &right);
+
+        assert_eq!(result.len(), 64);
+        for i in 0..64 {
+            assert_eq!(result.value(i), right.value(i), "mismatch at {i}");
+        }
+    }
+
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn test_boolean_buffer_and_then_bmi2_large() {
