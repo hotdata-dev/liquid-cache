@@ -465,27 +465,39 @@ async fn test_provide_schema2() {
     // Off x86_64 the byte-exact snapshot cannot match, because FSST picks a
     // different symbol table (see above). Bound the figures instead of skipping
     // the test: arm64 is a production target, so it still deserves a tripwire on
-    // a gross accounting regression, and everything else this test covers — the
-    // plans, the cache hits, the tier split, the `Utf8`-declared schema over a
-    // `string_view` file — is architecture-independent and worth running.
+    // a gross accounting regression. The plan text is only checked byte-for-byte
+    // on x86_64, but what this test covers besides it — the DataFusion-vs-liquid
+    // column equality, the cache hits, the tier split, the `Utf8`-declared schema
+    // over a `string_view` file — is architecture-independent and worth running.
     #[cfg(not(target_arch = "x86_64"))]
-    assert_memory_bytes_within_1pct(&snapshot, &[1000915, 1000915, 1036304]);
+    assert_memory_bytes_within_1pct(
+        &snapshot,
+        include_str!("snapshots/liquid_cache_datafusion_local__tests__provide_schema2.snap"),
+    );
 }
 
-/// Checks each `usage.memory_bytes` line in `snapshot` against the value recorded
-/// on x86_64, allowing 1%.
+/// Checks each `usage.memory_bytes` line in `snapshot` against the figure the
+/// committed x86_64 snapshot records for the same query, allowing 1%.
+///
+/// `recorded` is the `.snap` file itself rather than a hand-copied array, so
+/// regenerating the snapshot on x86_64 with `cargo insta accept` cannot leave
+/// this assertion silently checking stale numbers.
 ///
 /// The known architecture difference is ~0.1% (935 bytes in ~1 MiB), so 1% has an
 /// order of magnitude of headroom while still catching the kind of regression that
 /// matters — a buffer counted twice, or a tier accounted at the wrong size.
 #[cfg(not(target_arch = "x86_64"))]
-fn assert_memory_bytes_within_1pct(snapshot: &str, expected: &[u64]) {
-    let actual: Vec<u64> = snapshot
-        .lines()
-        .filter_map(|line| line.strip_prefix("usage.memory_bytes: "))
-        .map(|value| value.trim().parse().expect("memory_bytes must be a number"))
-        .collect();
+fn assert_memory_bytes_within_1pct(snapshot: &str, recorded: &str) {
+    let actual = memory_bytes(snapshot);
+    let expected = memory_bytes(recorded);
 
+    // Both sides are parsed with the same predicate, so a changed prefix would
+    // empty both and make the length check below pass on nothing.
+    assert!(
+        !expected.is_empty(),
+        "found no `usage.memory_bytes` readings in the committed snapshot; the \
+         stats format has changed and this assertion is no longer reading anything"
+    );
     assert_eq!(
         actual.len(),
         expected.len(),
@@ -494,7 +506,7 @@ fn assert_memory_bytes_within_1pct(snapshot: &str, expected: &[u64]) {
         actual.len()
     );
 
-    for (idx, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+    for (idx, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
         let drift = actual.abs_diff(expected);
         assert!(
             drift * 100 <= expected,
@@ -503,6 +515,19 @@ fn assert_memory_bytes_within_1pct(snapshot: &str, expected: &[u64]) {
              be ~0.1%, so this is a real accounting change"
         );
     }
+}
+
+/// Pulls every `usage.memory_bytes` figure out of a stats snapshot, in order.
+///
+/// Works on both the live snapshot and a committed `.snap` file: insta writes the
+/// snapshot body unindented after its YAML header, so the same prefix matches.
+#[cfg(not(target_arch = "x86_64"))]
+fn memory_bytes(snapshot: &str) -> Vec<u64> {
+    snapshot
+        .lines()
+        .filter_map(|line| line.strip_prefix("usage.memory_bytes: "))
+        .map(|value| value.trim().parse().expect("memory_bytes must be a number"))
+        .collect()
 }
 
 #[tokio::test]
