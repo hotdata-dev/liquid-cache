@@ -16,48 +16,44 @@
 use std::path::Path;
 use std::sync::Once;
 
-/// Whether this target mounts the on-disk store with DIRECT I/O.
-///
-/// `false` means the OS page cache holds an uncounted second copy of cached
-/// pages, so byte accounting understates real residency. Benchmark and
-/// capacity-planning numbers are only meaningful when this is `true`.
-pub const DIRECT_IO: bool = cfg!(target_os = "linux");
-
-/// Mount the on-disk store for a LiquidCache instance at `path`.
+/// Mount the on-disk store for a LiquidCache instance at `path`, which is the
+/// full path to the store file.
 ///
 /// Prefer this over calling [`t4::mount`] directly: it is the one place that
 /// decides the store's I/O mode, so the choice cannot drift between the cache
 /// builders, the server, benches and tests.
-#[cfg(target_os = "linux")]
-pub async fn mount(path: impl AsRef<Path>) -> t4::Result<t4::Store> {
-    t4::mount(path).await
-}
-
-/// Mount the on-disk store for a LiquidCache instance at `path`.
 ///
-/// See the [module docs](self) for what buffered I/O costs off Linux.
-#[cfg(not(target_os = "linux"))]
+/// On Linux this is exactly [`t4::mount`] — `direct_io` and `dsync` both come
+/// out `true`, matching [`t4::MountOptions::default`]. See the
+/// [module docs](self) for what the buffered fallback costs elsewhere.
 pub async fn mount(path: impl AsRef<Path>) -> t4::Result<t4::Store> {
-    static WARNED: Once = Once::new();
-    WARNED.call_once(|| {
-        log::warn!(
-            "mounting the liquid cache store with buffered I/O: t4 supports DIRECT I/O on Linux \
-             only. The cache is functional, but the OS page cache holds a second copy of cached \
-             pages that the cache does not count, so memory accounting understates residency. \
-             Measure performance on Linux."
-        );
-    });
+    #[cfg(not(target_os = "linux"))]
+    warn_buffered_once();
 
-    // `dsync` stays at t4's default: O_DSYNC is honoured off Linux, so keeping
-    // it preserves the write-durability semantics Linux gets.
+    // `dsync` stays at t4's default: O_DSYNC is honoured off Linux too, so the
+    // fallback keeps the write-durability semantics Linux gets.
     t4::mount_with_options(
         path,
         t4::MountOptions {
-            direct_io: false,
+            direct_io: cfg!(target_os = "linux"),
             ..Default::default()
         },
     )
     .await
+}
+
+#[cfg(not(target_os = "linux"))]
+fn warn_buffered_once() {
+    static WARNED: Once = Once::new();
+    WARNED.call_once(|| {
+        log::warn!(
+            "mounting the liquid cache store with buffered I/O: t4 implements DIRECT I/O on Linux \
+             only. The cache is fully functional, but memory accounting now excludes the kernel \
+             page-cache copy of every cached page, so reported usage understates real residency \
+             and the admission gate's budget is measured against an incomplete figure. Measure \
+             performance on Linux."
+        );
+    });
 }
 
 #[cfg(test)]
@@ -84,10 +80,5 @@ mod tests {
             b"hello",
             "a remounted store must replay what was written"
         );
-    }
-
-    #[test]
-    fn direct_io_tracks_the_target() {
-        assert_eq!(DIRECT_IO, cfg!(target_os = "linux"));
     }
 }
