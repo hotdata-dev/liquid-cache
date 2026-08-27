@@ -320,6 +320,14 @@ mod tests {
     /// aarch64, and on any x86_64 CPU without BMI2, since the fast path is
     /// chosen at runtime — would have no test of its own at all.
     ///
+    /// Which implementation these tests reach therefore depends on the host,
+    /// because they go through the public dispatcher: BMI2 on an x86_64 CPU that
+    /// has it, the portable path everywhere else. That is deliberate. Between the
+    /// two CI targets each implementation gets checked against this reference,
+    /// and on x86_64 it also pins BMI2 to an oracle it does not share code with —
+    /// the pre-existing differential tests only ever compared the two
+    /// implementations to each other, which a mistake common to both would pass.
+    ///
     /// Both operands are assumed to start at bit 0, which is all the sole
     /// caller ever passes. That limit is real and untested on purpose: the
     /// fallback mishandles a bit-offset (sliced) `left`, because it seeds the
