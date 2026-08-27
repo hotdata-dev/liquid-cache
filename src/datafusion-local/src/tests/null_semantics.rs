@@ -11,8 +11,8 @@
 //! require it to drop. The bug is in DataFusion's join, not in the cache — a
 //! plain parquet scan is equally wrong, and a `MemTable` (which accepts no
 //! pushdown) is the only thing that answers correctly — but it lands on every
-//! LiquidCache query, so `NoDynamicFiltersForNullAwareJoins` keeps dynamic
-//! filters out of any plan holding a null-aware join. See
+//! LiquidCache query, so `NullAwareJoinFilterGuard` clears the filter from any
+//! join whose filter could reach a null-aware join's probe side. See
 //! <https://github.com/hotdata-dev/liquid-cache/issues/16>.
 //!
 //! The expected values below are plain SQL semantics, not a differential
@@ -237,11 +237,11 @@ async fn joins_of(ctx: &SessionContext, sql: &str) -> Vec<(bool, bool)> {
     out
 }
 
-/// Dynamic filters survive everywhere except in a plan that holds a null-aware
-/// join — there they are suppressed plan-wide, since one join's filter reaches
-/// another's probe side.
+/// The guard is narrow: a join loses its dynamic filter only when that filter
+/// could reach a null-aware join's probe side. A join whose probe subtree holds
+/// no null-aware join keeps its pruning, even in a plan that has one elsewhere.
 #[tokio::test]
-async fn dynamic_filters_suppressed_only_alongside_a_null_aware_join() {
+async fn only_joins_reaching_a_null_aware_probe_side_lose_their_filter() {
     let dir = TempDir::new().unwrap();
     write_outer(dir.path(), &(1000..1109).map(Some).collect::<Vec<_>>());
     write_sub(dir.path(), &[(Some(1), "keep"), (None, "keep")]);
@@ -253,9 +253,10 @@ async fn dynamic_filters_suppressed_only_alongside_a_null_aware_join() {
         joins_of(&ctx, "SELECT t0.a FROM t0 JOIN t2 ON t0.a = t2.a").await,
         vec![(false, true)]
     );
-    // The null-aware join never gets one.
+    // The null-aware join never keeps one.
     assert_eq!(joins_of(&ctx, NOT_IN).await, vec![(true, false)]);
-    // Nor does the join above it, which is the case the plan-scoped guard adds.
+    // Neither does a join above it, whose filter would propagate into the same
+    // probe subtree.
     let nested = format!("SELECT x.a FROM t2 JOIN ({NOT_IN}) x ON t2.a = x.a");
     let joins = joins_of(&ctx, &nested).await;
     assert_eq!(
@@ -265,24 +266,35 @@ async fn dynamic_filters_suppressed_only_alongside_a_null_aware_join() {
     );
     assert!(
         joins.iter().all(|(_, has_filter)| !has_filter),
-        "no join in a null-aware plan may carry a dynamic filter: {joins:?}"
+        "no filter may reach the anti join's probe side: {joins:?}"
+    );
+    // But an unrelated join in the same plan keeps its filter — the guard is
+    // not plan-wide.
+    let sibling = format!("{NOT_IN} UNION ALL SELECT t0.a FROM t0 JOIN t2 ON t0.a = t2.a");
+    let joins = joins_of(&ctx, &sibling).await;
+    assert!(
+        joins.contains(&(true, false)) && joins.contains(&(false, true)),
+        "the sibling join should keep its filter: {joins:?}"
     );
 }
 
-/// A `NOT IN` alongside a range predicate on the same column is still wrong,
-/// and no physical rule can fix it: DataFusion's logical `push_down_filter`
-/// infers the join key and copies `t1.a > ..` into the subquery, dropping the
-/// NULL that makes `NOT IN` never true. Wrong in vanilla DataFusion over a
-/// `MemTable` too, with every dynamic filter disabled. Un-ignore when upstream
-/// stops inferring join-key predicates across a null-aware join.
+/// `NOT IN` alongside *any* predicate on the join key is still wrong, and no
+/// physical rule can fix it: DataFusion's logical `infer_join_predicates`
+/// copies the predicate onto the subquery side — `IS NOT NULL` included —
+/// deleting the NULL that makes `NOT IN` never true. Wrong in vanilla
+/// DataFusion over a `MemTable` too, with every dynamic filter disabled.
+/// Un-ignore when upstream stops inferring join-key predicates across a
+/// null-aware join.
 #[tokio::test]
 #[ignore = "upstream logical-optimizer bug, not reachable from a physical rule"]
-async fn not_in_with_range_predicate_on_the_join_key() {
+async fn not_in_with_any_predicate_on_the_join_key() {
     let dir = TempDir::new().unwrap();
     write_outer(dir.path(), &(1000..1109).map(Some).collect::<Vec<_>>());
     write_sub(dir.path(), &[(Some(1), "keep"), (None, "keep")]);
     let ctx = liquid_ctx(dir.path()).await;
 
-    let sql = format!("SELECT a FROM ({NOT_IN}) x WHERE x.a > 1050");
-    assert_result(&ctx, &sql, &[]).await;
+    for predicate in ["x.a IS NOT NULL", "x.a > 1050", "x.a <> 1050"] {
+        let sql = format!("SELECT a FROM ({NOT_IN}) x WHERE {predicate}");
+        assert_result(&ctx, &sql, &[]).await;
+    }
 }
