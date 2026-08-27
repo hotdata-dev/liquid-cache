@@ -351,14 +351,29 @@ async fn test_single_column_filter_projection() {
 /// variable — gating on `target_os` would still fail on Graviton or on any ARM
 /// Linux runner.
 ///
-/// Why the architectures differ is still unknown. Ruled out: `target_partitions`
-/// (pinned to 4 below, so not the host CPU count), the temp directory path, the
-/// serialized liquid encoding (`usage.disk_bytes` is identical at 35000 and the
-/// entry mix — 5 memory.arrow, 1 memory.liquid, 2 disk.liquid — matches, so only
-/// the in-memory footprint moves), and buffer rounding (the string-view data
-/// buffers this file produces have `capacity == len`, so the accounting is exact,
-/// which is what admits an odd 935-byte delta at all). `fastlanes` bit-packing is
-/// the obvious next place to look.
+/// The whole delta is the FSST-compressed payload — `RawFsstBuffer::values.len()`.
+/// Componentwise, everything else is byte-identical across the two architectures
+/// (the arrow entries, the fastlanes bit-packed dictionary keys at 17504, the
+/// prefix keys, the compact offsets, the struct sizes, and the 537585 bytes of
+/// uncompressed FSST input). Only the compressed output moves: 254655 on aarch64
+/// against 255590 on x86_64.
+///
+/// Cause: `fsst-rs` 0.5.11 drains a hash map of symbol candidates into a
+/// `BinaryHeap` (`builder.rs:796`), and `Candidate`'s ordering key is just
+/// `(gain, symbol.len())` (`builder.rs:835-837`) — the symbol bytes are excluded.
+/// Two distinct symbols with equal gain and equal length therefore compare
+/// `Equal`, so which one wins is decided by heap insertion order, i.e. hash-map
+/// iteration order, which is not stable across architectures (hashbrown selects
+/// an SSE2, NEON or generic probe implementation per target). Different
+/// tie-break, different 255-symbol table, different compressed length. The real
+/// fix belongs upstream: make `Candidate`'s ordering total by including the
+/// symbol bytes as a final tie-breaker.
+///
+/// Note this means liquid-encoded bytes are NOT identical across architectures —
+/// `to_bytes` writes `values` verbatim — so compression ratios and capacity
+/// figures do not transfer between arm64 and x86_64. `usage.disk_bytes` staying
+/// at 35000 is not evidence against that; the two disk-resident entries are
+/// different, much smaller columns than the one that moves.
 ///
 /// Gated rather than redacted so the x86_64 assertion keeps full strength and the
 /// `cargo insta` workflow keeps working. To see the diff elsewhere:

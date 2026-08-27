@@ -105,6 +105,8 @@ That fallback keeps the cache correct — it writes, reads and evicts exactly as
 
 So: **develop anywhere, measure on Linux.** Benchmark numbers from macOS are not comparable to production, and generally flatter LiquidCache rather than penalising it, since reads may be served from the page cache that DIRECT I/O deliberately avoids. Use a Linux machine or VM for any performance or capacity work.
 
+Separately, and independent of the operating system: **compressed sizes differ slightly between arm64 and x86_64.** FSST picks its symbol table by draining a hash map into a priority queue, and its candidate ordering does not fully break ties, so equally-good symbols are chosen in hash-iteration order — which is not stable across architectures. The compressed output is valid and interchangeable either way, but a given column will not compress to exactly the same number of bytes on Graviton as on x86_64 (we measure ~0.4% on one test column). Compare compression ratios and capacity figures only within one architecture.
+
 
 ### Use LiquidCache with DataFusion
 
