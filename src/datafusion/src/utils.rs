@@ -320,11 +320,14 @@ mod tests {
     /// aarch64, and on any x86_64 CPU without BMI2, since the fast path is
     /// chosen at runtime — would have no test of its own at all.
     ///
-    /// Both operands are assumed to start at bit 0. Neither implementation
-    /// handles a bit-offset (sliced) `left`, and they disagree with each other
-    /// on a bit-offset `right`; the sole caller only ever passes offset-0
-    /// buffers. Offset handling is tracked separately and is deliberately not
-    /// exercised here.
+    /// Both operands are assumed to start at bit 0, which is all the sole
+    /// caller ever passes. That limit is real and untested on purpose: the
+    /// fallback mishandles a bit-offset (sliced) `left`, because it seeds the
+    /// output from `left.values()` — which excludes the offset — while walking
+    /// the offset-aware `left.set_indices()`. The BMI2 path ignores the offset
+    /// of *both* operands, so the two disagree on a bit-offset `right`. Fixing
+    /// that means touching the filter hot path, so it is left to its own
+    /// change; covering it here would only pin down today's wrong answers.
     fn reference_and_then(left: &BooleanBuffer, right: &BooleanBuffer) -> Vec<bool> {
         debug_assert_eq!(left.offset(), 0);
         debug_assert_eq!(right.offset(), 0);
