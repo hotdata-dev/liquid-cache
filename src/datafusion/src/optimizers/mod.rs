@@ -1,5 +1,6 @@
 //! Optimizers for the Parquet module
 
+mod null_aware_join;
 mod squeeze_hint;
 
 use std::collections::HashSet;
@@ -25,6 +26,7 @@ use datafusion::{
     physical_plan::ExecutionPlan,
 };
 
+pub use null_aware_join::NullAwareJoinDynamicFilterGuard;
 pub(crate) use squeeze_hint::HintAnalyzer;
 pub use squeeze_hint::SqueezeHintMap;
 

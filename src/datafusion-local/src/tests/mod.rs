@@ -25,6 +25,7 @@ use crate::LiquidCacheLocalBuilder;
 mod batch_size_alignment;
 mod date_optimizer;
 mod filter_limit;
+mod null_semantics;
 mod page_index;
 mod squeeze;
 mod variants;
