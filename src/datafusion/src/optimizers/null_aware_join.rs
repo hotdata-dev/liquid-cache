@@ -56,7 +56,9 @@
 //!   `a NOT IN (..) AND <anything on a>` is still wrong — wrong in vanilla
 //!   DataFusion over a `MemTable` with every dynamic filter off.
 //! - With `prefer_hash_join = false` the planner emits a `SortMergeJoinExec`
-//!   and drops `null_aware` outright, leaving no `HashJoinExec` to guard.
+//!   and drops `null_aware` outright. That leaves no `HashJoinExec` to guard,
+//!   so *both* guards go inert — the value guard keys off the same detection as
+//!   the join one, and is not independent of the hash-join path.
 //!
 //! Upstream guards the join's own filter only when the *build* key is nullable,
 //! which misses the pruned-probe-NULL case. See
@@ -257,5 +259,35 @@ impl PhysicalOptimizerRule for NullAwareValueFilterGuard {
 
     fn schema_check(&self) -> bool {
         self.inner.schema_check()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use datafusion::config::ConfigOptions;
+
+    /// The guards cover the dynamic-filter publishers by name: the join filter
+    /// per-node, the TopK and aggregate filters plan-wide. A fifth publisher
+    /// behind a new `enable_*dynamic_filter*` flag would silently slip past
+    /// both, so pin the set rather than discover it from a wrong answer.
+    #[test]
+    fn dynamic_filter_flag_set_has_not_grown() {
+        let mut keys: Vec<String> = ConfigOptions::default()
+            .entries()
+            .into_iter()
+            .map(|entry| entry.key)
+            .filter(|key| key.contains("dynamic_filter"))
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                "datafusion.optimizer.enable_aggregate_dynamic_filter_pushdown",
+                "datafusion.optimizer.enable_dynamic_filter_pushdown",
+                "datafusion.optimizer.enable_join_dynamic_filter_pushdown",
+                "datafusion.optimizer.enable_topk_dynamic_filter_pushdown",
+            ],
+            "a new dynamic-filter flag means a new publisher to guard; see the module docs"
+        );
     }
 }
