@@ -335,25 +335,37 @@ async fn test_single_column_filter_projection() {
     test_runner(sql, &reference, cache_dir.path()).await;
 }
 
-/// Runs on Linux only, because the snapshot pins `usage.memory_bytes` exactly
-/// and aarch64-darwin reports 935 bytes less at every one of the three
-/// measurement points (1000915 -> 999980, 1036304 -> 1035369), reproducibly.
+/// Runs on x86_64 only, because the snapshot pins `usage.memory_bytes` exactly
+/// and aarch64 reports 935 bytes less at every one of the three measurement
+/// points (1000915 -> 999980, 1036304 -> 1035369), reproducibly.
 ///
-/// Why is not yet known. Ruled out so far: `target_partitions` (pinned to 4
-/// below, so it is not the host's CPU count), the temp directory path, the
-/// liquid encoding itself (`usage.disk_bytes` is identical at 35000, and the
-/// entry mix — 5 memory.arrow, 1 memory.liquid, 2 disk.liquid — matches), and
-/// buffer alignment (the string-view data buffers this file produces have
-/// `capacity == len`, so the accounting is exact rather than rounded, which is
-/// what makes an odd 935-byte delta possible in the first place).
+/// The split is by architecture, not by OS. Measured:
 ///
-/// Diagnosing it needs a Linux and a macOS run side by side. Until then this
-/// stays gated rather than redacted, so the Linux assertion keeps its full
-/// strength and the `cargo insta` workflow keeps working. To see the diff on
-/// macOS: `cargo test -p liquid-cache-datafusion-local -- --ignored`.
+/// | target              | usage.memory_bytes |
+/// |---------------------|--------------------|
+/// | x86_64-linux        | 1000915 (recorded) |
+/// | aarch64-linux       | 999980             |
+/// | aarch64-darwin      | 999980             |
+///
+/// aarch64-linux and aarch64-darwin agree exactly, so the OS is not the
+/// variable — gating on `target_os` would still fail on Graviton or on any ARM
+/// Linux runner.
+///
+/// Why the architectures differ is still unknown. Ruled out: `target_partitions`
+/// (pinned to 4 below, so not the host CPU count), the temp directory path, the
+/// serialized liquid encoding (`usage.disk_bytes` is identical at 35000 and the
+/// entry mix — 5 memory.arrow, 1 memory.liquid, 2 disk.liquid — matches, so only
+/// the in-memory footprint moves), and buffer rounding (the string-view data
+/// buffers this file produces have `capacity == len`, so the accounting is exact,
+/// which is what admits an odd 935-byte delta at all). `fastlanes` bit-packing is
+/// the obvious next place to look.
+///
+/// Gated rather than redacted so the x86_64 assertion keeps full strength and the
+/// `cargo insta` workflow keeps working. To see the diff elsewhere:
+/// `cargo test -p liquid-cache-datafusion-local -- --ignored`.
 #[cfg_attr(
-    not(target_os = "linux"),
-    ignore = "snapshot pins exact memory_bytes; aarch64-darwin differs by 935 bytes"
+    not(target_arch = "x86_64"),
+    ignore = "snapshot pins exact memory_bytes; aarch64 differs by 935 bytes"
 )]
 #[tokio::test]
 async fn test_provide_schema2() {
