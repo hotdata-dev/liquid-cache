@@ -375,13 +375,9 @@ async fn test_single_column_filter_projection() {
 /// at 35000 is not evidence against that; the two disk-resident entries are
 /// different, much smaller columns than the one that moves.
 ///
-/// Gated rather than redacted so the x86_64 assertion keeps full strength and the
-/// `cargo insta` workflow keeps working. To see the diff elsewhere:
-/// `cargo test -p liquid-cache-datafusion-local -- --ignored`.
-#[cfg_attr(
-    not(target_arch = "x86_64"),
-    ignore = "snapshot pins exact memory_bytes; aarch64 differs by 935 bytes"
-)]
+/// The byte-exact snapshot therefore runs on x86_64 only, keeping its full
+/// strength and the `cargo insta` workflow there. Everywhere else the test still
+/// runs and bounds the same figures to within 1% — see the bottom of this test.
 #[tokio::test]
 async fn test_provide_schema2() {
     use std::fmt::Write as _;
@@ -463,7 +459,50 @@ async fn test_provide_schema2() {
         }
     }
 
+    #[cfg(target_arch = "x86_64")]
     insta::assert_snapshot!(snapshot);
+
+    // Off x86_64 the byte-exact snapshot cannot match, because FSST picks a
+    // different symbol table (see above). Bound the figures instead of skipping
+    // the test: arm64 is a production target, so it still deserves a tripwire on
+    // a gross accounting regression, and everything else this test covers — the
+    // plans, the cache hits, the tier split, the `Utf8`-declared schema over a
+    // `string_view` file — is architecture-independent and worth running.
+    #[cfg(not(target_arch = "x86_64"))]
+    assert_memory_bytes_within_1pct(&snapshot, &[1000915, 1000915, 1036304]);
+}
+
+/// Checks each `usage.memory_bytes` line in `snapshot` against the value recorded
+/// on x86_64, allowing 1%.
+///
+/// The known architecture difference is ~0.1% (935 bytes in ~1 MiB), so 1% has an
+/// order of magnitude of headroom while still catching the kind of regression that
+/// matters — a buffer counted twice, or a tier accounted at the wrong size.
+#[cfg(not(target_arch = "x86_64"))]
+fn assert_memory_bytes_within_1pct(snapshot: &str, expected: &[u64]) {
+    let actual: Vec<u64> = snapshot
+        .lines()
+        .filter_map(|line| line.strip_prefix("usage.memory_bytes: "))
+        .map(|value| value.trim().parse().expect("memory_bytes must be a number"))
+        .collect();
+
+    assert_eq!(
+        actual.len(),
+        expected.len(),
+        "expected {} memory_bytes readings, found {}: {actual:?}",
+        expected.len(),
+        actual.len()
+    );
+
+    for (idx, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+        let drift = actual.abs_diff(expected);
+        assert!(
+            drift * 100 <= expected,
+            "query[{idx}]: memory_bytes {actual} is more than 1% from the x86_64 \
+             figure {expected} (off by {drift}); the architecture difference should \
+             be ~0.1%, so this is a real accounting change"
+        );
+    }
 }
 
 #[tokio::test]
