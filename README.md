@@ -93,9 +93,17 @@ tokio_test::block_on(async {
 
 ### LiquidCache uses DIRECT I/O
 
-By default, LiquidCache uses [DIRECT I/O](https://man7.org/linux/man-pages/man2/open.2.html#:~:text=O_DIRECT). This means that it bypasses the OS page cache, this avoids double-caching and bound memory usage. 
+On Linux, LiquidCache uses [DIRECT I/O](https://man7.org/linux/man-pages/man2/open.2.html#:~:text=O_DIRECT). This means that it bypasses the OS page cache, this avoids double-caching and bound memory usage. 
 
 This also means LiquidCache can *appear slower* than other caches when most data fits in OS page cache, which is common in dev environments but unrealistic in production.
+
+### Platform support
+
+LiquidCache builds, runs and passes its test suite on both Linux and macOS. DIRECT I/O is the exception: the underlying store implements it on Linux only, so every other target mounts with buffered I/O instead and logs a warning once at startup.
+
+That fallback keeps the cache correct — it writes, reads and evicts exactly as on Linux — but it costs the property the accounting depends on. Under DIRECT I/O a cached page exists once and the cache knows about it. Under buffered I/O the kernel holds a second copy that the cache does not count, so reported memory understates real residency, and the admission gate's budget is measured against an incomplete figure.
+
+So: **develop anywhere, measure on Linux.** Benchmark numbers from macOS are not comparable to production, and generally flatter LiquidCache rather than penalising it, since reads may be served from the page cache that DIRECT I/O deliberately avoids. Use a Linux machine or VM for any performance or capacity work.
 
 
 ### Use LiquidCache with DataFusion
