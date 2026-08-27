@@ -14,6 +14,7 @@ use liquid_cache::cache_policies::LiquidPolicy;
 use liquid_cache_datafusion::{LiquidCacheParquetRef, extract_execution_metrics};
 use liquid_cache_datafusion_local::LiquidCacheLocalBuilder;
 use log::{info, warn};
+#[cfg(target_os = "linux")]
 use perf_event::{
     Builder as PerfBuilder, Counter, Group,
     events::{Hardware, Software},
@@ -72,6 +73,13 @@ impl DiskIoGuard {
     }
 }
 
+/// Hardware and software counters for one query iteration.
+///
+/// `perf_event_open` is a Linux syscall, so off Linux the collector cannot be
+/// constructed at all — see the uninhabited stub below. Callers already treat a
+/// construction failure as "no counters this run", which is what we want:
+/// absent counters rather than fabricated zeroes.
+#[cfg(target_os = "linux")]
 struct PerfEventCollector {
     group: Group,
     cycles: Counter,
@@ -82,6 +90,7 @@ struct PerfEventCollector {
     page_faults: Counter,
 }
 
+#[cfg(target_os = "linux")]
 impl PerfEventCollector {
     fn new() -> io::Result<Self> {
         let mut group = Group::new()?;
@@ -156,6 +165,32 @@ impl PerfEventCollector {
                 .map(|entry| entry.value())
                 .unwrap_or(0),
         })
+    }
+}
+
+/// Stand-in for the collector on targets without `perf_event_open`.
+///
+/// Uninhabited, so the only reachable method is [`Self::new`], which always
+/// fails. `start` and `stop` are therefore statically unreachable and need no
+/// panic. Keeping the same shape as the Linux type means the call site is
+/// identical on every platform.
+#[cfg(not(target_os = "linux"))]
+enum PerfEventCollector {}
+
+#[cfg(not(target_os = "linux"))]
+impl PerfEventCollector {
+    fn new() -> io::Result<Self> {
+        Err(io::Error::other(
+            "hardware counters need perf_event_open, which only Linux provides",
+        ))
+    }
+
+    fn start(&mut self) -> io::Result<()> {
+        match *self {}
+    }
+
+    fn stop(self) -> io::Result<PerfEventStats> {
+        match self {}
     }
 }
 
