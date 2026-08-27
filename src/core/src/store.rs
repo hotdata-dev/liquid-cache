@@ -14,7 +14,6 @@
 //! That makes non-Linux fine for development and wrong for measurement.
 
 use std::path::Path;
-use std::sync::Once;
 
 /// Mount the on-disk store for a LiquidCache instance at `path`, which is the
 /// full path to the store file.
@@ -44,7 +43,7 @@ pub async fn mount(path: impl AsRef<Path>) -> t4::Result<t4::Store> {
 
 #[cfg(not(target_os = "linux"))]
 fn warn_buffered_once() {
-    static WARNED: Once = Once::new();
+    static WARNED: std::sync::Once = std::sync::Once::new();
     WARNED.call_once(|| {
         log::warn!(
             "mounting the liquid cache store with buffered I/O: t4 implements DIRECT I/O on Linux \
