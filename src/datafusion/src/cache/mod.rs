@@ -177,9 +177,10 @@ impl CachedRowGroup {
         // (`NULL`, `false`) projects no arrays, and an array-less batch would
         // otherwise claim zero rows.
         let options = RecordBatchOptions::new().with_row_count(Some(selection.count_set_bits()));
-        let record_batch = RecordBatch::try_new_with_options(schema, arrays, &options).unwrap();
-        let boolean_array = predicate.evaluate(record_batch).unwrap();
-        Some(Ok(boolean_array))
+        Some(
+            RecordBatch::try_new_with_options(schema, arrays, &options)
+                .and_then(|batch| predicate.evaluate(batch)),
+        )
     }
 }
 
@@ -436,7 +437,7 @@ mod tests {
     use super::*;
     use crate::cache::{CachedRowGroupRef, LiquidCacheParquet};
     use crate::reader::FilterCandidateBuilder;
-    use arrow::array::Int32Array;
+    use arrow::array::{Array, Int32Array};
     use arrow::buffer::BooleanBuffer;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
@@ -467,6 +468,54 @@ mod tests {
         .await;
         let file = cache.register_or_get_file("test".to_string(), schema);
         file.create_row_group(0, vec![])
+    }
+
+    /// Issue #19: `NOT (s = s)` simplifies to `s IS NULL AND NULL`, so a conjunct
+    /// that reads no column reaches the row filter. It has to survive candidate
+    /// building and then evaluate against the selection's row count — an
+    /// array-less batch would otherwise report zero rows and hand back a mask of
+    /// the wrong length, which silently widens the filter.
+    #[tokio::test]
+    async fn evaluate_column_free_conjunct() {
+        let batch_size = 8;
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let row_group = setup_cache(batch_size, schema.clone()).await;
+
+        let array = Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6, 7, 8]));
+        let batch_id = BatchID::from_row_id(0, batch_size);
+        let column = row_group.get_column(0).unwrap();
+        assert!(column.insert(batch_id, array.clone()).await.is_ok());
+
+        let tmp_meta = tempfile::NamedTempFile::new().unwrap();
+        let mut writer =
+            ArrowWriter::try_new(tmp_meta.reopen().unwrap(), Arc::clone(&schema), None).unwrap();
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![array]).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let file_reader = std::fs::File::open(tmp_meta.path()).unwrap();
+        let metadata = ArrowReaderMetadata::load(&file_reader, ArrowReaderOptions::new()).unwrap();
+
+        let expr: Arc<dyn PhysicalExpr> = Arc::new(Literal::new(ScalarValue::Boolean(None)));
+        let builder = FilterCandidateBuilder::new(expr, Arc::clone(&schema));
+        let candidate = builder
+            .build(metadata.metadata())
+            .unwrap()
+            .expect("a column-free conjunct must still produce a candidate");
+        let projection = candidate.projection(metadata.metadata());
+        let mut predicate = LiquidPredicate::try_new(candidate, projection).unwrap();
+        assert!(predicate.predicate_column_ids().is_empty());
+
+        // Four of the eight rows are selected, so the mask must be four long.
+        let selection = BooleanBuffer::collect_bool(batch_size, |i| i % 2 == 0);
+        let result = row_group
+            .evaluate_selection_with_predicate(batch_id, &selection, &mut predicate)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(result.len(), selection.count_set_bits());
+        assert_eq!(result.true_count(), 0);
+        assert_eq!(result.null_count(), result.len());
     }
 
     #[tokio::test]

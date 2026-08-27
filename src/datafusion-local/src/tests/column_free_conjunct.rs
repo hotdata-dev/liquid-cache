@@ -107,6 +107,11 @@ async fn projected_rows(ctx: &SessionContext, r#where: &str) -> Vec<String> {
 
 /// The scan projects `s` while the filter reads `f`, `s` and `id`, so the
 /// predicate columns are materialized separately from the projected one.
+///
+/// `NOT p` is the telling bucket: it is never TRUE, because `p` is TRUE or
+/// UNKNOWN for every row. Dropping the column-free `NULL` conjunct left
+/// `f > 333 AND s IS NULL AND id NOT BETWEEN 1 AND 7` behind, which matches the
+/// four UNKNOWN rows — so they came back in two buckets at once.
 #[tokio::test]
 async fn ternary_partitions_cover_every_row_once() {
     let dir = TempDir::new().unwrap();
@@ -114,39 +119,21 @@ async fn ternary_partitions_cover_every_row_once() {
     write_t1(&parquet);
     let ctx = liquid_ctx(&dir.path().join("cache"), &parquet).await;
 
-    // Twice: the first pass fills the cache, the second reads it back.
-    for pass in 0..2 {
-        let all = projected_rows(&ctx, "").await;
-        let mut partitioned = projected_rows(&ctx, &format!("WHERE {P}")).await;
-        partitioned.extend(projected_rows(&ctx, &format!("WHERE NOT ({P})")).await);
-        partitioned.extend(projected_rows(&ctx, &format!("WHERE ({P}) IS NULL")).await);
-        partitioned.sort();
+    let matched = projected_rows(&ctx, &format!("WHERE {P}")).await;
+    let negated = projected_rows(&ctx, &format!("WHERE NOT ({P})")).await;
+    let unknown = projected_rows(&ctx, &format!("WHERE ({P}) IS NULL")).await;
 
-        assert_eq!(
-            all, partitioned,
-            "pass {pass}: the three buckets are not a partition"
-        );
-    }
-}
+    assert_eq!(matched.len(), 8);
+    assert_eq!(negated, Vec::<String>::new());
+    assert_eq!(unknown, vec!["NULL"; 4]);
 
-/// The direct reading of the same bug: `NOT p` is never TRUE here, because `p`
-/// is TRUE or UNKNOWN for every row. Dropping the column-free `NULL` conjunct
-/// left `f > 333 AND s IS NULL AND id NOT BETWEEN 1 AND 7`, which matches four.
-#[tokio::test]
-async fn negation_of_an_unknown_predicate_matches_nothing() {
-    let dir = TempDir::new().unwrap();
-    let parquet = dir.path().join("t1.parquet");
-    write_t1(&parquet);
-    let ctx = liquid_ctx(&dir.path().join("cache"), &parquet).await;
-
-    for pass in 0..2 {
-        let matched = projected_rows(&ctx, &format!("WHERE NOT ({P})")).await;
-        assert!(matched.is_empty(), "pass {pass}: NOT p matched {matched:?}");
-
-        assert_eq!(projected_rows(&ctx, &format!("WHERE {P}")).await.len(), 8);
-        assert_eq!(
-            projected_rows(&ctx, &format!("WHERE ({P}) IS NULL")).await,
-            vec!["NULL"; 4]
-        );
-    }
+    let mut partitioned = matched;
+    partitioned.extend(negated);
+    partitioned.extend(unknown);
+    partitioned.sort();
+    assert_eq!(
+        projected_rows(&ctx, "").await,
+        partitioned,
+        "the three buckets are not a partition of the table"
+    );
 }

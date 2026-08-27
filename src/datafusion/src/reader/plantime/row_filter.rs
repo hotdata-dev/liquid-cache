@@ -71,7 +71,7 @@ use arrow_schema::SchemaRef;
 use datafusion::datasource::physical_plan::ParquetFileMetrics;
 use datafusion::logical_expr::Operator;
 use datafusion::physical_expr::utils::reassign_expr_columns;
-use datafusion::physical_plan::expressions::{BinaryExpr, LikeExpr};
+use datafusion::physical_plan::expressions::{BinaryExpr, LikeExpr, Literal};
 use datafusion::physical_plan::metrics;
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::ArrowPredicate;
@@ -498,17 +498,23 @@ pub fn build_row_filter(
 }
 
 fn get_priority(expr: &Arc<dyn PhysicalExpr>) -> u8 {
+    // A constant conjunct reads no column and can empty the selection outright,
+    // which skips every predicate after it, so it goes first.
+    if expr.is::<Literal>() {
+        return 0;
+    }
+
     if let Some(binary) = expr.downcast_ref::<BinaryExpr>() {
         match binary.op() {
-            Operator::Eq | Operator::NotEq => 0, // Highest priority
-            Operator::LikeMatch | Operator::ILikeMatch => 1,
-            Operator::NotLikeMatch | Operator::NotILikeMatch => 2,
-            Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq => 3,
-            _ => 4,
+            Operator::Eq | Operator::NotEq => 1,
+            Operator::LikeMatch | Operator::ILikeMatch => 2,
+            Operator::NotLikeMatch | Operator::NotILikeMatch => 3,
+            Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq => 4,
+            _ => 5,
         }
     } else if expr.is::<LikeExpr>() {
-        1 // LIKE expressions
+        2 // LIKE expressions
     } else {
-        5 // All other expression types
+        6 // All other expression types
     }
 }
