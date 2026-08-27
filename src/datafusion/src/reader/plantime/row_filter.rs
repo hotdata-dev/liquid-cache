@@ -289,10 +289,9 @@ impl FilterCandidateBuilder {
             return Ok(None);
         };
 
-        if required_indices_into_file_schema.is_empty() {
-            return Ok(None);
-        }
-
+        // A conjunct that references no column (`NULL`, `false`, a volatile
+        // function) is still a conjunct: dropping it here would widen the filter,
+        // because the scan is the only place the predicate is applied.
         let projected_file_schema = Arc::new(
             self.file_schema
                 .project(&required_indices_into_file_schema)?,

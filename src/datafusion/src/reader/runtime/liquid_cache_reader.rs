@@ -473,13 +473,8 @@ impl LiquidCacheReaderInner {
         }
 
         let schema = Arc::new(Schema::new(fields));
-        let predicate_batch = if arrays.is_empty() {
-            let options =
-                RecordBatchOptions::new().with_row_count(Some(selection.count_set_bits()));
-            RecordBatch::try_new_with_options(schema, arrays, &options)?
-        } else {
-            RecordBatch::try_new(schema, arrays)?
-        };
+        let options = RecordBatchOptions::new().with_row_count(Some(selection.count_set_bits()));
+        let predicate_batch = RecordBatch::try_new_with_options(schema, arrays, &options)?;
 
         predicate.evaluate(predicate_batch)
     }

@@ -5,7 +5,7 @@ use crate::io::ParquetCacheMetadata;
 use crate::reader::{LiquidPredicate, extract_multi_column_or};
 use crate::sync::Mutex;
 use ahash::AHashMap;
-use arrow::array::{BooleanArray, RecordBatch};
+use arrow::array::{BooleanArray, RecordBatch, RecordBatchOptions};
 use arrow::buffer::BooleanBuffer;
 use arrow_schema::{ArrowError, Field, Schema, SchemaRef};
 use liquid_cache::cache::squeeze_policies::SqueezePolicy;
@@ -173,7 +173,11 @@ impl CachedRowGroup {
             fields.push(column.field());
         }
         let schema = Arc::new(Schema::new(fields));
-        let record_batch = RecordBatch::try_new(schema, arrays).unwrap();
+        // The row count has to be carried explicitly: a column-free conjunct
+        // (`NULL`, `false`) projects no arrays, and an array-less batch would
+        // otherwise claim zero rows.
+        let options = RecordBatchOptions::new().with_row_count(Some(selection.count_set_bits()));
+        let record_batch = RecordBatch::try_new_with_options(schema, arrays, &options).unwrap();
         let boolean_array = predicate.evaluate(record_batch).unwrap();
         Some(Ok(boolean_array))
     }
