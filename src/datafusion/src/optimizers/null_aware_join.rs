@@ -23,16 +23,25 @@
 //! too. So this rule clears the dynamic filter of any hash join that is itself
 //! null-aware, or whose probe subtree holds a null-aware join.
 //!
-//! What it deliberately leaves alone:
+//! A join holding the null-aware join on its *build* side is left alone: its
+//! filter goes only to its own probe side and can never reach the anti join, so
+//! that pruning is sound and worth keeping. This matters — it is the difference
+//! between pruning an unrelated 400k-row scan to one row and reading all of it.
 //!
-//! - **A join holding the null-aware join on its *build* side.** Its filter
-//!   goes only to its own probe side and can never reach the anti join, so that
-//!   pruning is sound and worth keeping.
-//! - **TopK and aggregate dynamic filters.** Those tighten from the value
-//!   stream *above* the join, and a `LeftAnti` emits nothing until its probe
-//!   side is fully drained, so they cannot prune a probe row before the join
-//!   has counted it. Only the join's own filter comes from the build side,
-//!   which is collected first.
+//! TopK and aggregate filters need the blunter treatment in
+//! [`NullAwareValueFilterGuard`], because they are tightened from the value
+//! stream rather than published at a fixed point in the plan. It is tempting to
+//! argue they are safe — a `LeftAnti` emits nothing until its probe side is
+//! fully drained, so it cannot tighten a threshold against its own unread probe
+//! rows — but that only holds while the anti join is the *sole* producer
+//! feeding the node. Put a second producer under the same TopK or aggregate
+//! (`.. UNION ALL <NOT IN ..>`) and the sibling drains first, tightening the
+//! shared filter that has already been pushed into the still-unread probe scan.
+//! `min()`/`max()` filters and nulls-last TopK filters drop NULLs outright, so
+//! the deciding NULL disappears.
+//!
+//! What both guards deliberately leave alone:
+//!
 //! - **Static predicate pushdown.** Not because it is harmless in principle —
 //!   the physical `lr_is_preserved` does route a static parent predicate into a
 //!   `LeftAnti`'s probe side — but because the logical optimizer already copies
@@ -59,12 +68,18 @@ use datafusion::{
     common::tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion},
     config::ConfigOptions,
     error::Result,
-    physical_optimizer::PhysicalOptimizerRule,
-    physical_plan::{ExecutionPlan, joins::HashJoinExec},
+    physical_optimizer::{
+        PhysicalOptimizerRule,
+        optimizer::{PhysicalOptimizer, PhysicalOptimizerContext},
+    },
+    physical_plan::{ExecutionPlan, joins::HashJoinExec, operator_statistics::StatisticsRegistry},
 };
 
 /// Physical optimizer rule that clears the dynamic filter from hash joins whose
 /// filter could reach a null-aware anti join's probe side. See the module docs.
+///
+/// Pairs with [`NullAwareValueFilterGuard`], which handles the TopK and
+/// aggregate filters this rule does not touch.
 ///
 /// Must run after the filter-pushdown rules that attach the dynamic filter, so
 /// it belongs at the end of the physical optimizer list.
@@ -128,5 +143,119 @@ impl PhysicalOptimizerRule for NullAwareJoinFilterGuard {
 
     fn schema_check(&self) -> bool {
         true
+    }
+}
+
+/// A [`PhysicalOptimizerContext`] serving an overridden config while passing
+/// everything else — notably the statistics registry — through untouched.
+struct OverriddenConfig<'a> {
+    config: ConfigOptions,
+    inner: &'a dyn PhysicalOptimizerContext,
+}
+
+impl PhysicalOptimizerContext for OverriddenConfig<'_> {
+    fn config_options(&self) -> &ConfigOptions {
+        &self.config
+    }
+
+    fn statistics_registry(&self) -> Option<&StatisticsRegistry> {
+        self.inner.statistics_registry()
+    }
+}
+
+/// Wraps a physical optimizer rule so it cannot create a TopK or aggregate
+/// dynamic filter while the plan holds a null-aware anti join. See the module
+/// docs for why those two cannot be gated per-node the way join filters are.
+///
+/// Unlike the join filters, these are suppressed for the whole plan, so a
+/// `NOT IN` costs the query its TopK and aggregate pruning. The join filters —
+/// the expensive ones — keep their per-node treatment in
+/// [`NullAwareJoinFilterGuard`].
+///
+/// Wrap every rule rather than only the filter-pushdown ones: matching rules by
+/// name would silently stop guarding if upstream renamed one, and the cost of a
+/// short-circuiting walk per rule is immeasurable.
+#[derive(Debug)]
+pub struct NullAwareValueFilterGuard {
+    inner: Arc<dyn PhysicalOptimizerRule + Send + Sync>,
+}
+
+impl NullAwareValueFilterGuard {
+    /// Wrap `inner`.
+    pub fn new(inner: Arc<dyn PhysicalOptimizerRule + Send + Sync>) -> Self {
+        Self { inner }
+    }
+
+    /// Wrap every rule of DataFusion's default physical optimizer, ready for
+    /// `SessionStateBuilder::with_physical_optimizer_rules`.
+    pub fn wrap_default_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> {
+        PhysicalOptimizer::new()
+            .rules
+            .into_iter()
+            .map(|rule| Arc::new(Self::new(rule)) as Arc<dyn PhysicalOptimizerRule + Send + Sync>)
+            .collect()
+    }
+
+    /// The config to run `inner` under, or `None` to pass the caller's through.
+    fn override_for(
+        &self,
+        plan: &Arc<dyn ExecutionPlan>,
+        config: &ConfigOptions,
+    ) -> Option<ConfigOptions> {
+        let optimizer = &config.optimizer;
+        if !optimizer.enable_topk_dynamic_filter_pushdown
+            && !optimizer.enable_aggregate_dynamic_filter_pushdown
+        {
+            return None;
+        }
+        if !has_null_aware_join(plan) {
+            return None;
+        }
+        let mut config = config.clone();
+        let optimizer = &mut config.optimizer;
+        optimizer.enable_topk_dynamic_filter_pushdown = false;
+        optimizer.enable_aggregate_dynamic_filter_pushdown = false;
+        Some(config)
+    }
+}
+
+impl PhysicalOptimizerRule for NullAwareValueFilterGuard {
+    fn optimize(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        config: &ConfigOptions,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        match self.override_for(&plan, config) {
+            Some(config) => self.inner.optimize(plan, &config),
+            None => self.inner.optimize(plan, config),
+        }
+    }
+
+    /// Forwarded, not left to the trait default: the planner calls this one, and
+    /// the default would drop `inner`'s own override — and with it the
+    /// statistics registry that drives join-side selection.
+    fn optimize_with_context(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        context: &dyn PhysicalOptimizerContext,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        match self.override_for(&plan, context.config_options()) {
+            Some(config) => self.inner.optimize_with_context(
+                plan,
+                &OverriddenConfig {
+                    config,
+                    inner: context,
+                },
+            ),
+            None => self.inner.optimize_with_context(plan, context),
+        }
+    }
+
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn schema_check(&self) -> bool {
+        self.inner.schema_check()
     }
 }

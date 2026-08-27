@@ -85,8 +85,8 @@ async fn liquid_ctx(dir: &Path) -> SessionContext {
         .build(config)
         .await
         .unwrap();
-    // `t2` only exists for the tests that write it.
-    for t in ["t0", "t1", "t2"] {
+    // `t2`/`t3` only exist for the tests that write them.
+    for t in ["t0", "t1", "t2", "t3"] {
         let path = dir.join(format!("{t}.parquet"));
         if !path.exists() {
             continue;
@@ -297,4 +297,55 @@ async fn not_in_with_any_predicate_on_the_join_key() {
         let sql = format!("SELECT a FROM ({NOT_IN}) x WHERE {predicate}");
         assert_result(&ctx, &sql, &[]).await;
     }
+}
+
+/// Table `t3`, a second producer to sit beside the anti join under a TopK or
+/// aggregate.
+fn write_sibling(dir: &Path, vals: &[Option<i64>]) {
+    let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, true)]));
+    write(
+        &dir.join("t3.parquet"),
+        schema,
+        vec![Arc::new(Int64Array::from(vals.to_vec()))],
+    );
+}
+
+/// A `UNION ALL` sibling drains before the anti join's probe side is read, so
+/// it tightens the shared TopK/aggregate filter that was already pushed into
+/// the still-unread probe scan. `min`/`max` filters and nulls-last TopK filters
+/// drop NULLs outright, so the deciding NULL disappears and `NOT IN` wrongly
+/// contributes rows. Only the anti join's own rows must drop, never the
+/// sibling's.
+#[tokio::test]
+async fn union_all_sibling_cannot_prune_the_probe_side() {
+    // `max`: the anti join's outer values are the larger ones, so a surviving
+    // NOT IN row would win the max.
+    let dir = TempDir::new().unwrap();
+    write_outer(dir.path(), &(1000..20000).map(Some).collect::<Vec<_>>());
+    write_sub(dir.path(), &[(Some(1), "keep"), (None, "keep")]);
+    write_sibling(dir.path(), &(0..900).map(Some).collect::<Vec<_>>());
+    let ctx = liquid_ctx(dir.path()).await;
+    let union = format!("SELECT a FROM t3 UNION ALL {NOT_IN}");
+    assert_result(&ctx, &format!("SELECT max(a) FROM ({union})"), &[Some(899)]).await;
+
+    // `min` and a nulls-last TopK: now the anti join's values are the smaller
+    // ones, so a survivor would win the min and the LIMIT 1.
+    let dir = TempDir::new().unwrap();
+    write_outer(dir.path(), &(1..100).map(Some).collect::<Vec<_>>());
+    write_sub(dir.path(), &[(Some(500), "keep"), (None, "keep")]);
+    write_sibling(dir.path(), &(1000..1900).map(Some).collect::<Vec<_>>());
+    let ctx = liquid_ctx(dir.path()).await;
+    let union = format!("SELECT a FROM t3 UNION ALL {NOT_IN}");
+    assert_result(
+        &ctx,
+        &format!("SELECT min(a) FROM ({union})"),
+        &[Some(1000)],
+    )
+    .await;
+    assert_result(
+        &ctx,
+        &format!("SELECT a FROM ({union}) ORDER BY a ASC LIMIT 1"),
+        &[Some(1000)],
+    )
+    .await;
 }

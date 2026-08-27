@@ -13,7 +13,9 @@ use datafusion::prelude::{SessionConfig, SessionContext};
 use liquid_cache::cache::squeeze_policies::{SqueezePolicy, TranscodeSqueezeEvict};
 use liquid_cache::cache::{AlwaysHydrate, HydrationPolicy, default_max_memory_bytes};
 use liquid_cache::cache_policies::{CachePolicy, LiquidPolicy};
-use liquid_cache_datafusion::optimizers::{LocalModeOptimizer, NullAwareJoinFilterGuard};
+use liquid_cache_datafusion::optimizers::{
+    LocalModeOptimizer, NullAwareJoinFilterGuard, NullAwareValueFilterGuard,
+};
 use liquid_cache_datafusion::{
     LiquidCacheParquet, LiquidCacheParquetRef, VariantGetUdf, VariantPretty, VariantToJsonUdf,
 };
@@ -232,9 +234,12 @@ impl LiquidCacheLocalBuilder {
         let state = datafusion::execution::SessionStateBuilder::new()
             .with_config(config)
             .with_default_features()
+            // Wrapped so no stock rule can create a TopK or aggregate dynamic
+            // filter in a plan holding a null-aware anti join.
+            .with_physical_optimizer_rules(NullAwareValueFilterGuard::wrap_default_rules())
             .with_physical_optimizer_rule(Arc::new(optimizer))
             // Appended, so it runs after the filter-pushdown rules that attach
-            // the dynamic filters it clears.
+            // the join dynamic filters it clears.
             .with_physical_optimizer_rule(Arc::new(NullAwareJoinFilterGuard::new()))
             .build();
 
