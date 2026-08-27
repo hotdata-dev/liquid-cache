@@ -1,87 +1,118 @@
-//! Strips the build-side dynamic filter from null-aware anti joins.
+//! Keeps dynamic filters away from null-aware anti joins.
 //!
-//! `x NOT IN (<subquery>)` plans as a null-aware `LeftAnti` hash join, whose
-//! semantics are driven by what the probe side *contains*, not just by which
-//! probe rows match:
+//! `x NOT IN (<subquery>)` plans as a null-aware `LeftAnti` hash join, and its
+//! answer turns on what the probe side *contains*, not just on which probe rows
+//! match:
 //!
 //! - a NULL probe key annihilates the output (`x NOT IN (.., NULL, ..)` is
 //!   never true), and
 //! - an empty probe side passes every build row through, NULL keys included.
 //!
-//! `HashJoinExec` also publishes a dynamic filter derived from the build-side
-//! keys (`key >= min AND key <= max AND key IN (..)`) and pushes it into the
-//! probe-side scan. That filter is sound for a plain anti join — a probe row
-//! that cannot match cannot change which build rows are unmatched — but it
-//! destroys both signals above: NULL satisfies no comparison, so probe NULLs
-//! are pruned before the join ever sees them, and a probe side with no
-//! matching keys prunes down to nothing and reads as empty.
+//! A dynamic filter destroys both signals. `HashJoinExec` publishes one built
+//! from its build-side keys (`key >= min AND key <= max AND key IN (..)`) and
+//! pushes it into the probe-side scan; `SortExec`'s TopK and the aggregate
+//! rules publish their own. NULL satisfies no comparison, so probe NULLs are
+//! pruned before the join ever sees them, and a probe side holding no matching
+//! keys prunes away to nothing and reads as empty. Either way the join answers
+//! as if the probe side had no NULLs, and `NOT IN` returns rows that SQL
+//! tri-state semantics require it to drop.
 //!
-//! Either way the join answers as if the probe side had no NULLs, so
-//! `SELECT .. WHERE a NOT IN (SELECT b FROM ..)` returns the rows that SQL
-//! tri-state semantics require it to filter out. Upstream guards this only when
-//! the *build* key is nullable, which misses the pruned-probe-NULL case, so the
-//! rule below drops the dynamic filter from every null-aware join.
+//! Removing the filter from the null-aware join alone is not enough: a join
+//! *above* it pushes its own filter straight through into the same probe
+//! subtree, because `HashJoinExec` reports both sides of a `LeftAnti` as
+//! preserved for pushdown ("join key filters can be safely pushed down into
+//! the other side" — true for a plain anti join, false for a null-aware one).
+//! So the guard works at plan scope instead: when the plan contains a
+//! null-aware join at all, every rule runs with dynamic filter pushdown turned
+//! off, and no dynamic filter is created anywhere in that plan.
 //!
-//! The join keeps working without it: the filter is an optional pruning
-//! accelerator, and with it detached the shared expression is never refreshed
-//! from the build side and stays `true`. Only null-aware joins are touched, and
-//! a null-aware join always has a nullable join key (otherwise the planner
-//! would not have asked for null-aware semantics), so there is no case where
-//! this gives up pruning it could soundly have kept.
+//! Only static predicate pushdown is left alone, which is sound here — the
+//! probe side *is* the statically filtered subquery, so pruning it by its own
+//! predicate cannot change the answer. The cost is that a query containing a
+//! `NOT IN` gives up dynamic-filter pruning on its other joins too; that is the
+//! granularity the config exposes, and correctness wins.
 //!
-//! See <https://github.com/hotdata-dev/liquid-cache/issues/16>.
+//! Upstream guards this only when the *build* key is nullable, which misses the
+//! pruned-probe-NULL case entirely. See
+//! <https://github.com/hotdata-dev/liquid-cache/issues/16>.
 
 use std::sync::Arc;
 
 use datafusion::{
-    common::tree_node::{Transformed, TransformedResult, TreeNode},
+    common::tree_node::{TreeNode, TreeNodeRecursion},
     config::ConfigOptions,
     error::Result,
     physical_optimizer::PhysicalOptimizerRule,
     physical_plan::{ExecutionPlan, joins::HashJoinExec},
 };
 
-/// Physical optimizer rule that removes the build-side dynamic filter from
-/// null-aware anti joins, which cannot read their probe side correctly through
-/// it. See the module docs.
+/// Wraps a physical optimizer rule so it never gets to attach a dynamic filter
+/// to a plan that contains a null-aware anti join. See the module docs.
 ///
-/// Must run after the filter-pushdown rules that attach the dynamic filter,
-/// i.e. it belongs at the end of the physical optimizer list.
-#[derive(Debug, Default)]
-pub struct NullAwareJoinDynamicFilterGuard;
+/// Wrap every rule in the list — dynamic filters are created inside the
+/// filter-pushdown rules today, but nothing pins them there, and the wrapper is
+/// inert for a plan with no null-aware join.
+#[derive(Debug)]
+pub struct NoDynamicFiltersForNullAwareJoins {
+    inner: Arc<dyn PhysicalOptimizerRule + Send + Sync>,
+}
 
-impl NullAwareJoinDynamicFilterGuard {
-    /// Create the rule.
-    pub fn new() -> Self {
-        Self
+impl NoDynamicFiltersForNullAwareJoins {
+    /// Wrap `inner`.
+    pub fn new(inner: Arc<dyn PhysicalOptimizerRule + Send + Sync>) -> Self {
+        Self { inner }
+    }
+
+    /// Wrap every rule of DataFusion's default physical optimizer, ready to
+    /// hand to `SessionStateBuilder::with_physical_optimizer_rules`.
+    pub fn wrap_default_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> {
+        datafusion::physical_optimizer::optimizer::PhysicalOptimizer::new()
+            .rules
+            .into_iter()
+            .map(|rule| Arc::new(Self::new(rule)) as Arc<dyn PhysicalOptimizerRule + Send + Sync>)
+            .collect()
     }
 }
 
-impl PhysicalOptimizerRule for NullAwareJoinDynamicFilterGuard {
+/// Whether `plan` contains a hash join asking for null-aware semantics.
+fn has_null_aware_join(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    let mut found = false;
+    // `apply` only fails if the closure does, and this one cannot.
+    let _ = plan.apply(|node| {
+        Ok(match node.downcast_ref::<HashJoinExec>() {
+            Some(join) if join.null_aware => {
+                found = true;
+                TreeNodeRecursion::Stop
+            }
+            _ => TreeNodeRecursion::Continue,
+        })
+    });
+    found
+}
+
+impl PhysicalOptimizerRule for NoDynamicFiltersForNullAwareJoins {
     fn optimize(
         &self,
         plan: Arc<dyn ExecutionPlan>,
-        _config: &ConfigOptions,
+        config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        plan.transform_up(|node| {
-            let Some(join) = node.downcast_ref::<HashJoinExec>() else {
-                return Ok(Transformed::no(node));
-            };
-            if !join.null_aware || join.dynamic_filter_expr().is_none() {
-                return Ok(Transformed::no(node));
-            }
-            // `reset_state` clears the dynamic filter along with the build-side
-            // future and metrics, none of which carry anything yet at plan time.
-            Ok(Transformed::yes(join.builder().reset_state().build_exec()?))
-        })
-        .data()
+        if !has_null_aware_join(&plan) {
+            return self.inner.optimize(plan, config);
+        }
+        let mut config = config.clone();
+        let optimizer = &mut config.optimizer;
+        optimizer.enable_dynamic_filter_pushdown = false;
+        optimizer.enable_join_dynamic_filter_pushdown = false;
+        optimizer.enable_topk_dynamic_filter_pushdown = false;
+        optimizer.enable_aggregate_dynamic_filter_pushdown = false;
+        self.inner.optimize(plan, &config)
     }
 
     fn name(&self) -> &str {
-        "NullAwareJoinDynamicFilterGuard"
+        self.inner.name()
     }
 
     fn schema_check(&self) -> bool {
-        true
+        self.inner.schema_check()
     }
 }

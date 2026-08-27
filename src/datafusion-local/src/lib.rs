@@ -13,7 +13,7 @@ use datafusion::prelude::{SessionConfig, SessionContext};
 use liquid_cache::cache::squeeze_policies::{SqueezePolicy, TranscodeSqueezeEvict};
 use liquid_cache::cache::{AlwaysHydrate, HydrationPolicy, default_max_memory_bytes};
 use liquid_cache::cache_policies::{CachePolicy, LiquidPolicy};
-use liquid_cache_datafusion::optimizers::{LocalModeOptimizer, NullAwareJoinDynamicFilterGuard};
+use liquid_cache_datafusion::optimizers::{LocalModeOptimizer, NoDynamicFiltersForNullAwareJoins};
 use liquid_cache_datafusion::{
     LiquidCacheParquet, LiquidCacheParquetRef, VariantGetUdf, VariantPretty, VariantToJsonUdf,
 };
@@ -232,11 +232,11 @@ impl LiquidCacheLocalBuilder {
         let state = datafusion::execution::SessionStateBuilder::new()
             .with_config(config)
             .with_default_features()
+            // Wrap the stock rules so none of them can attach a dynamic filter
+            // to a plan holding a null-aware anti join, then append ours, which
+            // runs last.
+            .with_physical_optimizer_rules(NoDynamicFiltersForNullAwareJoins::wrap_default_rules())
             .with_physical_optimizer_rule(Arc::new(optimizer))
-            // Both rules are appended, so they run after the filter-pushdown
-            // rules — which is what the guard needs to see the join's dynamic
-            // filter already attached.
-            .with_physical_optimizer_rule(Arc::new(NullAwareJoinDynamicFilterGuard::new()))
             .build();
 
         let ctx = SessionContext::new_with_state(state);

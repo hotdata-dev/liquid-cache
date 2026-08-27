@@ -14,7 +14,6 @@ use datafusion::{
     prelude::*,
 };
 use fastrace_tonic::FastraceClientService;
-use liquid_cache_datafusion::optimizers::NullAwareJoinDynamicFilterGuard;
 pub use optimizer::PushdownOptimizer;
 use tonic::transport::Channel;
 
@@ -125,10 +124,6 @@ impl LiquidCacheClientBuilder {
                 self.cache_server.clone(),
                 self.object_stores.clone(),
             )))
-            // Joins run client-side, and `LiquidCacheClientExec` forwards
-            // pushed filters into the fragment it ships, so the probe side of a
-            // null-aware anti join is reachable here too.
-            .with_physical_optimizer_rule(Arc::new(NullAwareJoinDynamicFilterGuard::new()))
             .build();
         Ok(SessionContext::new_with_state(session_state))
     }

@@ -11,8 +11,8 @@
 //! require it to drop. The bug is in DataFusion's join, not in the cache — a
 //! plain parquet scan is equally wrong, and a `MemTable` (which accepts no
 //! pushdown) is the only thing that answers correctly — but it lands on every
-//! LiquidCache query, so `NullAwareJoinDynamicFilterGuard` detaches the filter
-//! from null-aware joins. See
+//! LiquidCache query, so `NoDynamicFiltersForNullAwareJoins` keeps dynamic
+//! filters out of any plan holding a null-aware join. See
 //! <https://github.com/hotdata-dev/liquid-cache/issues/16>.
 //!
 //! The expected values below are plain SQL semantics, not a differential
@@ -30,6 +30,16 @@ use parquet::arrow::ArrowWriter;
 use tempfile::TempDir;
 
 use crate::LiquidCacheLocalBuilder;
+
+/// Table `t2`, used as the far side of a join enclosing the anti join.
+fn write_probe(dir: &Path, vals: &[Option<i64>]) {
+    let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, true)]));
+    write(
+        &dir.join("t2.parquet"),
+        schema,
+        vec![Arc::new(Int64Array::from(vals.to_vec()))],
+    );
+}
 
 /// Outer table `t0`, one nullable `a` column.
 fn write_outer(dir: &Path, vals: &[Option<i64>]) {
@@ -75,14 +85,15 @@ async fn liquid_ctx(dir: &Path) -> SessionContext {
         .build(config)
         .await
         .unwrap();
-    for t in ["t0", "t1"] {
-        ctx.register_parquet(
-            t,
-            dir.join(format!("{t}.parquet")).to_str().unwrap(),
-            ParquetReadOptions::default(),
-        )
-        .await
-        .unwrap();
+    // `t2` only exists for the tests that write it.
+    for t in ["t0", "t1", "t2"] {
+        let path = dir.join(format!("{t}.parquet"));
+        if !path.exists() {
+            continue;
+        }
+        ctx.register_parquet(t, path.to_str().unwrap(), ParquetReadOptions::default())
+            .await
+            .unwrap();
     }
     ctx
 }
@@ -185,34 +196,93 @@ async fn empty_probe_keeps_null_outer_key() {
     assert_result(&liquid_ctx(dir.path()).await, NOT_IN, &[None, Some(1000)]).await;
 }
 
-fn find_join(plan: &Arc<dyn ExecutionPlan>) -> Option<&HashJoinExec> {
-    if let Some(join) = plan.downcast_ref::<HashJoinExec>() {
-        return Some(join);
+/// A join *above* the anti join pushes its own dynamic filter straight through
+/// into the same probe subtree, because `HashJoinExec` reports both sides of a
+/// `LeftAnti` as preserved for pushdown. Detaching only the anti join's own
+/// filter left this wrong, which is why the guard works at plan scope.
+#[tokio::test]
+async fn enclosing_join_cannot_prune_the_probe_side() {
+    let dir = TempDir::new().unwrap();
+    write_outer(dir.path(), &(1000..1109).map(Some).collect::<Vec<_>>());
+    write_sub(dir.path(), &[(Some(1), "keep"), (None, "keep")]);
+    // `t2` matches one outer value, so the enclosing join's filter is narrow
+    // enough to prune the whole subquery file away.
+    write_probe(dir.path(), &[Some(1050)]);
+    let ctx = liquid_ctx(dir.path()).await;
+
+    // The anti join drops every outer row, so the enclosing join has nothing to
+    // match and both orderings must return no rows.
+    for sql in [
+        "SELECT x.a FROM t2 JOIN ({NOT_IN}) x ON t2.a = x.a",
+        "SELECT x.a FROM ({NOT_IN}) x JOIN t2 ON t2.a = x.a",
+    ] {
+        assert_result(&ctx, &sql.replace("{NOT_IN}", NOT_IN), &[]).await;
     }
-    plan.children().into_iter().find_map(find_join)
 }
 
-/// The guard is surgical: it detaches the dynamic filter from the null-aware
-/// join only, leaving the pruning optimization in place everywhere else.
+fn find_joins(plan: &Arc<dyn ExecutionPlan>, out: &mut Vec<(bool, bool)>) {
+    if let Some(join) = plan.downcast_ref::<HashJoinExec>() {
+        out.push((join.null_aware, join.dynamic_filter_expr().is_some()));
+    }
+    for child in plan.children() {
+        find_joins(child, out);
+    }
+}
+
+async fn joins_of(ctx: &SessionContext, sql: &str) -> Vec<(bool, bool)> {
+    let (state, logical) = ctx.sql(sql).await.unwrap().into_parts();
+    let plan = state.create_physical_plan(&logical).await.unwrap();
+    let mut out = Vec::new();
+    find_joins(&plan, &mut out);
+    out
+}
+
+/// Dynamic filters survive everywhere except in a plan that holds a null-aware
+/// join — there they are suppressed plan-wide, since one join's filter reaches
+/// another's probe side.
 #[tokio::test]
-async fn guard_only_strips_null_aware_joins() {
+async fn dynamic_filters_suppressed_only_alongside_a_null_aware_join() {
+    let dir = TempDir::new().unwrap();
+    write_outer(dir.path(), &(1000..1109).map(Some).collect::<Vec<_>>());
+    write_sub(dir.path(), &[(Some(1), "keep"), (None, "keep")]);
+    write_probe(dir.path(), &[Some(1050)]);
+    let ctx = liquid_ctx(dir.path()).await;
+
+    // A plain join keeps its dynamic filter.
+    assert_eq!(
+        joins_of(&ctx, "SELECT t0.a FROM t0 JOIN t2 ON t0.a = t2.a").await,
+        vec![(false, true)]
+    );
+    // The null-aware join never gets one.
+    assert_eq!(joins_of(&ctx, NOT_IN).await, vec![(true, false)]);
+    // Nor does the join above it, which is the case the plan-scoped guard adds.
+    let nested = format!("SELECT x.a FROM t2 JOIN ({NOT_IN}) x ON t2.a = x.a");
+    let joins = joins_of(&ctx, &nested).await;
+    assert_eq!(
+        joins.len(),
+        2,
+        "expected an enclosing join and an anti join"
+    );
+    assert!(
+        joins.iter().all(|(_, has_filter)| !has_filter),
+        "no join in a null-aware plan may carry a dynamic filter: {joins:?}"
+    );
+}
+
+/// A `NOT IN` alongside a range predicate on the same column is still wrong,
+/// and no physical rule can fix it: DataFusion's logical `push_down_filter`
+/// infers the join key and copies `t1.a > ..` into the subquery, dropping the
+/// NULL that makes `NOT IN` never true. Wrong in vanilla DataFusion over a
+/// `MemTable` too, with every dynamic filter disabled. Un-ignore when upstream
+/// stops inferring join-key predicates across a null-aware join.
+#[tokio::test]
+#[ignore = "upstream logical-optimizer bug, not reachable from a physical rule"]
+async fn not_in_with_range_predicate_on_the_join_key() {
     let dir = TempDir::new().unwrap();
     write_outer(dir.path(), &(1000..1109).map(Some).collect::<Vec<_>>());
     write_sub(dir.path(), &[(Some(1), "keep"), (None, "keep")]);
     let ctx = liquid_ctx(dir.path()).await;
 
-    for (sql, null_aware) in [
-        (NOT_IN, true),
-        ("SELECT t0.a FROM t0 JOIN t1 ON t0.a = t1.a", false),
-    ] {
-        let (state, logical) = ctx.sql(sql).await.unwrap().into_parts();
-        let plan = state.create_physical_plan(&logical).await.unwrap();
-        let join = find_join(&plan).expect("query should plan a hash join");
-        assert_eq!(join.null_aware, null_aware, "{sql}");
-        assert_eq!(
-            join.dynamic_filter_expr().is_none(),
-            null_aware,
-            "dynamic filter should be stripped from null-aware joins only: {sql}"
-        );
-    }
+    let sql = format!("SELECT a FROM ({NOT_IN}) x WHERE x.a > 1050");
+    assert_result(&ctx, &sql, &[]).await;
 }

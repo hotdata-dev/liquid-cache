@@ -26,7 +26,7 @@ use datafusion::{
     physical_plan::ExecutionPlan,
 };
 
-pub use null_aware_join::NullAwareJoinDynamicFilterGuard;
+pub use null_aware_join::NoDynamicFiltersForNullAwareJoins;
 pub(crate) use squeeze_hint::HintAnalyzer;
 pub use squeeze_hint::SqueezeHintMap;
 
