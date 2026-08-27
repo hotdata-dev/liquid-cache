@@ -29,7 +29,7 @@ async fn read_squeezed_date_time() {
         .with_squeeze_policy(Box::new(TranscodeSqueezeEvict))
         .with_max_memory_bytes(array_size * 2)
         .with_store(
-            t4::mount(temp_dir.path().join("liquid_cache.t4"))
+            crate::store::mount(temp_dir.path().join("liquid_cache.t4"))
                 .await
                 .unwrap(),
         )
@@ -95,7 +95,7 @@ async fn read_squeezed_variant_path() {
         .with_squeeze_policy(Box::new(TranscodeSqueezeEvict))
         .with_max_memory_bytes(array_size * 3 / 2)
         .with_store(
-            t4::mount(temp_dir.path().join("liquid_cache.t4"))
+            crate::store::mount(temp_dir.path().join("liquid_cache.t4"))
                 .await
                 .unwrap(),
         )
@@ -158,7 +158,7 @@ async fn read_squeezed_int64_array() {
         .with_squeeze_policy(Box::new(TranscodeSqueezeEvict))
         .with_max_memory_bytes(array_size * 2)
         .with_store(
-            t4::mount(temp_dir.path().join("liquid_cache.t4"))
+            crate::store::mount(temp_dir.path().join("liquid_cache.t4"))
                 .await
                 .unwrap(),
         )

@@ -137,7 +137,7 @@ impl LiquidCacheBuilder {
             None => {
                 let cache_dir = tempfile::tempdir().unwrap().keep();
                 let store_path = cache_dir.join("liquid_cache.t4");
-                t4::mount(&store_path)
+                crate::store::mount(&store_path)
                     .await
                     .expect("failed to mount t4 store")
             }

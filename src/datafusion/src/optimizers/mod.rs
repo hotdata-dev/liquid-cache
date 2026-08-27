@@ -47,6 +47,12 @@ use crate::{LiquidCacheParquetRef, LiquidParquetSource, cache::ColumnSqueezeHint
 /// The estimate multiplies the raw required parquet bytes by `expansion`
 /// (parquet -> liquid in-memory blow-up) and `safety` (extra margin); both are
 /// `>= 1.0` so the estimate is conservative (over-counts).
+///
+/// The budget assumes the bytes the cache counts are the bytes actually
+/// resident, which holds only under DIRECT I/O. Off Linux the store falls back
+/// to buffered I/O (see [`liquid_cache::store`]) and the kernel keeps an
+/// uncounted second copy, so real residency exceeds the figure this gate is
+/// measured against. Tune these knobs on Linux.
 #[derive(Debug, Clone, Copy)]
 pub struct AdmissionGate {
     /// Parquet-bytes -> liquid-in-memory-bytes multiplier (>= 1.0). Inflates the

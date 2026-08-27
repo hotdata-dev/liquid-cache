@@ -102,6 +102,28 @@ jobs:
                   files: codecov.json
                   fail_ci_if_error: true
 
+    macos:
+        # The only job that exercises the store's non-io_uring I/O backend and
+        # the portable (non-BMI2) selection path, both of which Linux never
+        # reaches. Excludes dev-tools, whose generated tailwind.css comes from
+        # the npm steps the Linux jobs run; benchmarks stay Linux-only because
+        # buffered I/O makes their numbers unrepresentative.
+        name: macOS
+        runs-on: macos-latest
+        steps:
+            - uses: actions/checkout@v4
+            - uses: dtolnay/rust-toolchain@stable
+              with:
+                  components: clippy
+            - uses: Swatinem/rust-cache@v2
+              with:
+                  shared-key: ci-${{ runner.os }}
+                  save-if: ${{ github.ref == 'refs/heads/main' }}
+            - name: Run clippy
+              run: cargo clippy --workspace --exclude dev-tools --all-targets --all-features -- -D warnings
+            - name: Run tests
+              run: cargo test --workspace --exclude dev-tools
+
     shuttle_test:
         name: Shuttle Test
         runs-on: ubuntu-latest

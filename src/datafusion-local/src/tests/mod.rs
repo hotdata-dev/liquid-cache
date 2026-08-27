@@ -335,6 +335,49 @@ async fn test_single_column_filter_projection() {
     test_runner(sql, &reference, cache_dir.path()).await;
 }
 
+/// Runs on x86_64 only, because the snapshot pins `usage.memory_bytes` exactly
+/// and aarch64 reports 935 bytes less at every one of the three measurement
+/// points (1000915 -> 999980, 1036304 -> 1035369), reproducibly.
+///
+/// The split is by architecture, not by OS. Measured:
+///
+/// | target              | usage.memory_bytes |
+/// |---------------------|--------------------|
+/// | x86_64-linux        | 1000915 (recorded) |
+/// | aarch64-linux       | 999980             |
+/// | aarch64-darwin      | 999980             |
+///
+/// aarch64-linux and aarch64-darwin agree exactly, so the OS is not the
+/// variable — gating on `target_os` would still fail on Graviton or on any ARM
+/// Linux runner.
+///
+/// The whole delta is the FSST-compressed payload — `RawFsstBuffer::values.len()`.
+/// Componentwise, everything else is byte-identical across the two architectures
+/// (the arrow entries, the fastlanes bit-packed dictionary keys at 17504, the
+/// prefix keys, the compact offsets, the struct sizes, and the 537585 bytes of
+/// uncompressed FSST input). Only the compressed output moves: 254655 on aarch64
+/// against 255590 on x86_64.
+///
+/// Cause: `fsst-rs` 0.5.11 drains a hash map of symbol candidates into a
+/// `BinaryHeap` (`builder.rs:796`), and `Candidate`'s ordering key is just
+/// `(gain, symbol.len())` (`builder.rs:835-837`) — the symbol bytes are excluded.
+/// Two distinct symbols with equal gain and equal length therefore compare
+/// `Equal`, so which one wins is decided by heap insertion order, i.e. hash-map
+/// iteration order, which is not stable across architectures (hashbrown selects
+/// an SSE2, NEON or generic probe implementation per target). Different
+/// tie-break, different 255-symbol table, different compressed length. The real
+/// fix belongs upstream: make `Candidate`'s ordering total by including the
+/// symbol bytes as a final tie-breaker.
+///
+/// Note this means liquid-encoded bytes are NOT identical across architectures —
+/// `to_bytes` writes `values` verbatim — so compression ratios and capacity
+/// figures do not transfer between arm64 and x86_64. `usage.disk_bytes` staying
+/// at 35000 is not evidence against that; the two disk-resident entries are
+/// different, much smaller columns than the one that moves.
+///
+/// The byte-exact snapshot therefore runs on x86_64 only, keeping its full
+/// strength and the `cargo insta` workflow there. Everywhere else the test still
+/// runs and bounds the same figures to within 1% — see the bottom of this test.
 #[tokio::test]
 async fn test_provide_schema2() {
     use std::fmt::Write as _;
@@ -416,7 +459,75 @@ async fn test_provide_schema2() {
         }
     }
 
+    #[cfg(target_arch = "x86_64")]
     insta::assert_snapshot!(snapshot);
+
+    // Off x86_64 the byte-exact snapshot cannot match, because FSST picks a
+    // different symbol table (see above). Bound the figures instead of skipping
+    // the test: arm64 is a production target, so it still deserves a tripwire on
+    // a gross accounting regression. The plan text is only checked byte-for-byte
+    // on x86_64, but what this test covers besides it — the DataFusion-vs-liquid
+    // column equality, the cache hits, the tier split, the `Utf8`-declared schema
+    // over a `string_view` file — is architecture-independent and worth running.
+    #[cfg(not(target_arch = "x86_64"))]
+    assert_memory_bytes_within_1pct(
+        &snapshot,
+        include_str!("snapshots/liquid_cache_datafusion_local__tests__provide_schema2.snap"),
+    );
+}
+
+/// Checks each `usage.memory_bytes` line in `snapshot` against the figure the
+/// committed x86_64 snapshot records for the same query, allowing 1%.
+///
+/// `recorded` is the `.snap` file itself rather than a hand-copied array, so
+/// regenerating the snapshot on x86_64 with `cargo insta accept` cannot leave
+/// this assertion silently checking stale numbers.
+///
+/// The known architecture difference is ~0.1% (935 bytes in ~1 MiB), so 1% has an
+/// order of magnitude of headroom while still catching the kind of regression that
+/// matters — a buffer counted twice, or a tier accounted at the wrong size.
+#[cfg(not(target_arch = "x86_64"))]
+fn assert_memory_bytes_within_1pct(snapshot: &str, recorded: &str) {
+    let actual = memory_bytes(snapshot);
+    let expected = memory_bytes(recorded);
+
+    // Both sides are parsed with the same predicate, so a changed prefix would
+    // empty both and make the length check below pass on nothing.
+    assert!(
+        !expected.is_empty(),
+        "found no `usage.memory_bytes` readings in the committed snapshot; the \
+         stats format has changed and this assertion is no longer reading anything"
+    );
+    assert_eq!(
+        actual.len(),
+        expected.len(),
+        "expected {} memory_bytes readings, found {}: {actual:?}",
+        expected.len(),
+        actual.len()
+    );
+
+    for (idx, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
+        let drift = actual.abs_diff(expected);
+        assert!(
+            drift * 100 <= expected,
+            "query[{idx}]: memory_bytes {actual} is more than 1% from the x86_64 \
+             figure {expected} (off by {drift}); the architecture difference should \
+             be ~0.1%, so this is a real accounting change"
+        );
+    }
+}
+
+/// Pulls every `usage.memory_bytes` figure out of a stats snapshot, in order.
+///
+/// Works on both the live snapshot and a committed `.snap` file: insta writes the
+/// snapshot body unindented after its YAML header, so the same prefix matches.
+#[cfg(not(target_arch = "x86_64"))]
+fn memory_bytes(snapshot: &str) -> Vec<u64> {
+    snapshot
+        .lines()
+        .filter_map(|line| line.strip_prefix("usage.memory_bytes: "))
+        .map(|value| value.trim().parse().expect("memory_bytes must be a number"))
+        .collect()
 }
 
 #[tokio::test]

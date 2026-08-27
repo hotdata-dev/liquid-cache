@@ -41,8 +41,6 @@
               llvmPackages.bintools
               lldb
               cargo-fuzz
-              bpftrace
-              perf
               nixd
               inferno
               cargo-flamegraph
@@ -55,6 +53,12 @@
                 extensions = [ "rust-src" "llvm-tools-preview" ];
                 targets = [ "x86_64-unknown-linux-gnu" "wasm32-unknown-unknown" ];
               }))
+            ]
+            # perf and bpftrace exist only on Linux in nixpkgs, and this flake
+            # is evaluated for every default system, macOS included.
+            ++ lib.optionals stdenv.isLinux [
+              bpftrace
+              perf
             ];
 
             shellHook = ''

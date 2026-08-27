@@ -4312,7 +4312,6 @@ dependencies = [
  "liquid-cache-common",
  "liquid-cache-datafusion",
  "parquet",
- "t4",
  "tempfile",
  "tokio",
 ]
@@ -4341,7 +4340,6 @@ dependencies = [
  "prost",
  "serde",
  "sysinfo",
- "t4",
  "tempfile",
  "tokio",
  "tonic",

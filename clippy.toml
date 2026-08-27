@@ -1,0 +1,4 @@
+disallowed-methods = [
+	{ path = "t4::mount", reason = "use liquid_cache::store::mount so the store's I/O mode stays in one place" },
+	{ path = "t4::mount_with_options", reason = "use liquid_cache::store::mount so the store's I/O mode stays in one place" },
+]

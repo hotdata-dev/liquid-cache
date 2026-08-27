@@ -41,6 +41,11 @@ pprof = { version = "0.15.0", features = ["flamegraph"] }
 anyhow = "1.0"
 usdt = "0.6"
 regex = "1.12.4"
+
+# Hardware counters come from perf_event_open, a Linux-only syscall; the crate
+# does not compile anywhere else. See `PerfEventCollector` in
+# src/inprocess_runner.rs for the fallback.
+[target.'cfg(target_os = "linux")'.dependencies]
 perf-event2 = "0.7.4"
 
 [features]

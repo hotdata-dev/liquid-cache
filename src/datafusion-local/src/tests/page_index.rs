@@ -136,8 +136,8 @@ fn fixture_is_rejected_by_required_policy() {
 /// Scanning such a file through LiquidCache must succeed. The predicate matters:
 /// it is what builds the page-pruning predicate that consults the index.
 ///
-/// The local builder mounts t4 with buffered I/O off Linux, so unlike the
-/// direct-`t4::mount` suites this runs on every dev machine, not just CI.
+/// The store is mounted through `liquid_cache::store::mount`, which uses
+/// buffered I/O off Linux, so this runs on every dev machine, not just CI.
 #[tokio::test]
 async fn scans_file_without_offset_index() {
     let dir = TempDir::new().unwrap();
