@@ -11,24 +11,12 @@ pub(crate) mod utils;
 pub(crate) mod test_utils {
     //! Shared helpers for this crate's tests.
 
-    /// Mount a t4 store for a test.
-    ///
-    /// t4's default [`t4::MountOptions`] enable `direct_io`, which only Linux
-    /// supports; everywhere else the mount fails outright with
-    /// `direct_io not supported on target_os`. Keep it on Linux (production, CI)
-    /// and fall back to buffered I/O elsewhere, matching what
-    /// `LiquidCacheLocalBuilder` does, so these tests run on macOS dev machines
-    /// too.
+    /// Mount a t4 store for a test, using the same I/O mode the cache uses in
+    /// production on this platform.
     pub(crate) async fn mount_test_store(dir: &std::path::Path) -> t4::Store {
-        t4::mount_with_options(
-            dir.join("liquid_cache.t4"),
-            t4::MountOptions {
-                direct_io: cfg!(target_os = "linux"),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("mount t4 test store")
+        liquid_cache::store::mount(dir.join("liquid_cache.t4"))
+            .await
+            .expect("mount t4 test store")
     }
 }
 
