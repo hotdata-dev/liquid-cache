@@ -119,21 +119,27 @@ async fn ternary_partitions_cover_every_row_once() {
     write_t1(&parquet);
     let ctx = liquid_ctx(&dir.path().join("cache"), &parquet).await;
 
-    let matched = projected_rows(&ctx, &format!("WHERE {P}")).await;
-    let negated = projected_rows(&ctx, &format!("WHERE NOT ({P})")).await;
-    let unknown = projected_rows(&ctx, &format!("WHERE ({P}) IS NULL")).await;
+    // The first query reads the predicate columns through the parquet fallback
+    // and fills the cache; everything after it is served from the cache, which
+    // is a separate evaluation path. Running the buckets twice gives each one a
+    // warm pass, and the first one a cold pass.
+    for pass in ["fills-cache", "cached"] {
+        let matched = projected_rows(&ctx, &format!("WHERE {P}")).await;
+        let negated = projected_rows(&ctx, &format!("WHERE NOT ({P})")).await;
+        let unknown = projected_rows(&ctx, &format!("WHERE ({P}) IS NULL")).await;
 
-    assert_eq!(matched.len(), 8);
-    assert_eq!(negated, Vec::<String>::new());
-    assert_eq!(unknown, vec!["NULL"; 4]);
+        assert_eq!(matched.len(), 8, "{pass}");
+        assert_eq!(negated, Vec::<String>::new(), "{pass}");
+        assert_eq!(unknown, vec!["NULL"; 4], "{pass}");
 
-    let mut partitioned = matched;
-    partitioned.extend(negated);
-    partitioned.extend(unknown);
-    partitioned.sort();
-    assert_eq!(
-        projected_rows(&ctx, "").await,
-        partitioned,
-        "the three buckets are not a partition of the table"
-    );
+        let mut partitioned = matched;
+        partitioned.extend(negated);
+        partitioned.extend(unknown);
+        partitioned.sort();
+        assert_eq!(
+            projected_rows(&ctx, "").await,
+            partitioned,
+            "{pass}: the three buckets are not a partition of the table"
+        );
+    }
 }

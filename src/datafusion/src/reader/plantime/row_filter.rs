@@ -417,13 +417,15 @@ fn columns_sorted(_columns: &[usize], _metadata: &ParquetMetaData) -> Result<boo
 /// * `Ok(None)` if the expression cannot be used as an RowFilter
 /// * `Err(e)` if an error occurs while building the filter
 ///
-/// Note that the returned `RowFilter` may not contains all conjuncts in the
-/// original expression. This is because some conjuncts may not be able to be
-/// evaluated as an `ArrowPredicate` and will be ignored.
+/// A conjunct that cannot be evaluated as an `ArrowPredicate` is dropped: given
+/// `a = 1 AND b = 2 AND c = 3` where `b = 2` cannot be evaluated, the returned
+/// filter holds `a = 1` and `c = 3`.
 ///
-/// For example, if the expression is `a = 1 AND b = 2 AND c = 3` and `b = 2`
-/// can not be evaluated for some reason, the returned `RowFilter` will contain
-/// `a = 1` and `c = 3`.
+/// That is a correctness hazard here, not the harmless narrowing it is upstream.
+/// DataFusion removes the `FilterExec` when it pushes a predicate down, so this
+/// scan is the only place the predicate is applied and a dropped conjunct widens
+/// the filter — rows that should not match come back. See issue #21; the honest
+/// fix is to refuse the pushdown so a `FilterExec` survives.
 pub fn build_row_filter(
     expr: &Arc<dyn PhysicalExpr>,
     physical_file_schema: &SchemaRef,
