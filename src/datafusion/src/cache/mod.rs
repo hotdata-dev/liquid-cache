@@ -450,9 +450,7 @@ mod tests {
 
     async fn setup_cache(batch_size: usize, schema: SchemaRef) -> CachedRowGroupRef {
         let tmp_dir = tempfile::tempdir().unwrap();
-        let store = t4::mount(tmp_dir.path().join("liquid_cache.t4"))
-            .await
-            .unwrap();
+        let store = crate::test_utils::mount_test_store(tmp_dir.path()).await;
         let cache = LiquidCacheParquet::new(
             batch_size,
             usize::MAX,

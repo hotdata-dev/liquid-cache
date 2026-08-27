@@ -49,7 +49,6 @@ impl ReaderFactory {
         row_group_idx: usize,
         selection: Option<RowSelection>,
         projection: ProjectionMask,
-        batch_size: usize,
     ) -> PlanResult {
         let meta = self.metadata.row_group(row_group_idx);
 
@@ -120,7 +119,6 @@ impl ReaderFactory {
         let context = PlanningContext {
             row_group_idx,
             selection,
-            batch_size,
             cached_row_group,
             cache_projection,
             projection_column_ids,
@@ -144,7 +142,6 @@ fn build_projection_schema(file_schema: &SchemaRef, projection_column_ids: &[usi
 struct PlanningContext {
     row_group_idx: usize,
     selection: RowSelection,
-    batch_size: usize,
     cached_row_group: CachedRowGroupRef,
     cache_projection: ProjectionMask,
     projection_column_ids: Vec<usize>,
@@ -160,9 +157,13 @@ fn build_liquid_cache_reader(
         .metadata
         .row_group(context.row_group_idx)
         .num_rows() as usize;
+    // `current_batch_id` counts read batches, and the parquet fallback multiplies
+    // it by `cache_batch_size` to get a row offset, so the read size and the cache
+    // size must be the same number. Read it once and use it for both rather than
+    // deriving them separately — issue #13 was the two drifting apart.
     let cache_batch_size = context.cached_row_group.batch_size();
     LiquidCacheReader::new(LiquidCacheReaderConfig {
-        batch_size: context.batch_size,
+        batch_size: cache_batch_size,
         selection: context.selection,
         row_filter: reader_factory.filter.take(),
         cached_row_group: context.cached_row_group,
@@ -185,6 +186,9 @@ enum StreamState {
     Init,
     /// Decoding a batch from cache
     ReadFromCache(Box<LiquidCacheReader>),
+    /// A decode error ended the scan. Terminal: the stream yields `None` from
+    /// here on and never plans another row group.
+    Finished,
 }
 
 impl std::fmt::Debug for StreamState {
@@ -192,6 +196,7 @@ impl std::fmt::Debug for StreamState {
         match self {
             StreamState::Init => write!(f, "StreamState::Init"),
             StreamState::ReadFromCache(_) => write!(f, "StreamState::Decoding"),
+            StreamState::Finished => write!(f, "StreamState::Finished"),
         }
     }
 }
@@ -200,8 +205,6 @@ pub struct LiquidStreamBuilder {
     pub(crate) input: ParquetMetadataCacheReader,
 
     pub(crate) metadata: Arc<ParquetMetaData>,
-
-    pub(crate) batch_size: usize,
 
     pub(crate) row_groups: Option<Vec<usize>>,
 
@@ -223,7 +226,6 @@ impl LiquidStreamBuilder {
         Self {
             input,
             metadata,
-            batch_size: 1024,
             row_groups: None,
             projection: ProjectionMask::all(),
             filter: None,
@@ -232,11 +234,6 @@ impl LiquidStreamBuilder {
             offset: None,
             span: None,
         }
-    }
-
-    pub fn with_batch_size(mut self, batch_size: usize) -> Self {
-        self.batch_size = batch_size;
-        self
     }
 
     pub fn with_row_groups(mut self, row_groups: Vec<usize>) -> Self {
@@ -284,10 +281,10 @@ impl LiquidStreamBuilder {
             None => (0..self.metadata.row_groups().len()).collect(),
         };
 
-        let batch_size = self
-            .batch_size
-            .min(self.metadata.file_metadata().num_rows() as usize);
-
+        // No batch size is chosen here. The scan must read in cache-sized batches
+        // (see `build_liquid_cache_reader`), so the size is read from the cached row
+        // group at the one place it is used, and the session config never reaches
+        // the reader at all.
         let schema_descr = self.metadata.file_metadata().schema_descr();
         let projection_column_ids = get_root_column_ids(schema_descr, &self.projection);
         let file_schema = liquid_cache.schema();
@@ -325,7 +322,6 @@ impl LiquidStreamBuilder {
             schema,
             row_groups,
             projection: self.projection,
-            batch_size,
             selection: self.selection,
             reader: Some(reader),
             state: StreamState::Init,
@@ -343,8 +339,6 @@ pub struct LiquidStream {
 
     projection: ProjectionMask,
 
-    batch_size: usize,
-
     selection: Option<RowSelection>,
 
     /// This is an option so it can be moved into a future
@@ -360,7 +354,6 @@ impl std::fmt::Debug for LiquidStream {
         f.debug_struct("ParquetRecordBatchStream")
             .field("metadata", &self.metadata)
             .field("schema", &self.schema)
-            .field("batch_size", &self.batch_size)
             .field("projection", &self.projection)
             .field("state", &self.state)
             .finish()
@@ -389,7 +382,16 @@ impl Stream for LiquidStream {
                             return Poll::Ready(Some(Ok(batch)));
                         }
                         Poll::Ready(Some(Err(e))) => {
-                            panic!("Decoding next batch error: {e:?}");
+                            // A decode fault belongs to this one query. Panicking
+                            // here crosses the host's task boundary and takes down
+                            // a worker thread, so return the error instead.
+                            //
+                            // Terminal, and that matters for correctness: the reader
+                            // emits this error without incrementing `current_batch_id`
+                            // and leaves itself `Ready`, so resuming would read the
+                            // next window against a stale batch id.
+                            self.state = StreamState::Finished;
+                            return Poll::Ready(Some(Err(e.into())));
                         }
                         Poll::Ready(None) => {
                             let batch_reader = *batch_reader;
@@ -403,6 +405,10 @@ impl Stream for LiquidStream {
                         }
                     }
                 }
+                StreamState::Finished => {
+                    self.state = StreamState::Finished;
+                    return Poll::Ready(None);
+                }
                 StreamState::Init => {
                     let row_group_idx = match self.row_groups.pop_front() {
                         Some(idx) => idx,
@@ -415,12 +421,10 @@ impl Stream for LiquidStream {
 
                     LocalSpan::add_event(Event::new("LiquidStream::plan_row_group"));
                     let projection = self.projection.clone();
-                    let batch_size = self.batch_size;
                     let maybe_context = self.reader.as_mut().expect("lost reader").plan_row_group(
                         row_group_idx,
                         selection,
                         projection,
-                        batch_size,
                     );
                     match maybe_context {
                         Some(context) => {
@@ -465,6 +469,8 @@ mod tests {
     use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
     use std::fs::File;
     use std::sync::Arc;
+
+    use crate::test_utils::mount_test_store as test_mount;
 
     fn write_two_row_group_file(path: &std::path::Path, schema: SchemaRef) {
         let file = File::create(path).unwrap();
@@ -537,9 +543,7 @@ mod tests {
             &metrics,
         );
 
-        let store = t4::mount(tmp_dir.path().join("liquid_cache.t4"))
-            .await
-            .unwrap();
+        let store = test_mount(tmp_dir.path()).await;
         let cache = Arc::new(
             LiquidCacheParquet::new(
                 4,
@@ -558,7 +562,6 @@ mod tests {
             [0, 1],
         );
         let mut builder = LiquidStreamBuilder::new(input, Arc::clone(reader_metadata.metadata()))
-            .with_batch_size(4)
             .with_row_groups(vec![0, 1])
             .with_projection(projection);
         if let Some(row_filter) = row_filter {
@@ -669,9 +672,7 @@ mod tests {
             &metrics,
         );
 
-        let store = t4::mount(tmp_dir.path().join("liquid_cache.t4"))
-            .await
-            .unwrap();
+        let store = test_mount(tmp_dir.path()).await;
         let cache = Arc::new(
             LiquidCacheParquet::new(
                 4,
@@ -690,7 +691,6 @@ mod tests {
             projection_columns,
         );
         let mut builder = LiquidStreamBuilder::new(input, Arc::clone(reader_metadata.metadata()))
-            .with_batch_size(4)
             .with_row_groups(vec![0, 1])
             .with_projection(projection);
         if let Some(row_filter) = row_filter {
@@ -727,9 +727,7 @@ mod tests {
             &metrics,
         );
 
-        let store = t4::mount(tmp_dir.path().join("liquid_cache.t4"))
-            .await
-            .unwrap();
+        let store = test_mount(tmp_dir.path()).await;
         let cache = Arc::new(
             LiquidCacheParquet::new(
                 4,
@@ -748,7 +746,6 @@ mod tests {
             projection_columns,
         );
         let stream = LiquidStreamBuilder::new(input, Arc::clone(reader_metadata.metadata()))
-            .with_batch_size(4)
             .with_row_groups(vec![0])
             .with_projection(projection)
             .build(cached_file.clone())
@@ -898,5 +895,153 @@ mod tests {
         assert!(is_cached(&row_group, 0, 1).await);
         assert!(is_cached(&row_group, 0, 2).await);
         assert!(is_cached(&row_group, 0, 3).await);
+    }
+
+    /// Build a stream over a single row group with the given cache batch size.
+    async fn make_single_row_group_stream_with_cache_batch_size(
+        row_count: i32,
+        cache_batch_size: usize,
+        limit: Option<usize>,
+    ) -> (LiquidStream, Arc<LiquidCacheParquet>, tempfile::TempDir) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let parquet_path = tmp_dir.path().join("data.parquet");
+        write_single_row_group_file(&parquet_path, schema.clone(), (0..row_count).collect());
+        let metadata_file = File::open(&parquet_path).unwrap();
+        let reader_metadata =
+            ArrowReaderMetadata::load(&metadata_file, ArrowReaderOptions::new()).unwrap();
+        let object_store = Arc::new(LocalFileSystem::new_with_prefix(tmp_dir.path()).unwrap());
+        let partitioned_file = PartitionedFile::new(
+            "data.parquet",
+            std::fs::metadata(&parquet_path).unwrap().len(),
+        );
+        let metrics = ExecutionPlanMetricsSet::new();
+        let input = CachedMetaReaderFactory::new(object_store).create_liquid_reader(
+            0,
+            partitioned_file,
+            None,
+            &metrics,
+        );
+
+        let store = test_mount(tmp_dir.path()).await;
+        let cache = Arc::new(
+            LiquidCacheParquet::new(
+                cache_batch_size,
+                1024 * 1024 * 1024,
+                1024 * 1024 * 1024,
+                store,
+                Box::new(LiquidPolicy::new()),
+                Box::new(Evict),
+                Box::new(AlwaysHydrate::new()),
+            )
+            .await,
+        );
+        let cached_file = cache.register_or_get_file("data.parquet".to_string(), schema);
+        let projection = ProjectionMask::roots(
+            reader_metadata.metadata().file_metadata().schema_descr(),
+            [0],
+        );
+        let stream = LiquidStreamBuilder::new(input, Arc::clone(reader_metadata.metadata()))
+            .with_row_groups(vec![0])
+            .with_limit(limit)
+            .with_projection(projection)
+            .build(cached_file)
+            .unwrap();
+        (stream, cache, tmp_dir)
+    }
+
+    async fn try_collect_a(stream: LiquidStream) -> Result<Vec<i32>, ParquetError> {
+        let batches: Vec<_> = stream.collect().await;
+        let mut a = Vec::new();
+        for batch in batches {
+            let batch = batch?;
+            let array = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            a.extend(array.iter().map(|value| value.unwrap()));
+        }
+        Ok(a)
+    }
+
+    /// A decode error ends the scan, and the stream stays ended.
+    ///
+    /// This load-bears for correctness rather than tidiness. On an error the
+    /// reader returns `ProcessResult::Emit(Err(..))` without incrementing
+    /// `current_batch_id` and leaves itself in `ReaderState::Ready`, so a scan
+    /// that resumed would read the next selection window against a stale batch
+    /// id — the misalignment this module exists to prevent. The file here has two
+    /// row groups, so a stream that failed to terminate would carry on into the
+    /// second one instead of stopping.
+    #[tokio::test]
+    async fn decode_error_ends_the_stream() {
+        let (stream, _cache, _cached_file, tmp_dir) =
+            make_liquid_stream(1024 * 1024, 1024 * 1024, None).await;
+
+        // Truncate the file now that the metadata is cached, so the parquet
+        // fallback's byte reads fail on the first batch.
+        File::create(tmp_dir.path().join("data.parquet")).unwrap();
+
+        let mut stream = Box::pin(stream);
+        assert!(
+            matches!(stream.next().await, Some(Err(_))),
+            "expected the truncated file to surface a decode error"
+        );
+        assert!(
+            stream.next().await.is_none(),
+            "stream must not resume into the next row group after an error"
+        );
+        assert!(
+            stream.next().await.is_none(),
+            "stream must stay ended once it has ended"
+        );
+    }
+
+    /// Issue #13: the reader indexes the cache by batch id and the parquet
+    /// fallback turns that id back into rows with the cache batch size, so the
+    /// scan must read in cache-sized batches. `build` takes the size from the
+    /// cache for exactly that reason — assert the emitted batches follow it and
+    /// the rows stay in order, including when the size does not divide the row
+    /// group evenly.
+    #[tokio::test]
+    async fn stream_reads_in_cache_sized_batches() {
+        let (stream, _cache, _tmp) =
+            make_single_row_group_stream_with_cache_batch_size(20, 8, None).await;
+        let batches: Vec<_> = stream
+            .map(|batch| batch.expect("valid liquid stream batch"))
+            .collect()
+            .await;
+
+        assert_eq!(
+            batches.iter().map(|b| b.num_rows()).collect::<Vec<_>>(),
+            vec![8, 8, 4]
+        );
+        let values: Vec<i32> = batches
+            .iter()
+            .flat_map(|batch| {
+                let array = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                array.iter().map(|value| value.unwrap()).collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(values, (0..20).collect::<Vec<_>>());
+    }
+
+    /// A limit that stops the scan mid-row-group still yields aligned rows. This
+    /// is the shape that used to return rows from the wrong offsets without any
+    /// error at all.
+    #[tokio::test]
+    async fn limited_scan_stays_aligned() {
+        let (stream, _cache, _tmp) =
+            make_single_row_group_stream_with_cache_batch_size(32, 8, Some(12)).await;
+        let values = try_collect_a(stream).await.expect("stream should succeed");
+        assert_eq!(values, (0..12).collect::<Vec<_>>());
     }
 }
