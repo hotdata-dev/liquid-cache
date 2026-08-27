@@ -1,4 +1,9 @@
-disallowed-methods = []
+# Kept in sync with the workspace-root `clippy.toml`: clippy reads exactly one
+# config file per crate, so a crate with its own gets no inheritance.
+disallowed-methods = [
+	{ path = "t4::mount", reason = "use liquid_cache::store::mount so the store's I/O mode stays in one place" },
+	{ path = "t4::mount_with_options", reason = "use liquid_cache::store::mount so the store's I/O mode stays in one place" },
+]
 
 disallowed-types = [
 	{ path = "dashmap::DashMap", reason = "DashMap can easily lead to deadlocks, use RwLock<HashMap> with shuttle tests instead" },

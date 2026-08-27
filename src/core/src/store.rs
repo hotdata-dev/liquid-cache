@@ -25,6 +25,10 @@ use std::path::Path;
 /// On Linux this is exactly [`t4::mount`] — `direct_io` and `dsync` both come
 /// out `true`, matching [`t4::MountOptions::default`]. See the
 /// [module docs](self) for what the buffered fallback costs elsewhere.
+// The one place allowed to mount through `t4` directly — `clippy.toml` sends
+// every other call site here, so this is where the `disallowed_methods` rule has
+// to stop.
+#[allow(clippy::disallowed_methods)]
 pub async fn mount(path: impl AsRef<Path>) -> t4::Result<t4::Store> {
     #[cfg(not(target_os = "linux"))]
     warn_buffered_once();
