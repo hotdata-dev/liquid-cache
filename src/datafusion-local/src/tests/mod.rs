@@ -99,12 +99,28 @@ impl fmt::Display for CacheStatsSummary {
     }
 }
 
+/// Session config for the tests that read [`TEST_FILE`] and pin cache traces,
+/// entry counts or IO counts.
+///
+/// DataFusion 55 lowered `repartition_file_min_size` from 10 MiB to 1 MiB, so the
+/// 2.3 MB test file is now split into one scan partition per `target_partitions`
+/// instead of being read by a single one. Several scan partitions hit the shared
+/// cache concurrently, which makes admission and eviction order — and with it
+/// every trace and byte count these tests assert — depend on scheduling and on
+/// the host's core count. Raise the threshold back above the file size so the
+/// scan stays single-partition and the snapshots stay reproducible.
+pub(super) fn cache_test_config() -> SessionConfig {
+    let mut config = SessionConfig::new();
+    config.options_mut().optimizer.repartition_file_min_size = 16 * 1024 * 1024;
+    config
+}
+
 async fn create_session_context_with_liquid_cache(
     squeeze_policy: Box<dyn SqueezePolicy>,
     cache_size_bytes: usize,
     cache_dir: &Path,
 ) -> Result<(SessionContext, LiquidCacheParquetRef)> {
-    let mut config = SessionConfig::new();
+    let mut config = cache_test_config();
     config.options_mut().execution.target_partitions = 4;
     let (ctx, cache) = LiquidCacheLocalBuilder::new()
         .with_max_memory_bytes(cache_size_bytes)
@@ -385,7 +401,7 @@ async fn test_provide_schema2() {
 
     let cache_dir = TempDir::new().unwrap();
     let df_ctx = SessionContext::new();
-    let mut config = SessionConfig::new();
+    let mut config = cache_test_config();
     config.options_mut().execution.target_partitions = 4;
     let (liquid_ctx, cache) = LiquidCacheLocalBuilder::new()
         .with_cache_dir(cache_dir.path().to_path_buf())
@@ -560,7 +576,7 @@ async fn test_provide_schema_with_filter() {
 
     let (ctx, _) = LiquidCacheLocalBuilder::new()
         .with_squeeze_policy(Box::new(TranscodeSqueezeEvict))
-        .build(SessionConfig::new())
+        .build(cache_test_config())
         .await
         .unwrap();
 
