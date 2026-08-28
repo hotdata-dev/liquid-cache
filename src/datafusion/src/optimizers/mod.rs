@@ -21,7 +21,7 @@ use datafusion::{
         source::DataSource,
     },
     physical_expr::utils::collect_columns,
-    physical_optimizer::{PhysicalOptimizerRule, pruning::PruningPredicate},
+    physical_optimizer::{PhysicalOptimizerRule, pruning::PruningPredicateBuilder},
     physical_plan::ExecutionPlan,
 };
 
@@ -486,7 +486,10 @@ fn surviving_files(
     let Some(pred) = src.filter() else {
         return vec![true; files.len()];
     };
-    let pruning = match PruningPredicate::try_new(pred, table_schema.clone()) {
+    let pruning = match PruningPredicateBuilder::new()
+        .with_file_schema(table_schema.clone())
+        .try_build(pred)
+    {
         Ok(p) => p,
         Err(_) => return vec![true; files.len()],
     };

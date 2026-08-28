@@ -15,7 +15,7 @@ use datafusion::{
         tree_node::{TreeNode, TreeNodeRecursion},
     },
     datasource::physical_plan::FileScanConfig,
-    physical_plan::ExecutionPlan,
+    physical_plan::{ExecutionPlan, StatisticsArgs, StatisticsContext},
 };
 use liquid_cache_common::rpc::ExecutionMetricsResponse;
 use liquid_cache_datafusion::LiquidParquetSource;
@@ -323,14 +323,12 @@ impl From<&Arc<dyn ExecutionPlan>> for ExecutionPlanWithStats {
             });
         }
 
+        let stats = StatisticsContext::new()
+            .compute(plan.as_ref(), &StatisticsArgs::new())
+            .unwrap();
+
         let mut column_statistics = Vec::new();
-        for (i, cs) in plan
-            .partition_statistics(None)
-            .unwrap()
-            .column_statistics
-            .iter()
-            .enumerate()
-        {
+        for (i, cs) in stats.column_statistics.iter().enumerate() {
             let min = if cs.min_value != Precision::Absent {
                 Some(cs.min_value.to_string())
             } else {
@@ -378,16 +376,8 @@ impl From<&Arc<dyn ExecutionPlan>> for ExecutionPlanWithStats {
                 })
                 .collect(),
             statistics: Statistics {
-                num_rows: plan
-                    .partition_statistics(None)
-                    .unwrap()
-                    .num_rows
-                    .to_string(),
-                total_byte_size: plan
-                    .partition_statistics(None)
-                    .unwrap()
-                    .total_byte_size
-                    .to_string(),
+                num_rows: stats.num_rows.to_string(),
+                total_byte_size: stats.total_byte_size.to_string(),
                 column_statistics,
             },
             metrics: metric_values,
