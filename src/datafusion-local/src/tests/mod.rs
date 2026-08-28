@@ -610,3 +610,95 @@ async fn test_provide_schema_with_filter() {
     }
     assert_eq!(formatted_results, reference);
 }
+
+/// Covers the multi-partition scan path against the shared cache.
+///
+/// The tests above pin `repartition_file_min_size` above the test file size so
+/// the scan stays single-partition and their traces stay reproducible. That pin
+/// is deliberate, but it also means nothing else exercises several scan
+/// partitions admitting into one cache concurrently — which is exactly what a
+/// default DataFusion 55 deployment does for any file over 1 MiB, since DF 55
+/// lowered the threshold from 10 MiB to 1 MiB.
+///
+/// So this test leaves `repartition_file_min_size` at the DF 55 default and
+/// asserts only order-independent properties: the result rows compared as a
+/// sorted multiset (against a single-partition run of the same query), and that
+/// the warm run hits the cache. No trace, byte count or row order is pinned, so
+/// it cannot reintroduce the snapshot flakiness the pin defends against.
+#[tokio::test]
+async fn test_multi_partition_scan_shares_cache() {
+    /// Rows as an order-independent multiset.
+    async fn sorted_rows(ctx: &SessionContext, sql: &str) -> Vec<String> {
+        let plan = get_physical_plan(sql, ctx).await;
+        let batches = collect(plan, ctx.task_ctx()).await.unwrap();
+        let mut rows = pretty_format_batches(&batches)
+            .unwrap()
+            .to_string()
+            .lines()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        rows.sort();
+        rows
+    }
+
+    async fn build_ctx(
+        config: SessionConfig,
+        cache_dir: &Path,
+    ) -> (SessionContext, LiquidCacheParquetRef) {
+        let (ctx, cache) = LiquidCacheLocalBuilder::new()
+            .with_max_memory_bytes(1024 * 1024)
+            .with_cache_dir(cache_dir.to_path_buf())
+            .with_squeeze_policy(Box::new(TranscodeSqueezeEvict))
+            .with_cache_policy(Box::new(LiquidPolicy::new()))
+            .build(config)
+            .await
+            .unwrap();
+        ctx.register_parquet("hits", TEST_FILE, ParquetReadOptions::default())
+            .await
+            .unwrap();
+        (ctx, cache)
+    }
+
+    let sql = r#"select "OS", COUNT(*) from hits where "URL" like '%tours%' group by "OS""#;
+
+    // Multi-partition: DF 55 default `repartition_file_min_size` (1 MiB) against
+    // the 2.3 MB test file, so `target_partitions` really does split the scan.
+    let multi_dir = TempDir::new().unwrap();
+    let mut multi_config = SessionConfig::new();
+    multi_config.options_mut().execution.target_partitions = 4;
+    let (multi_ctx, cache) = build_ctx(multi_config, multi_dir.path()).await;
+
+    // Guard the premise: if a future default makes the scan single-partition
+    // again, this test would silently stop covering concurrent admission.
+    let scan_partitions = {
+        let mut node = get_physical_plan(sql, &multi_ctx).await;
+        while let Some(child) = node.children().first() {
+            node = Arc::clone(child);
+        }
+        node.properties().partitioning.partition_count()
+    };
+    assert!(
+        scan_partitions > 1,
+        "expected a multi-partition scan, got {scan_partitions}"
+    );
+
+    // Clear historical counters, then warm the cache and read it back.
+    cache.storage().stats();
+    let first_run = sorted_rows(&multi_ctx, sql).await;
+    let entries_after_first_run = cache.storage().stats().total_entries;
+    let second_run = sorted_rows(&multi_ctx, sql).await;
+    let stats = CacheStatsSummary::from_stats(cache.storage().stats(), entries_after_first_run);
+
+    assert_eq!(first_run, second_run);
+    assert!(
+        stats.has_cache_hits(),
+        "warm multi-partition run did not read from the cache"
+    );
+
+    // Same answer as the single-partition path the snapshot tests pin.
+    let single_dir = TempDir::new().unwrap();
+    let mut single_config = cache_test_config();
+    single_config.options_mut().execution.target_partitions = 4;
+    let (single_ctx, _single_cache) = build_ctx(single_config, single_dir.path()).await;
+    assert_eq!(sorted_rows(&single_ctx, sql).await, second_run);
+}
