@@ -4,6 +4,7 @@ use ahash::{HashMap, HashMapExt};
 use arrow_schema::Schema;
 use bytes::Bytes;
 use datafusion::{
+    common::tree_node::TreeNodeRecursion,
     config::TableParquetOptions,
     datasource::{
         listing::PartitionedFile,
@@ -16,21 +17,25 @@ use datafusion::{
     error::Result,
     physical_expr::projection::ProjectionExprs,
     physical_expr_adapter::DefaultPhysicalExprAdapterFactory,
-    physical_optimizer::pruning::PruningPredicate,
+    physical_optimizer::pruning::{PruningPredicate, PruningPredicateBuilder},
     physical_plan::{
-        PhysicalExpr,
+        PhysicalExpr, apply_expression_roots,
         metrics::{ExecutionPlanMetricsSet, MetricBuilder},
     },
 };
 use futures::{FutureExt, future::BoxFuture};
 use object_store::{ObjectStore, path::Path};
-use parquet::{
-    arrow::{
-        arrow_reader::ArrowReaderOptions,
-        async_reader::{AsyncFileReader, ParquetObjectReader},
-    },
-    file::metadata::{PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader},
-};
+use parquet::arrow::arrow_reader::ArrowReaderOptions;
+use parquet::arrow::async_reader::AsyncFileReader;
+// `ParquetObjectReader` is deprecated in arrow-rs 59 in favour of implementing
+// `AsyncFileReader` against the object store directly
+// (https://github.com/apache/arrow-rs/issues/10308). We keep it for now: it is the
+// only readily available reader that coalesces byte ranges, and DataFusion's
+// `ParquetFileReader` — the suggested replacement — has a `pub(crate)`
+// constructor and does no coalescing.
+#[allow(deprecated)]
+use parquet::arrow::async_reader::ParquetObjectReader;
+use parquet::file::metadata::{PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader};
 use std::{
     ops::Range,
     sync::{Arc, LazyLock},
@@ -58,6 +63,7 @@ impl CachedMetaReaderFactory {
     ) -> ParquetMetadataCacheReader {
         let path = partitioned_file.object_meta.location.clone();
         let store = Arc::clone(&self.store);
+        #[allow(deprecated)]
         let mut inner = ParquetObjectReader::new(store, path.clone())
             .with_file_size(partitioned_file.object_meta.size);
 
@@ -106,6 +112,7 @@ impl MetadataCache {
 #[derive(Clone)]
 pub struct ParquetMetadataCacheReader {
     file_metrics: ParquetFileMetrics,
+    #[allow(deprecated)]
     inner: ParquetObjectReader,
     path: Path,
 }
@@ -225,7 +232,10 @@ impl LiquidParquetSource {
         self.metrics = metrics;
         self.predicate = Some(Arc::clone(&predicate));
 
-        match PruningPredicate::try_new(Arc::clone(&predicate), Arc::clone(&file_schema)) {
+        match PruningPredicateBuilder::new()
+            .with_file_schema(Arc::clone(&file_schema))
+            .try_build(Arc::clone(&predicate))
+        {
             Ok(pruning_predicate) => {
                 if !pruning_predicate.always_true() {
                     self.pruning_predicate = Some(Arc::new(pruning_predicate));
@@ -362,5 +372,17 @@ impl FileSource for LiquidParquetSource {
 
     fn file_type(&self) -> &str {
         "liquid_parquet"
+    }
+
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        apply_expression_roots(
+            self.predicate
+                .iter()
+                .chain(self.projection.iter().map(|proj_expr| &proj_expr.expr)),
+            f,
+        )
     }
 }

@@ -5,6 +5,7 @@ use datafusion::{
     execution::object_store::ObjectStoreUrl, physical_optimizer::PhysicalOptimizerRule,
     physical_plan::ExecutionPlan, physical_plan::aggregates::AggregateExec,
     physical_plan::aggregates::AggregateMode, physical_plan::repartition::RepartitionExec,
+    physical_plan::replace_children_if_necessary,
 };
 
 use liquid_cache_datafusion::optimizers::SqueezeHintMap;
@@ -69,22 +70,13 @@ impl PushdownOptimizer {
 
         // Otherwise, recurse into children
         let mut new_children = Vec::with_capacity(plan.children().len());
-        let mut children_changed = false;
 
         for child in plan.children() {
-            let new_child = self.optimize_plan(child.clone(), hints)?;
-            if !Arc::ptr_eq(child, &new_child) {
-                children_changed = true;
-            }
-            new_children.push(new_child);
+            new_children.push(self.optimize_plan(child.clone(), hints)?);
         }
 
-        // If any children were changed, create a new plan with the updated children
-        if children_changed {
-            plan.with_new_children(new_children)
-        } else {
-            Ok(plan)
-        }
+        // Returns the plan untouched when every child is unchanged.
+        replace_children_if_necessary(plan, new_children)
     }
 }
 

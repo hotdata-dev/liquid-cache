@@ -10,7 +10,7 @@ use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_schema::{Schema, SchemaRef};
 use datafusion::catalog::memory::DataSourceExec;
 use datafusion::common::internal_err;
-use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::config::ConfigOptions;
 use datafusion::datasource::physical_plan::{FileSource, ParquetSource};
 use datafusion::execution::object_store::ObjectStoreUrl;
@@ -138,6 +138,15 @@ impl ExecutionPlan for LiquidCacheClientExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.remote_plan]
+    }
+
+    /// The client node holds no expressions of its own; the wrapped remote plan
+    /// is visited as a child.
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn with_new_children(

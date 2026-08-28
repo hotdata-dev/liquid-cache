@@ -24,7 +24,6 @@ use datafusion::{
     physical_expr::projection::ProjectionExprs,
     physical_expr::utils::reassign_expr_columns,
     physical_expr_adapter::{PhysicalExprAdapterFactory, replace_columns_with_literals},
-    physical_expr_common::physical_expr::is_dynamic_physical_expr,
     physical_optimizer::pruning::{FilePruner, PruningPredicate, build_pruning_predicate},
     physical_plan::{
         PhysicalExpr,
@@ -145,22 +144,20 @@ impl FileOpener for LiquidParquetOpener {
             // Prune this file using the file level statistics and partition values.
             // Since dynamic filters may have been updated since planning it is possible that we are able
             // to prune files now that we couldn't prune at planning time.
-            // It is assumed that there is no point in doing pruning here if the predicate is not dynamic,
-            // as it would have been done at planning time.
             // We'll also check this after every record batch we read,
             // and if at some point we are able to prove we can prune the file using just the file level statistics
             // we can end the stream early.
-            let mut file_pruner = predicate
-                .as_ref()
-                .filter(|p| is_dynamic_physical_expr(p) || partitioned_file.has_statistics())
-                .and_then(|p| {
-                    FilePruner::try_new(
-                        Arc::clone(p),
-                        &logical_file_schema,
-                        &partitioned_file,
-                        predicate_creation_errors.clone(),
-                    )
-                });
+            // `FilePruner::try_new` itself decides whether a pruner is worth
+            // building: it returns `None` for a purely static predicate over a
+            // file with no usable column statistics.
+            let mut file_pruner = predicate.as_ref().and_then(|p| {
+                FilePruner::try_new(
+                    Arc::clone(p),
+                    &logical_file_schema,
+                    &partitioned_file,
+                    predicate_creation_errors.clone(),
+                )
+            });
 
             if let Some(file_pruner) = &mut file_pruner
                 && file_pruner.should_prune()?
