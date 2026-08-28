@@ -23,6 +23,7 @@ use datafusion::{
 
 use crate::LiquidCacheLocalBuilder;
 mod batch_size_alignment;
+mod column_free_conjunct;
 mod date_optimizer;
 mod filter_limit;
 mod page_index;

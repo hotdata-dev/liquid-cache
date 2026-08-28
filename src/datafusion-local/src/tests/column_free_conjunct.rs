@@ -1,0 +1,145 @@
+//! Regression tests for issue #19: a pushed-down conjunct that references no column.
+//!
+//! DataFusion simplifies `NOT (s = s)` to `s IS NULL AND NULL`. The bare `NULL`
+//! is a conjunct with an empty column set, and the row-filter builder used to
+//! drop every candidate whose column set was empty. The liquid scan is the only
+//! place the pushed-down predicate is applied — DataFusion has already removed
+//! the `FilterExec` — so dropping a conjunct *widens* the filter: rows where the
+//! predicate is UNKNOWN came back as if it were TRUE.
+//!
+//! That shows up as a ternary-logic partitioning violation. `WHERE p`,
+//! `WHERE NOT p` and `WHERE p IS NULL` must partition the table, since every row
+//! satisfies exactly one of the three; with the conjunct dropped the three
+//! buckets returned more rows than the table holds.
+
+use std::path::Path;
+use std::sync::Arc;
+
+use arrow::array::{Array, Float64Array, Int64Array, StringArray};
+use arrow::record_batch::RecordBatch;
+use arrow_schema::{DataType, Field, Schema};
+use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
+use parquet::arrow::ArrowWriter;
+use tempfile::TempDir;
+
+use crate::LiquidCacheLocalBuilder;
+
+/// The predicate from the issue. Over [`write_t1`]'s data it is TRUE for eight
+/// rows, UNKNOWN for four, and FALSE for none:
+///
+/// - `id BETWEEN 1 AND 7` is FALSE everywhere — `id` starts at 10.
+/// - `f <= 333.0` is TRUE for the first four rows only.
+/// - `s = s` is TRUE where `s` is set and UNKNOWN where it is NULL.
+///
+/// So the last four NULL-`s` rows are UNKNOWN, and belong to the `p IS NULL`
+/// bucket alone.
+const P: &str = "(f <= 333.0 OR s = s) OR id BETWEEN 1 AND 7";
+
+/// Twelve rows. `s` is NULL on even rows, `f` climbs past the 333 threshold at
+/// row four, and `id` stays clear of the 1..7 range.
+fn write_t1(path: &Path) {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("f", DataType::Float64, false),
+        Field::new("s", DataType::Utf8, true),
+    ]));
+
+    let id: Int64Array = (0..12).map(|i| i + 10).collect();
+    let f: Float64Array = (0..12).map(|i| i as f64 * 100.0).collect();
+    let s: StringArray = (0..12)
+        .map(|i| (i % 2 == 1).then(|| format!("s{i}")))
+        .collect();
+
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(id), Arc::new(f), Arc::new(s)],
+    )
+    .unwrap();
+    let file = std::fs::File::create(path).unwrap();
+    let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+}
+
+async fn liquid_ctx(cache_dir: &Path, parquet: &Path) -> SessionContext {
+    std::fs::create_dir_all(cache_dir).unwrap();
+    let (ctx, _cache) = LiquidCacheLocalBuilder::new()
+        .with_cache_dir(cache_dir.to_path_buf())
+        .build(SessionConfig::new())
+        .await
+        .unwrap();
+    ctx.register_parquet(
+        "t1",
+        parquet.to_str().unwrap(),
+        ParquetReadOptions::default(),
+    )
+    .await
+    .unwrap();
+    ctx
+}
+
+/// The `s` values matching `where`, sorted, with NULL spelled out.
+async fn projected_rows(ctx: &SessionContext, r#where: &str) -> Vec<String> {
+    let batches = ctx
+        .sql(&format!("SELECT s FROM t1 {}", r#where))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let mut rows = Vec::new();
+    for batch in batches {
+        let column = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for i in 0..column.len() {
+            rows.push(match column.is_valid(i) {
+                true => column.value(i).to_string(),
+                false => "NULL".to_string(),
+            });
+        }
+    }
+    rows.sort();
+    rows
+}
+
+/// The scan projects `s` while the filter reads `f`, `s` and `id`, so the
+/// predicate columns are materialized separately from the projected one.
+///
+/// `NOT p` is the telling bucket: it is never TRUE, because `p` is TRUE or
+/// UNKNOWN for every row. Dropping the column-free `NULL` conjunct left
+/// `f > 333 AND s IS NULL AND id NOT BETWEEN 1 AND 7` behind, which matches the
+/// four UNKNOWN rows — so they came back in two buckets at once.
+#[tokio::test]
+async fn ternary_partitions_cover_every_row_once() {
+    let dir = TempDir::new().unwrap();
+    let parquet = dir.path().join("t1.parquet");
+    write_t1(&parquet);
+    let ctx = liquid_ctx(&dir.path().join("cache"), &parquet).await;
+
+    // The first query reads the predicate columns through the parquet fallback
+    // and fills the cache; everything after it is served from the cache, which
+    // is a separate evaluation path. Running the buckets twice gives each one a
+    // warm pass, and the first one a cold pass.
+    for pass in ["fills-cache", "cached"] {
+        let matched = projected_rows(&ctx, &format!("WHERE {P}")).await;
+        let negated = projected_rows(&ctx, &format!("WHERE NOT ({P})")).await;
+        let unknown = projected_rows(&ctx, &format!("WHERE ({P}) IS NULL")).await;
+
+        assert_eq!(matched.len(), 8, "{pass}");
+        assert_eq!(negated, Vec::<String>::new(), "{pass}");
+        assert_eq!(unknown, vec!["NULL"; 4], "{pass}");
+
+        let mut partitioned = matched;
+        partitioned.extend(negated);
+        partitioned.extend(unknown);
+        partitioned.sort();
+        assert_eq!(
+            projected_rows(&ctx, "").await,
+            partitioned,
+            "{pass}: the three buckets are not a partition of the table"
+        );
+    }
+}
