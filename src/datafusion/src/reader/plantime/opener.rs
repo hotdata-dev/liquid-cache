@@ -145,8 +145,6 @@ impl FileOpener for LiquidParquetOpener {
             // Prune this file using the file level statistics and partition values.
             // Since dynamic filters may have been updated since planning it is possible that we are able
             // to prune files now that we couldn't prune at planning time.
-            // It is assumed that there is no point in doing pruning here if the predicate is not dynamic,
-            // as it would have been done at planning time.
             // We'll also check this after every record batch we read,
             // and if at some point we are able to prove we can prune the file using just the file level statistics
             // we can end the stream early.
