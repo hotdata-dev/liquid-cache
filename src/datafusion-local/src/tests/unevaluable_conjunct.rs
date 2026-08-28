@@ -119,6 +119,73 @@ async fn nested_column_conjunct_is_still_applied() {
     }
 }
 
+/// Every conjunct being unevaluable was the case the old code thought was safe:
+/// it returned `None` only when *all* candidates failed. That was wrong too —
+/// `None` means the scan applies no filter at all, and the `FilterExec` that
+/// would have caught it is gone. `id > 100 OR st.a = 3` is a single conjunct
+/// touching `st`, so it takes that path, and it matches exactly one row.
+#[tokio::test]
+async fn sole_unevaluable_conjunct_is_still_applied() {
+    let dir = TempDir::new().unwrap();
+    let parquet = dir.path().join("t.parquet");
+    write_t(&parquet);
+    let ctx = liquid_ctx(&dir.path().join("cache")).await;
+    ctx.register_parquet(
+        "t",
+        parquet.to_str().unwrap(),
+        ParquetReadOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    let sql = "SELECT id FROM t WHERE id > 100 OR st.a = 3";
+    for pass in ["cold", "warm"] {
+        assert_eq!(ids(&ctx, sql).await, vec![3], "{pass}");
+    }
+}
+
+/// Declining a scan costs it the cache, so the refusal has to stay narrow: it is
+/// a nested column *in the predicate* that the row filter cannot evaluate, not
+/// the mere presence of one in the table or in the projection. Projecting `st.a`
+/// is still cached, and so is a scan of a table that merely has a struct column.
+#[tokio::test]
+async fn only_a_nested_predicate_costs_the_cache() {
+    let dir = TempDir::new().unwrap();
+    let parquet = dir.path().join("t.parquet");
+    write_t(&parquet);
+    let ctx = liquid_ctx(&dir.path().join("cache")).await;
+    ctx.register_parquet(
+        "t",
+        parquet.to_str().unwrap(),
+        ParquetReadOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    for sql in [
+        "SELECT st.a FROM t WHERE id >= 0",
+        "SELECT id FROM t WHERE id >= 0",
+        "SELECT id FROM t",
+    ] {
+        let plan = plan_of(&ctx, sql).await;
+        assert!(
+            plan.contains("liquid_parquet"),
+            "`{sql}` lost the cache; the refusal has widened:\n{plan}"
+        );
+    }
+
+    for sql in [
+        "SELECT id FROM t WHERE st.a = 3",
+        "SELECT id FROM t WHERE id >= 0 AND st.a = 3",
+    ] {
+        let plan = plan_of(&ctx, sql).await;
+        assert!(
+            !plan.contains("liquid_parquet"),
+            "`{sql}` kept a filter it cannot evaluate:\n{plan}"
+        );
+    }
+}
+
 /// The other `PushdownChecker` refusal: a conjunct on a column that is not in the
 /// file schema. The table declares `extra`, the file does not have it, so every
 /// row's `extra` is NULL and `extra = 3` is never TRUE.
