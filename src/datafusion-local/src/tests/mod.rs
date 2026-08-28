@@ -28,6 +28,7 @@ mod date_optimizer;
 mod filter_limit;
 mod page_index;
 mod squeeze;
+mod unevaluable_conjunct;
 mod variants;
 
 const TEST_FILE: &str = "../../examples/nano_hits.parquet";

@@ -33,7 +33,6 @@ use datafusion::{
 };
 use futures::StreamExt;
 use futures::TryStreamExt;
-use log::debug;
 use parquet::arrow::{
     ParquetRecordBatchStreamBuilder, ProjectionMask,
     arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions},
@@ -230,25 +229,23 @@ impl FileOpener for LiquidParquetOpener {
             let indices = projection.column_indices();
             let mask = ProjectionMask::roots(builder.parquet_schema(), indices);
 
-            // Filter pushdown: evaluate predicates during scan
-            let row_filter = predicate.as_ref().and_then(|p| {
-                let row_filter = build_row_filter(
+            // Filter pushdown: evaluate predicates during scan.
+            //
+            // A failure here is not recoverable by ignoring it. DataFusion removed
+            // the `FilterExec` when it pushed this predicate down, so the row
+            // filter is the only place the predicate is applied; carrying on
+            // without one returns rows the query excluded. Fail the query instead
+            // (issue #23).
+            let row_filter = match predicate.as_ref() {
+                Some(p) => build_row_filter(
                     p,
                     &physical_file_schema,
                     reader_metadata.metadata(),
                     reorder_predicates,
                     &file_metrics,
-                );
-
-                match row_filter {
-                    Ok(Some(filter)) => Some(filter),
-                    Ok(None) => None,
-                    Err(e) => {
-                        debug!("Ignoring error building row filter for '{predicate:?}': {e:?}");
-                        None
-                    }
-                }
-            });
+                )?,
+                None => None,
+            };
 
             // Determine which row groups to actually read. The idea is to skip
             // as many row groups as possible based on the metadata and query

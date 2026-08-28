@@ -28,7 +28,10 @@ use datafusion::{
 pub(crate) use squeeze_hint::HintAnalyzer;
 pub use squeeze_hint::SqueezeHintMap;
 
-use crate::{LiquidCacheParquetRef, LiquidParquetSource, cache::ColumnSqueezeHints};
+use crate::{
+    LiquidCacheParquetRef, LiquidParquetSource, cache::ColumnSqueezeHints,
+    reader::unevaluable_conjunct,
+};
 
 /// Parameters for the footprint-based admission gate.
 ///
@@ -547,6 +550,16 @@ fn file_required_bytes(
 
 /// If `node` is a `DataSourceExec` over a `ParquetSource`, return an equivalent
 /// node backed by [`LiquidParquetSource`] carrying `hints`.
+///
+/// Returns `None` — leaving the scan a vanilla parquet read — when the pushed-down
+/// predicate holds a conjunct the liquid row filter cannot evaluate. By the time
+/// this rule runs, DataFusion has already removed the `FilterExec` on the
+/// strength of `ParquetSource` accepting the whole predicate, so the scan is the
+/// only place it is applied. The liquid row filter is stricter than DataFusion's
+/// own (it refuses nested columns, which upstream handles), and it used to drop
+/// what it could not evaluate — running the scan with a strictly weaker filter
+/// than the query asked for (issues #21, #23). Declining the scan hands the
+/// predicate back to the reader that planned it, which applies all of it.
 fn convert_parquet_scan(
     node: &Arc<dyn ExecutionPlan>,
     cache: &LiquidCacheParquetRef,
@@ -555,6 +568,28 @@ fn convert_parquet_scan(
     let data_source_exec = node.downcast_ref::<DataSourceExec>()?;
     let (file_scan_config, parquet_source) =
         data_source_exec.downcast_to_file_source::<ParquetSource>()?;
+
+    if let Some(predicate) = parquet_source.filter() {
+        // Checked against the table schema, which is what the row filter
+        // effectively sees: the opener's physical-expr adapter resolves partition
+        // columns and columns missing from an individual file to literals before
+        // the filter is built. See `unevaluable_conjunct`.
+        let table_schema = parquet_source.table_schema().table_schema();
+        match unevaluable_conjunct(&predicate, table_schema) {
+            Ok(Some(conjunct)) => {
+                log::debug!(
+                    "Not caching scan: the liquid row filter cannot evaluate `{conjunct}`, \
+                     a conjunct of the pushed-down predicate `{predicate}`"
+                );
+                return None;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                log::debug!("Not caching scan: `{predicate}` could not be checked: {e}");
+                return None;
+            }
+        }
+    }
 
     let new_source =
         LiquidParquetSource::from_parquet_source(parquet_source.clone(), cache.clone())
