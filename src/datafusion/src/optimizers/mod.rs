@@ -28,7 +28,10 @@ use datafusion::{
 pub(crate) use squeeze_hint::HintAnalyzer;
 pub use squeeze_hint::SqueezeHintMap;
 
-use crate::{LiquidCacheParquetRef, LiquidParquetSource, cache::ColumnSqueezeHints};
+use crate::{
+    LiquidCacheParquetRef, LiquidParquetSource, cache::ColumnSqueezeHints,
+    reader::unevaluable_conjunct,
+};
 
 /// Parameters for the footprint-based admission gate.
 ///
@@ -547,6 +550,36 @@ fn file_required_bytes(
 
 /// If `node` is a `DataSourceExec` over a `ParquetSource`, return an equivalent
 /// node backed by [`LiquidParquetSource`] carrying `hints`.
+///
+/// Returns `None` — leaving the scan a vanilla parquet read — when the pushed-down
+/// predicate holds a conjunct the liquid row filter cannot evaluate. By the time
+/// this rule runs, DataFusion has already removed the `FilterExec` on the
+/// strength of `ParquetSource` accepting the whole predicate (both entry points
+/// force `execution.parquet.pushdown_filters`, so that removal always happens),
+/// and the scan is the only place the predicate is applied. The liquid row filter
+/// is stricter than DataFusion's own — it refuses nested columns, which upstream
+/// handles — and it used to drop what it could not evaluate, running the scan
+/// with a strictly weaker filter than the query asked for (issues #21, #23).
+/// Declining the scan hands the predicate back to the reader that planned it,
+/// which applies all of it.
+///
+/// Two things this is not, and why:
+///
+/// - **Not `FileSource::try_pushdown_filters`.** Declining per conjunct there is
+///   how DataFusion expects a source to say no, and it would keep the cache *and*
+///   leave a real `FilterExec`. It needs this rewrite to run before the
+///   `FilterPushdown` rule, and this rule cannot move: the admission gate sizes a
+///   scan from the pushed-down projection and predicate, neither of which exists
+///   that early, and the squeeze-hint analyzer reads the optimized plan. Splitting
+///   conversion from gating would fix local mode — but not the server, which
+///   receives a fragment whose `FilterExec` the *client* already removed. The
+///   server has no pushdown negotiation to join, so this gate is needed either way.
+/// - **Not teaching the row filter about nested columns.** Upstream evaluates
+///   `st.a = 3` by building a leaf-level `ProjectionMask` from struct field paths.
+///   Liquid masks by root (`ProjectionMask::roots`) and `get_predicate_column_id`
+///   reads the mask's leaf bits back as cache column ids, so a struct root — one
+///   column, several leaves — would address several cache entries. Lifting that
+///   means changing the cache's column-id model, well past a correctness fix.
 fn convert_parquet_scan(
     node: &Arc<dyn ExecutionPlan>,
     cache: &LiquidCacheParquetRef,
@@ -555,6 +588,31 @@ fn convert_parquet_scan(
     let data_source_exec = node.downcast_ref::<DataSourceExec>()?;
     let (file_scan_config, parquet_source) =
         data_source_exec.downcast_to_file_source::<ParquetSource>()?;
+
+    if let Some(predicate) = parquet_source.filter() {
+        // Checked against the table schema, which is what the row filter
+        // effectively sees: the opener's physical-expr adapter resolves partition
+        // columns and columns missing from an individual file to literals before
+        // the filter is built. See `unevaluable_conjunct`.
+        let table_schema = parquet_source.table_schema().table_schema();
+        // At `info`, like the admission gate's BYPASS line: this silently turns
+        // the cache off for a scan, and the only symptom is that queries stop
+        // getting faster.
+        match unevaluable_conjunct(&predicate, table_schema) {
+            Ok(Some(conjunct)) => {
+                log::info!(
+                    "liquid_cache scan BYPASS: the row filter cannot evaluate `{conjunct}`, \
+                     a conjunct of the pushed-down predicate `{predicate}`"
+                );
+                return None;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                log::info!("liquid_cache scan BYPASS: `{predicate}` could not be checked: {e}");
+                return None;
+            }
+        }
+    }
 
     let new_source =
         LiquidParquetSource::from_parquet_source(parquet_source.clone(), cache.clone())

@@ -8,4 +8,5 @@ mod row_filter;
 mod row_group_filter;
 mod source;
 
+pub(crate) use row_filter::unevaluable_conjunct;
 pub use row_filter::{FilterCandidateBuilder, LiquidPredicate, LiquidRowFilter};
