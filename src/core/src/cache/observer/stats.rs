@@ -142,8 +142,17 @@ pub struct CacheStats {
     pub memory_liquid_bytes: usize,
     /// Total size of in-memory Squeezed-Liquid entries in bytes.
     pub memory_squeezed_liquid_bytes: usize,
-    /// Total memory usage of the cache.
+    /// Total memory usage of the cache: the bytes held by the index.
     pub memory_usage_bytes: usize,
+    /// Bytes materialized in memory but not yet indexed: entries being decoded
+    /// off disk, squeeze outputs awaiting insertion, and entries pending
+    /// admission. Read with `memory_usage_bytes`, which covers only what the
+    /// hydrate/insert/squeeze cycle has already landed.
+    pub in_flight_memory_bytes: usize,
+    /// High water mark of `in_flight_memory_bytes`, since the last cache reset.
+    /// Transients come and go between gauge scrapes, so this is the figure that
+    /// explains a process holding more than `memory_usage_bytes` reports.
+    pub peak_in_flight_memory_bytes: usize,
     /// Total disk usage of the cache.
     pub disk_usage_bytes: usize,
     /// Maximum memory size.

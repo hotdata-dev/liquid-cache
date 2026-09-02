@@ -9,8 +9,53 @@ pub struct BudgetAccounting {
     max_memory_bytes: usize,
     max_disk_bytes: usize,
     used_memory_bytes: AtomicUsize,
+    in_flight_memory_bytes: AtomicUsize,
+    peak_in_flight_memory_bytes: AtomicUsize,
     used_disk_bytes: AtomicUsize,
     observer: Arc<Observer>,
+}
+
+/// Bytes that are materialized in memory but not yet indexed.
+///
+/// The cache holds one of these for every intermediate the
+/// hydrate -> insert -> squeeze cycle creates outside the index: a disk entry
+/// being decoded, a squeeze output waiting to be written and inserted, and an
+/// entry pending admission while room is made for it. Nothing counted them
+/// before, which is why a tier reporting itself at its limit could sit inside a
+/// process holding several times that.
+///
+/// These bytes do not gate admission: they already exist by the time their size
+/// is known, so refusing them would free nothing. They are reported, and they
+/// bound how many transcodes [`super::core::LiquidCache`] runs at once.
+#[derive(Debug)]
+#[must_use = "dropping the reservation immediately releases the bytes"]
+pub(super) struct InFlightReservation<'a> {
+    budget: &'a BudgetAccounting,
+    bytes: usize,
+}
+
+impl InFlightReservation<'_> {
+    /// Change the reserved amount, for when the true size is only known part
+    /// way through: a disk read reserves the encoded buffer before decoding and
+    /// resizes to the decoded array, a transcode reserves its input size as an
+    /// upper bound and resizes to the compressed result.
+    pub(super) fn resize(&mut self, bytes: usize) {
+        self.budget.release_in_flight(self.bytes);
+        self.budget.reserve_in_flight_bytes(bytes);
+        self.bytes = bytes;
+    }
+
+    /// Stop counting these bytes as in-flight, because the caller is about to
+    /// account for them another way: by inserting them into the index.
+    pub(super) fn release(self) {
+        drop(self);
+    }
+}
+
+impl Drop for InFlightReservation<'_> {
+    fn drop(&mut self) {
+        self.budget.release_in_flight(self.bytes);
+    }
 }
 
 impl BudgetAccounting {
@@ -23,6 +68,8 @@ impl BudgetAccounting {
             max_memory_bytes,
             max_disk_bytes,
             used_memory_bytes: AtomicUsize::new(0),
+            in_flight_memory_bytes: AtomicUsize::new(0),
+            peak_in_flight_memory_bytes: AtomicUsize::new(0),
             used_disk_bytes: AtomicUsize::new(0),
             observer,
         }
@@ -31,6 +78,7 @@ impl BudgetAccounting {
     pub(super) fn reset_usage(&self) {
         self.used_memory_bytes.store(0, Ordering::Relaxed);
         self.used_disk_bytes.store(0, Ordering::Relaxed);
+        self.peak_in_flight_memory_bytes.store(0, Ordering::Relaxed);
     }
 
     /// Try to reserve memory in the cache.
@@ -70,8 +118,51 @@ impl BudgetAccounting {
         }
     }
 
+    /// Reserve bytes that are live in memory but not yet in the index.
+    ///
+    /// Cannot fail: see [`InFlightReservation`].
+    pub(super) fn reserve_in_flight(&self, bytes: usize) -> InFlightReservation<'_> {
+        self.reserve_in_flight_bytes(bytes);
+        InFlightReservation {
+            budget: self,
+            bytes,
+        }
+    }
+
+    fn reserve_in_flight_bytes(&self, bytes: usize) {
+        let total = self
+            .in_flight_memory_bytes
+            .fetch_add(bytes, Ordering::Relaxed)
+            + bytes;
+        self.peak_in_flight_memory_bytes
+            .fetch_max(total, Ordering::Relaxed);
+    }
+
+    fn release_in_flight(&self, bytes: usize) {
+        self.in_flight_memory_bytes
+            .fetch_sub(bytes, Ordering::Relaxed);
+    }
+
+    /// Bytes held by the index.
     pub fn memory_usage_bytes(&self) -> usize {
         self.used_memory_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Bytes materialized in memory right now but not yet in the index.
+    ///
+    /// Read alongside [`Self::memory_usage_bytes`]: that one reports the end
+    /// state of the hydrate -> insert -> squeeze cycle, this one reports what
+    /// the cycle is holding on the way there.
+    pub fn in_flight_memory_bytes(&self) -> usize {
+        self.in_flight_memory_bytes.load(Ordering::Relaxed)
+    }
+
+    /// High water mark of [`Self::in_flight_memory_bytes`].
+    ///
+    /// Transients live and die between two scrapes of a gauge, so this is the
+    /// number to look at when a process holds more than its tier reports.
+    pub fn peak_in_flight_memory_bytes(&self) -> usize {
+        self.peak_in_flight_memory_bytes.load(Ordering::Relaxed)
     }
 
     pub fn disk_usage_bytes(&self) -> usize {
@@ -127,6 +218,34 @@ mod tests {
 
         config.reset_usage();
         assert_eq!(config.memory_usage_bytes(), 0);
+    }
+
+    #[test]
+    fn in_flight_reservations_are_reported_and_released() {
+        let budget = test_budget(1000, usize::MAX);
+
+        let small = budget.reserve_in_flight(100);
+        let mut large = budget.reserve_in_flight(300);
+        assert_eq!(budget.in_flight_memory_bytes(), 400);
+
+        // A reservation taken as an upper bound is trued up once the real size
+        // is known, and the peak remembers the bound that was held.
+        large.resize(50);
+        assert_eq!(budget.in_flight_memory_bytes(), 150);
+        assert_eq!(budget.peak_in_flight_memory_bytes(), 400);
+
+        // In-flight bytes are reported, not charged: they say what the cache is
+        // holding outside the index, and admission does not consult them.
+        assert!(budget.try_reserve_memory(1000).is_ok());
+
+        drop(large);
+        small.release();
+        assert_eq!(budget.in_flight_memory_bytes(), 0);
+        assert_eq!(
+            budget.peak_in_flight_memory_bytes(),
+            400,
+            "the high water mark outlives the reservations that set it"
+        );
     }
 
     #[test]

@@ -374,9 +374,28 @@ impl LiquidCacheParquet {
         self.cache_store.config().max_disk_bytes()
     }
 
-    /// Get the memory usage of the cache in bytes.
+    /// Get the memory usage of the cache in bytes: the bytes held by the index.
     pub fn memory_usage_bytes(&self) -> usize {
         self.cache_store.budget().memory_usage_bytes()
+    }
+
+    /// Get the bytes the cache currently holds in memory but has not indexed:
+    /// entries being decoded off disk, squeeze output awaiting insertion, and
+    /// entries pending admission.
+    ///
+    /// Export this next to [`Self::memory_usage_bytes`]. That figure alone can
+    /// sit exactly at the limit while the cycle behind it holds a multiple of
+    /// the limit, which is invisible from the index.
+    pub fn in_flight_memory_bytes(&self) -> usize {
+        self.cache_store.budget().in_flight_memory_bytes()
+    }
+
+    /// Get the high water mark of [`Self::in_flight_memory_bytes`].
+    ///
+    /// Transients are born and freed between gauge scrapes, so the peak is what
+    /// a scrape can actually catch.
+    pub fn peak_in_flight_memory_bytes(&self) -> usize {
+        self.cache_store.budget().peak_in_flight_memory_bytes()
     }
 
     /// Get the disk usage of the cache in bytes.
