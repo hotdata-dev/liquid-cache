@@ -21,7 +21,7 @@ use datafusion::{
         source::DataSource,
         table_schema::TableSchema,
     },
-    physical_expr::{projection::ProjectionExprs, utils::collect_columns},
+    physical_expr::{PhysicalExpr, projection::ProjectionExprs, utils::collect_columns},
     physical_optimizer::{PhysicalOptimizerRule, pruning::PruningPredicateBuilder},
     physical_plan::ExecutionPlan,
 };
@@ -556,7 +556,8 @@ fn file_required_bytes(
 ///
 /// The liquid read path has no notion of DataFusion's virtual columns. It carries
 /// the [`TableSchema`] across faithfully but never produces one, so a scan that
-/// reads a virtual column gets back a batch which simply lacks it. Such a scan has
+/// reads a virtual column gets back a batch which simply lacks it, and a predicate
+/// over one cannot be rewritten against the file schemas either. Such a scan has
 /// to stay on `ParquetSource`, which derives virtual columns from the parquet
 /// reader.
 ///
@@ -575,6 +576,7 @@ fn file_required_bytes(
 fn unproducible_virtual_columns(
     table_schema: &TableSchema,
     projection: Option<&ProjectionExprs>,
+    filter: Option<&Arc<dyn PhysicalExpr>>,
 ) -> Option<String> {
     let virtual_columns = table_schema.virtual_columns();
     if virtual_columns.is_empty() {
@@ -585,11 +587,23 @@ fn unproducible_virtual_columns(
     match projection {
         None => needed.extend(virtual_columns.iter().map(|field| field.name().as_str())),
         Some(projection) => {
-            let read: HashSet<String> = projection
+            let mut read: HashSet<String> = projection
                 .expr_iter()
                 .flat_map(|expr| collect_columns(&expr))
                 .map(|column| column.name().to_string())
                 .collect();
+            // The pushed-down predicate is rewritten against the file schemas in
+            // the opener too, so a conjunct over a virtual column fails exactly as
+            // a projection over one does. The row filter's own check cannot catch
+            // it: that resolves against the table schema, which does hold the
+            // virtual columns.
+            if let Some(filter) = filter {
+                read.extend(
+                    collect_columns(filter)
+                        .into_iter()
+                        .map(|column| column.name().to_string()),
+                );
+            }
             needed.extend(
                 virtual_columns
                     .iter()
@@ -671,9 +685,12 @@ fn convert_parquet_scan(
         }
     }
 
-    if let Some(names) =
-        unproducible_virtual_columns(parquet_source.table_schema(), parquet_source.projection())
-    {
+    let pushed_filter = parquet_source.filter();
+    if let Some(names) = unproducible_virtual_columns(
+        parquet_source.table_schema(),
+        parquet_source.projection(),
+        pushed_filter.as_ref(),
+    ) {
         log::info!(
             "liquid_cache scan BYPASS: the read path cannot produce virtual column(s) `{names}`"
         );
@@ -709,7 +726,8 @@ mod tests {
     #[test]
     fn only_a_virtual_column_the_scan_reads_costs_the_cache() {
         use arrow_schema::{DataType, Field, Fields};
-        use datafusion::physical_expr::expressions::col;
+        use datafusion::logical_expr::Operator;
+        use datafusion::physical_expr::expressions::{BinaryExpr, col, lit};
         use datafusion::physical_expr::projection::ProjectionExpr;
 
         let file_schema = Arc::new(arrow_schema::Schema::new(vec![
@@ -720,7 +738,7 @@ mod tests {
 
         // No virtual columns at all: nothing to refuse, whatever the projection.
         let plain = TableSchema::builder(Arc::clone(&file_schema)).build();
-        assert_eq!(unproducible_virtual_columns(&plain, None), None);
+        assert_eq!(unproducible_virtual_columns(&plain, None, None), None);
 
         let positional = TableSchema::builder(Arc::clone(&file_schema))
             .with_virtual_columns(Fields::from(vec![row_pos.clone()]))
@@ -731,7 +749,7 @@ mod tests {
         let only_id =
             ProjectionExprs::new(vec![ProjectionExpr::new(col("id", full).unwrap(), "id")]);
         assert_eq!(
-            unproducible_virtual_columns(&positional, Some(&only_id)),
+            unproducible_virtual_columns(&positional, Some(&only_id), None),
             None
         );
 
@@ -741,13 +759,27 @@ mod tests {
             "__ducklake_row_pos",
         )]);
         assert_eq!(
-            unproducible_virtual_columns(&positional, Some(&reads_pos)).as_deref(),
+            unproducible_virtual_columns(&positional, Some(&reads_pos), None).as_deref(),
             Some("__ducklake_row_pos")
         );
 
         // No projection reads the whole table schema, virtual columns included.
         assert_eq!(
-            unproducible_virtual_columns(&positional, None).as_deref(),
+            unproducible_virtual_columns(&positional, None, None).as_deref(),
+            Some("__ducklake_row_pos")
+        );
+
+        // Read only by the pushed-down predicate: refused too. The opener rewrites
+        // the predicate against the file schemas as well, and the row filter's own
+        // check passes it because that resolves against the table schema.
+        let pos_predicate: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            col("__ducklake_row_pos", full).unwrap(),
+            Operator::Gt,
+            lit(0i64),
+        ));
+        assert_eq!(
+            unproducible_virtual_columns(&positional, Some(&only_id), Some(&pos_predicate))
+                .as_deref(),
             Some("__ducklake_row_pos")
         );
     }
