@@ -7,7 +7,7 @@ use bytes::Bytes;
 use futures::StreamExt;
 
 use super::{
-    budget::BudgetAccounting,
+    budget::{BudgetAccounting, InFlightReservation},
     builders::{EvaluatePredicate, Get, Insert},
     cached_batch::{CacheEntry, CachedBatchType},
     io_context::{EntryMetadata, entry_id_to_key},
@@ -111,6 +111,8 @@ impl LiquidCache {
             memory_liquid_bytes,
             memory_squeezed_liquid_bytes,
             memory_usage_bytes,
+            in_flight_memory_bytes: self.budget.in_flight_memory_bytes(),
+            peak_in_flight_memory_bytes: self.budget.peak_in_flight_memory_bytes(),
             disk_usage_bytes,
             max_memory_bytes: self.config.max_memory_bytes(),
             max_disk_bytes: self.config.max_disk_bytes(),
@@ -156,14 +158,15 @@ impl LiquidCache {
         match batch.as_ref() {
             CacheEntry::MemoryLiquid(array) => Some(array.clone()),
             entry @ CacheEntry::DiskLiquid { .. } => {
-                let liquid = self.read_disk_liquid_array(entry_id).await;
+                let (liquid, reservation) = self.read_disk_liquid_array(entry_id).await;
+                reservation.release();
                 self.maybe_hydrate(entry_id, entry, MaterializedEntry::Liquid(&liquid), None)
                     .await;
                 Some(liquid)
             }
             CacheEntry::MemorySqueezedLiquid(array) => match array.disk_backing() {
                 SqueezedBacking::Liquid(_) => {
-                    let liquid = self.read_disk_liquid_array(entry_id).await;
+                    let (liquid, _reservation) = self.read_disk_liquid_array(entry_id).await;
                     Some(liquid)
                 }
                 SqueezedBacking::Arrow(_) => None,
@@ -350,6 +353,13 @@ impl LiquidCache {
                 kind: CachedBatchType::from(&not_inserted),
             });
 
+            // The entry is materialized but not indexed for as long as we are
+            // making room for it, and that room-making is itself what holds the
+            // most memory. Count it while it waits.
+            let pending = self
+                .budget
+                .reserve_in_flight(not_inserted.memory_usage_bytes());
+
             let victims = self.cache_policy.find_memory_victim(8);
             if victims.is_empty() {
                 // no advice, because the cache is already empty
@@ -358,10 +368,12 @@ impl LiquidCache {
                 let on_disk_batch = self
                     .write_in_memory_batch_to_disk(entry_id, not_inserted)
                     .await?;
+                pending.release();
                 batch_to_cache = on_disk_batch;
                 continue;
             }
             self.squeeze_victims(victims).await?;
+            pending.release();
 
             batch_to_cache = not_inserted;
             crate::utils::yield_now_if_shuttle();
@@ -495,18 +507,70 @@ impl LiquidCache {
             victims: victims.clone(),
         });
         if self.squeeze_victims_concurrently {
-            let results = futures::stream::iter(victims)
-                .map(|victim| self.squeeze_victim_inner(victim))
-                .buffer_unordered(usize::MAX)
-                .collect::<Vec<_>>()
-                .await;
-            results.into_iter().collect::<Result<Vec<_>, _>>()?;
+            for group in self.group_victims_by_in_flight_bytes(victims) {
+                let concurrency = group.len();
+                let results = futures::stream::iter(group)
+                    .map(|victim| self.squeeze_victim_inner(victim))
+                    .buffer_unordered(concurrency)
+                    .collect::<Vec<_>>()
+                    .await;
+                results.into_iter().collect::<Result<Vec<_>, _>>()?;
+            }
         } else {
             for victim in victims {
                 self.squeeze_victim_inner(victim).await?;
             }
         }
         Ok(())
+    }
+
+    /// Split victims into groups whose squeezes may be in flight together.
+    ///
+    /// Running a whole batch of victims concurrently puts every one of their
+    /// outputs in memory at once, which is unbounded in bytes however few
+    /// victims there are: eight 60 MB batches is half a gigabyte of transcode
+    /// output outside the index. A squeeze's output cannot exceed its input, so
+    /// each victim's indexed size bounds what it will add, and grouping by that
+    /// bound caps the pile-up at [`Self::squeeze_in_flight_limit`].
+    ///
+    /// A group always contains at least one victim, so a victim larger than the
+    /// whole limit proceeds alone rather than stalling the cache.
+    fn group_victims_by_in_flight_bytes(&self, victims: Vec<EntryID>) -> Vec<Vec<EntryID>> {
+        // Other tasks may already be squeezing, so spend only what is left of
+        // the limit rather than the whole limit again.
+        let limit = self
+            .squeeze_in_flight_limit()
+            .saturating_sub(self.budget.in_flight_memory_bytes());
+
+        let mut groups: Vec<Vec<EntryID>> = Vec::new();
+        let mut group_bytes = 0usize;
+        for victim in victims {
+            let victim_bytes = self
+                .index
+                .get(&victim)
+                .map_or(0, |entry| entry.memory_usage_bytes());
+            match groups.last_mut() {
+                Some(group) if group_bytes + victim_bytes <= limit => {
+                    group_bytes += victim_bytes;
+                    group.push(victim);
+                }
+                _ => {
+                    group_bytes = victim_bytes;
+                    groups.push(vec![victim]);
+                }
+            }
+        }
+        groups
+    }
+
+    /// Ceiling on the squeeze output the cache lets accumulate outside the
+    /// index at one time, as a fraction of the memory tier.
+    ///
+    /// The fraction, rather than a constant, is what keeps this meaningful
+    /// across tier sizes: the transients of making room have to be small
+    /// against the room being made.
+    fn squeeze_in_flight_limit(&self) -> usize {
+        self.config.max_memory_bytes() / 32
     }
 
     async fn squeeze_victim_inner(&self, to_squeeze: EntryID) -> Result<(), CacheFull> {
@@ -524,6 +588,14 @@ impl LiquidCache {
         ));
 
         loop {
+            // A squeeze cannot produce more bytes than it consumes, so the
+            // entry's indexed size is an upper bound on the compressed output
+            // and the disk buffer the squeeze is about to hold outside the
+            // index. Reserve the bound first, then true it up to the result.
+            let mut reservation = self
+                .budget
+                .reserve_in_flight(to_squeeze_batch.memory_usage_bytes());
+
             let outcome = self.squeeze_policy.squeeze(
                 to_squeeze_batch.as_ref(),
                 compressor.as_ref(),
@@ -536,10 +608,16 @@ impl LiquidCache {
                     entry: new_batch,
                     bytes_to_write,
                 } => {
+                    reservation.resize(
+                        new_batch.memory_usage_bytes()
+                            + bytes_to_write.as_ref().map_or(0, Bytes::len),
+                    );
                     if let Some(bytes_to_write) = bytes_to_write {
                         self.write_batch_to_disk(to_squeeze, &new_batch, bytes_to_write)
                             .await?;
                     }
+                    // About to be indexed, so stop counting it as a transient.
+                    reservation.release();
                     match self.try_insert(to_squeeze, new_batch) {
                         Ok(()) => {
                             break;
@@ -550,6 +628,7 @@ impl LiquidCache {
                     }
                 }
                 SqueezeOutcome::Remove => {
+                    reservation.release();
                     self.remove_disk_entry(to_squeeze).await;
                     break;
                 }
@@ -647,7 +726,8 @@ impl LiquidCache {
                 {
                     return Some(arrow::array::new_empty_array(data_type));
                 }
-                let full_array = self.read_disk_arrow_array(entry_id).await;
+                let (full_array, reservation) = self.read_disk_arrow_array(entry_id).await;
+                reservation.release();
                 self.maybe_hydrate(
                     entry_id,
                     entry,
@@ -669,7 +749,8 @@ impl LiquidCache {
                 {
                     return Some(arrow::array::new_empty_array(data_type));
                 }
-                let liquid = self.read_disk_liquid_array(entry_id).await;
+                let (liquid, reservation) = self.read_disk_liquid_array(entry_id).await;
+                reservation.release();
                 self.maybe_hydrate(
                     entry_id,
                     entry,
@@ -762,7 +843,8 @@ impl LiquidCache {
         let full_array = if !all_paths_present {
             let batch = CacheEntry::MemorySqueezedLiquid(array.clone());
             self.observer.on_get_squeezed_needs_io();
-            let full_array = self.read_disk_arrow_array(entry_id).await;
+            let (full_array, reservation) = self.read_disk_arrow_array(entry_id).await;
+            reservation.release();
             self.maybe_hydrate(
                 entry_id,
                 &batch,
@@ -818,29 +900,47 @@ impl LiquidCache {
         Ok(())
     }
 
-    async fn read_disk_arrow_array(&self, entry_id: &EntryID) -> ArrayRef {
+    /// Read an on-disk Arrow entry, reserving what the decode holds outside the
+    /// index.
+    ///
+    /// The reservation comes back with the array because the caller is the one
+    /// that knows when these bytes stop being a transient: it releases just
+    /// before hydrating them, which counts the same bytes as indexed instead.
+    async fn read_disk_arrow_array(
+        &self,
+        entry_id: &EntryID,
+    ) -> (ArrayRef, InFlightReservation<'_>) {
         let bytes = self
             .store
             .get(&entry_id_to_key(entry_id))
             .await
             .expect("read failed");
         let bytes_len = bytes.len();
+        // The encoded buffer is already resident; the decode adds the array on
+        // top of it, and the IPC reader holds both until this call returns.
+        let mut reservation = self.budget.reserve_in_flight(bytes_len);
         let cursor = std::io::Cursor::new(bytes);
         let mut reader =
             arrow::ipc::reader::StreamReader::try_new(cursor, None).expect("create reader failed");
         let batch = reader.next().unwrap().expect("read batch failed");
         let array = batch.column(0).clone();
+        // Arrow IPC copies rather than slicing, so the encoded buffer and the
+        // decoded array are both resident here.
+        reservation.resize(bytes_len + array.get_array_memory_size());
         self.trace(InternalEvent::IoReadArrow {
             entry: *entry_id,
             bytes: bytes_len,
         });
-        array
+        (array, reservation)
     }
 
+    /// Read an on-disk Liquid entry, reserving what the decode holds outside
+    /// the index. See [`Self::read_disk_arrow_array`] for the reservation's
+    /// contract.
     async fn read_disk_liquid_array(
         &self,
         entry_id: &EntryID,
-    ) -> crate::liquid_array::LiquidArrayRef {
+    ) -> (crate::liquid_array::LiquidArrayRef, InFlightReservation<'_>) {
         let bytes = self
             .store
             .get(&entry_id_to_key(entry_id))
@@ -850,13 +950,19 @@ impl LiquidCache {
             entry: *entry_id,
             bytes: bytes.len(),
         });
+        let mut reservation = self.budget.reserve_in_flight(bytes.len());
         let compressor_states = self.metadata.get_compressor(entry_id);
         let compressor = compressor_states.fsst_compressor();
 
-        (crate::liquid_array::ipc::read_from_bytes(
+        let array = crate::liquid_array::ipc::read_from_bytes(
             Bytes::from(bytes),
             &crate::liquid_array::ipc::LiquidIPCContext::new(compressor),
-        )) as _
+        );
+        // A liquid array decodes zero-copy over the encoded buffer, so its
+        // reported size already covers what was reserved above rather than
+        // adding to it.
+        reservation.resize(array.get_array_memory_size());
+        (array as _, reservation)
     }
 
     pub(crate) async fn eval_predicate_internal(
@@ -890,7 +996,8 @@ impl LiquidCache {
                 Some(self.eval_predicate_on_array(filtered, predicate))
             }
             entry @ CacheEntry::DiskArrow { .. } => {
-                let array = self.read_disk_arrow_array(entry_id).await;
+                let (array, reservation) = self.read_disk_arrow_array(entry_id).await;
+                reservation.release();
                 self.maybe_hydrate(entry_id, entry, MaterializedEntry::Arrow(&array), None)
                     .await;
                 let mut owned = None;
@@ -912,7 +1019,8 @@ impl LiquidCache {
                 Some(array.try_eval_predicate(predicate, selection))
             }
             entry @ CacheEntry::DiskLiquid { .. } => {
-                let liquid = self.read_disk_liquid_array(entry_id).await;
+                let (liquid, reservation) = self.read_disk_liquid_array(entry_id).await;
+                reservation.release();
                 self.maybe_hydrate(entry_id, entry, MaterializedEntry::Liquid(&liquid), None)
                     .await;
                 let mut owned = None;

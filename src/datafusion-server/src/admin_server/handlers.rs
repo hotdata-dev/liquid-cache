@@ -123,6 +123,8 @@ pub(crate) struct CacheInfo {
     batch_size: usize,
     max_memory_bytes: u64,
     memory_usage_bytes: u64,
+    in_flight_memory_bytes: u64,
+    peak_in_flight_memory_bytes: u64,
     disk_usage_bytes: u64,
 }
 
@@ -132,11 +134,15 @@ pub(crate) async fn get_cache_info_handler(State(state): State<Arc<AppState>>) -
     let batch_size = cache.batch_size();
     let max_memory_bytes = cache.max_memory_bytes() as u64;
     let memory_usage_bytes = cache.memory_usage_bytes() as u64;
+    let in_flight_memory_bytes = cache.in_flight_memory_bytes() as u64;
+    let peak_in_flight_memory_bytes = cache.peak_in_flight_memory_bytes() as u64;
     let disk_usage_bytes = cache.disk_usage_bytes() as u64;
     Json(CacheInfo {
         batch_size,
         max_memory_bytes,
         memory_usage_bytes,
+        in_flight_memory_bytes,
+        peak_in_flight_memory_bytes,
         disk_usage_bytes,
     })
 }
