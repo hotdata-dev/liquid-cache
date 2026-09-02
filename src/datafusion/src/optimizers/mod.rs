@@ -19,8 +19,9 @@ use datafusion::{
         listing::PartitionedFile,
         physical_plan::{FileScanConfig, FileSource, ParquetSource},
         source::DataSource,
+        table_schema::TableSchema,
     },
-    physical_expr::utils::collect_columns,
+    physical_expr::{PhysicalExpr, projection::ProjectionExprs, utils::collect_columns},
     physical_optimizer::{PhysicalOptimizerRule, pruning::PruningPredicateBuilder},
     physical_plan::ExecutionPlan,
 };
@@ -551,6 +552,73 @@ fn file_required_bytes(
     (sum, false)
 }
 
+/// The virtual columns this scan reads that the liquid path cannot produce.
+///
+/// The liquid read path has no notion of DataFusion's virtual columns. It carries
+/// the [`TableSchema`] across faithfully but never produces one, so a scan that
+/// reads a virtual column gets back a batch which simply lacks it, and a predicate
+/// over one cannot be rewritten against the file schemas either. Such a scan has
+/// to stay on `ParquetSource`, which derives virtual columns from the parquet
+/// reader.
+///
+/// Declining a scan costs it the cache, so this stays as narrow as the row
+/// filter's own refusal: a virtual column the scan actually reads, not the mere
+/// presence of one on the table. A provider that declares a row-position column on
+/// every table keeps the cache for the queries that never project it. No
+/// projection at all is the one broad case, and it is not a guess — the scan then
+/// reads the whole table schema, virtual columns included.
+///
+/// Positional reads are what reaches here: applying positional deletes, and row
+/// lineage, both project a reader-produced physical row position, which is an
+/// absolute index into the file. A plausible but shifted position would associate
+/// a delete with the wrong row, so declining is the sound answer while the liquid
+/// reader cannot generate positions itself.
+fn unproducible_virtual_columns(
+    table_schema: &TableSchema,
+    projection: Option<&ProjectionExprs>,
+    filter: Option<&Arc<dyn PhysicalExpr>>,
+) -> Option<String> {
+    let virtual_columns = table_schema.virtual_columns();
+    if virtual_columns.is_empty() {
+        return None;
+    }
+
+    let mut needed: Vec<&str> = Vec::new();
+    match projection {
+        None => needed.extend(virtual_columns.iter().map(|field| field.name().as_str())),
+        Some(projection) => {
+            let mut read: HashSet<String> = projection
+                .expr_iter()
+                .flat_map(|expr| collect_columns(&expr))
+                .map(|column| column.name().to_string())
+                .collect();
+            // The pushed-down predicate is rewritten against the file schemas in
+            // the opener too, so a conjunct over a virtual column fails exactly as
+            // a projection over one does. The row filter's own check cannot catch
+            // it: that resolves against the table schema, which does hold the
+            // virtual columns.
+            if let Some(filter) = filter {
+                read.extend(
+                    collect_columns(filter)
+                        .into_iter()
+                        .map(|column| column.name().to_string()),
+                );
+            }
+            needed.extend(
+                virtual_columns
+                    .iter()
+                    .map(|field| field.name().as_str())
+                    .filter(|name| read.contains(*name)),
+            );
+        }
+    }
+
+    if needed.is_empty() {
+        return None;
+    }
+    Some(needed.join("`, `"))
+}
+
 /// If `node` is a `DataSourceExec` over a `ParquetSource`, return an equivalent
 /// node backed by [`LiquidParquetSource`] carrying `hints`.
 ///
@@ -617,6 +685,18 @@ fn convert_parquet_scan(
         }
     }
 
+    let pushed_filter = parquet_source.filter();
+    if let Some(names) = unproducible_virtual_columns(
+        parquet_source.table_schema(),
+        parquet_source.projection(),
+        pushed_filter.as_ref(),
+    ) {
+        log::info!(
+            "liquid_cache scan BYPASS: the read path cannot produce virtual column(s) `{names}`"
+        );
+        return None;
+    }
+
     let new_source =
         LiquidParquetSource::from_parquet_source(parquet_source.clone(), cache.clone())
             .with_squeeze_hints(Arc::new(hints));
@@ -638,6 +718,120 @@ mod tests {
     use crate::LiquidCacheParquet;
 
     use super::*;
+
+    /// Declining a scan costs it the cache, so the guard must key on what the scan
+    /// reads, not on what the table declares. A row-position column present on the
+    /// table but absent from the projection keeps the cache; no projection at all
+    /// reads the whole table schema and does not.
+    #[test]
+    fn only_a_virtual_column_the_scan_reads_costs_the_cache() {
+        use arrow_schema::{DataType, Field, Fields};
+        use datafusion::logical_expr::Operator;
+        use datafusion::physical_expr::expressions::{BinaryExpr, col, lit};
+        use datafusion::physical_expr::projection::ProjectionExpr;
+
+        let file_schema = Arc::new(arrow_schema::Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("val", DataType::Int64, true),
+        ]));
+        let row_pos = Field::new("__ducklake_row_pos", DataType::Int64, true);
+
+        // No virtual columns at all: nothing to refuse, whatever the projection.
+        let plain = TableSchema::builder(Arc::clone(&file_schema)).build();
+        assert_eq!(unproducible_virtual_columns(&plain, None, None), None);
+
+        let positional = TableSchema::builder(Arc::clone(&file_schema))
+            .with_virtual_columns(Fields::from(vec![row_pos.clone()]))
+            .build();
+        let full = positional.table_schema();
+
+        // Declared but not read: still cached.
+        let only_id =
+            ProjectionExprs::new(vec![ProjectionExpr::new(col("id", full).unwrap(), "id")]);
+        assert_eq!(
+            unproducible_virtual_columns(&positional, Some(&only_id), None),
+            None
+        );
+
+        // Read: refused, and named.
+        let reads_pos = ProjectionExprs::new(vec![ProjectionExpr::new(
+            col("__ducklake_row_pos", full).unwrap(),
+            "__ducklake_row_pos",
+        )]);
+        assert_eq!(
+            unproducible_virtual_columns(&positional, Some(&reads_pos), None).as_deref(),
+            Some("__ducklake_row_pos")
+        );
+
+        // No projection reads the whole table schema, virtual columns included.
+        assert_eq!(
+            unproducible_virtual_columns(&positional, None, None).as_deref(),
+            Some("__ducklake_row_pos")
+        );
+
+        // Read only by the pushed-down predicate: refused too. The opener rewrites
+        // the predicate against the file schemas as well, and the row filter's own
+        // check passes it because that resolves against the table schema.
+        let pos_predicate: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            col("__ducklake_row_pos", full).unwrap(),
+            Operator::Gt,
+            lit(0i64),
+        ));
+        assert_eq!(
+            unproducible_virtual_columns(&positional, Some(&only_id), Some(&pos_predicate))
+                .as_deref(),
+            Some("__ducklake_row_pos")
+        );
+    }
+
+    /// The guard has to hold at the call site, not only in the helper, so that
+    /// removing the bypass from `convert_parquet_scan` fails a test rather than
+    /// silently restoring the broken plan.
+    #[tokio::test]
+    async fn a_scan_reading_a_virtual_column_stays_on_parquet_source() {
+        use arrow_schema::{DataType, Field, Fields};
+        use datafusion::datasource::physical_plan::FileScanConfigBuilder;
+        use datafusion::execution::object_store::ObjectStoreUrl;
+
+        let file_schema = Arc::new(arrow_schema::Schema::new(vec![Field::new(
+            "id",
+            DataType::Int64,
+            false,
+        )]));
+
+        let scan = |table_schema: TableSchema| -> Arc<dyn ExecutionPlan> {
+            let source = Arc::new(ParquetSource::new(table_schema)) as Arc<dyn FileSource>;
+            let config = FileScanConfigBuilder::new(ObjectStoreUrl::local_filesystem(), source)
+                .with_file(PartitionedFile::new("t.parquet", 16))
+                .build();
+            Arc::new(DataSourceExec::new(Arc::new(config)))
+        };
+
+        let cache = build_cache().await;
+
+        // Positive control: an ordinary scan is still handed to the cache.
+        let plain = scan(TableSchema::builder(Arc::clone(&file_schema)).build());
+        assert!(
+            convert_parquet_scan(&plain, &cache, ColumnSqueezeHints::default()).is_some(),
+            "an ordinary scan must still convert to the liquid source"
+        );
+
+        // `ParquetSource::new` projects the whole table schema, so the positional
+        // scan reads the row-position column and cannot be served.
+        let positional = scan(
+            TableSchema::builder(file_schema)
+                .with_virtual_columns(Fields::from(vec![Field::new(
+                    "__ducklake_row_pos",
+                    DataType::Int64,
+                    true,
+                )]))
+                .build(),
+        );
+        assert!(
+            convert_parquet_scan(&positional, &cache, ColumnSqueezeHints::default()).is_none(),
+            "a scan reading a virtual column must stay on ParquetSource"
+        );
+    }
 
     async fn rewrite_plan_inner(plan: Arc<dyn ExecutionPlan>) {
         let expected_schema = plan.schema();
