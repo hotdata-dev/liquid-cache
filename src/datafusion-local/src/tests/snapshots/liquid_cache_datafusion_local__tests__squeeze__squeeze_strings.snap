@@ -26,7 +26,6 @@ event=squeeze_begin victims=[851969,851968,917504]
 event=squeeze_victim entry=851969
 event=insert_success entry=851969 kind=MemoryLiquid
 event=squeeze_victim entry=851968
-event=io_write entry=851968 kind=DiskLiquid bytes=139416
 event=insert_success entry=851968 kind=DiskLiquid
 event=squeeze_victim entry=917504
 event=io_write entry=917504 kind=MemorySqueezedLiquid bytes=136440

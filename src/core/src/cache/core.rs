@@ -24,9 +24,59 @@ use crate::liquid_array::{
     LiquidSqueezedArrayRef, SqueezeIoHandler, SqueezedBacking, SqueezedDate32Array,
     VariantStructSqueezedArray,
 };
-use crate::sync::Arc;
+use crate::sync::{Arc, Mutex};
+use std::collections::HashMap;
 
 // CacheStats and RuntimeStats moved to stats.rs
+
+/// What the disk tier holds for an entry that is currently (also) in memory.
+///
+/// Hydrating a disk entry replaces its index entry with a memory one, but the
+/// bytes stay in the store under the same key and stay counted against the
+/// disk budget. Without this record, evicting the hydrated entry serialised
+/// and wrote the same bytes again — one redundant write per read of an
+/// oversized working set, and a second disk reservation for one object, so
+/// the disk tally drifted up until the tier evicted real entries early
+/// (liquid-cache#43).
+#[derive(Debug, Clone, Copy)]
+struct DiskCopy {
+    kind: DiskKind,
+    bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiskKind {
+    Liquid,
+    Arrow,
+}
+
+impl DiskCopy {
+    /// The store object an entry refers to: a disk stub's bytes, or the
+    /// full serialisation a squeezed entry reads back through.
+    fn referenced_by(entry: &CacheEntry) -> Option<Self> {
+        match entry {
+            CacheEntry::DiskLiquid { disk_bytes, .. } => Some(Self {
+                kind: DiskKind::Liquid,
+                bytes: *disk_bytes,
+            }),
+            CacheEntry::DiskArrow { disk_bytes, .. } => Some(Self {
+                kind: DiskKind::Arrow,
+                bytes: *disk_bytes,
+            }),
+            CacheEntry::MemorySqueezedLiquid(squeezed) => Some(match squeezed.disk_backing() {
+                SqueezedBacking::Liquid(bytes) => Self {
+                    kind: DiskKind::Liquid,
+                    bytes,
+                },
+                SqueezedBacking::Arrow(bytes) => Self {
+                    kind: DiskKind::Arrow,
+                    bytes,
+                },
+            }),
+            CacheEntry::MemoryArrow(_) | CacheEntry::MemoryLiquid(_) => None,
+        }
+    }
+}
 
 /// Cache storage for liquid cache.
 ///
@@ -60,6 +110,7 @@ pub struct LiquidCache {
     metadata: Arc<dyn EntryMetadata>,
     store: t4::Store,
     squeeze_victims_concurrently: bool,
+    disk_copies: Mutex<HashMap<EntryID, DiskCopy>>,
 }
 
 /// Builder returned by [`LiquidCache::insert`] for configuring cache writes.
@@ -183,6 +234,7 @@ impl LiquidCache {
     pub fn reset(&self) {
         self.index.reset();
         self.budget.reset_usage();
+        self.disk_copies.lock().unwrap().clear();
     }
 
     /// Check if a batch is cached.
@@ -239,10 +291,23 @@ impl LiquidCache {
                             )
                             .expect("failed to insert disk arrow entry");
                         }
-                        Err(CacheFull) => self.drop_memory_entry(entry_id, &batch),
+                        Err(CacheFull) => self.drop_memory_entry(entry_id, &batch).await,
                     }
                 }
                 CacheEntry::MemoryLiquid(liquid_array) => {
+                    let data_type = liquid_array.original_arrow_data_type();
+                    if let Some(DiskCopy {
+                        kind: DiskKind::Liquid,
+                        bytes,
+                    }) = self.disk_copy(&entry_id)
+                    {
+                        // Hydrated from disk and never modified since: the
+                        // bytes are already there, flip the index rather
+                        // than re-serialising and rewriting them.
+                        self.try_insert(entry_id, CacheEntry::disk_liquid(data_type, bytes))
+                            .expect("failed to insert disk liquid entry");
+                        continue;
+                    }
                     let liquid_bytes = liquid_array.to_bytes();
                     let disk_bytes = liquid_bytes.len();
                     match self
@@ -252,14 +317,11 @@ impl LiquidCache {
                         Ok(()) => {
                             self.try_insert(
                                 entry_id,
-                                CacheEntry::disk_liquid(
-                                    liquid_array.original_arrow_data_type(),
-                                    disk_bytes,
-                                ),
+                                CacheEntry::disk_liquid(data_type, disk_bytes),
                             )
                             .expect("failed to insert disk liquid entry");
                         }
-                        Err(CacheFull) => self.drop_memory_entry(entry_id, &batch),
+                        Err(CacheFull) => self.drop_memory_entry(entry_id, &batch).await,
                     }
                 }
                 CacheEntry::MemorySqueezedLiquid(array) => {
@@ -311,14 +373,19 @@ impl LiquidCache {
                 Ok(new_batch)
             }
             CacheEntry::MemoryLiquid(liquid_array) => {
+                let data_type = liquid_array.original_arrow_data_type();
+                if let Some(DiskCopy {
+                    kind: DiskKind::Liquid,
+                    bytes,
+                }) = self.disk_copy(&entry_id)
+                {
+                    return Ok(CacheEntry::disk_liquid(data_type, bytes));
+                }
                 let liquid_bytes = Bytes::from(liquid_array.to_bytes());
                 let disk_bytes = liquid_bytes.len();
                 self.write_batch_to_disk(entry_id, &batch, liquid_bytes)
                     .await?;
-                Ok(CacheEntry::disk_liquid(
-                    liquid_array.original_arrow_data_type(),
-                    disk_bytes,
-                ))
+                Ok(CacheEntry::disk_liquid(data_type, disk_bytes))
             }
             CacheEntry::MemorySqueezedLiquid(squeezed_array) => {
                 // The full data is already on disk, so we just need to mark ourself as disk entry
@@ -398,6 +465,106 @@ impl LiquidCache {
             metadata,
             store,
             squeeze_victims_concurrently,
+            disk_copies: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn disk_copy(&self, entry_id: &EntryID) -> Option<DiskCopy> {
+        self.disk_copies.lock().unwrap().get(entry_id).copied()
+    }
+
+    /// A caller-supplied value supersedes whatever the store holds for the
+    /// entry. Hydration keeps the record, because the bytes on disk are still
+    /// the value in memory; an overwrite must not, or a later demotion would
+    /// flip the index to a stub over the previous value. Only [`Insert`] calls
+    /// this: `insert_inner` is shared with `maybe_hydrate`.
+    ///
+    /// A concurrent overwrite and squeeze of one entry is not serialised here
+    /// or anywhere else in the cache (a squeeze that read the old value can
+    /// still land its result after the new one), so this covers the
+    /// sequential case only.
+    pub(crate) async fn supersede_disk_copy(&self, entry_id: EntryID) {
+        if self.disk_copy(&entry_id).is_none() {
+            return;
+        }
+        match self.index.get(&entry_id).as_deref() {
+            Some(CacheEntry::DiskLiquid { .. } | CacheEntry::DiskArrow { .. }) => {
+                // Still a stub: the whole entry is the superseded object.
+                self.remove_disk_entry(entry_id).await;
+            }
+            Some(squeezed @ CacheEntry::MemorySqueezedLiquid(_)) => {
+                // A squeezed entry reads back through the object too, so it
+                // cannot stay in the index over a deleted one, not even for
+                // the span of an insert that then fails with `CacheFull`.
+                self.drop_memory_entry(entry_id, squeezed).await;
+            }
+            Some(CacheEntry::MemoryArrow(_) | CacheEntry::MemoryLiquid(_)) | None => {
+                self.discard_disk_copy(entry_id).await;
+            }
+        }
+    }
+
+    /// Delete the store object recorded for `entry_id`, if any, and release
+    /// its reservation. The index entry, if one remains, must not be a form
+    /// that reads through the object.
+    async fn discard_disk_copy(&self, entry_id: EntryID) {
+        let Some(copy) = self.disk_copies.lock().unwrap().remove(&entry_id) else {
+            return;
+        };
+        self.store
+            .remove(&entry_id_to_key(&entry_id))
+            .await
+            .expect("disk remove failed");
+        self.budget.release_disk(copy.bytes);
+    }
+
+    /// If `outcome` demotes an entry to a form backed by a store object whose
+    /// bytes are already there, drop the write and point the entry at the
+    /// existing copy.
+    fn reuse_disk_copy(&self, entry_id: &EntryID, outcome: SqueezeOutcome) -> SqueezeOutcome {
+        let (entry, bytes) = match outcome {
+            SqueezeOutcome::Replace {
+                entry,
+                bytes_to_write: Some(bytes),
+            } => (entry, bytes),
+            other => return other,
+        };
+        let keep_write = move |entry| SqueezeOutcome::Replace {
+            entry,
+            bytes_to_write: Some(bytes),
+        };
+        let (Some(copy), Some(wanted)) =
+            (self.disk_copy(entry_id), DiskCopy::referenced_by(&entry))
+        else {
+            return keep_write(entry);
+        };
+        if copy.kind != wanted.kind {
+            return keep_write(entry);
+        }
+        let entry = match entry {
+            // A squeezed entry reads back through the full serialisation the
+            // policy handed over to be written. A copy of the same kind and
+            // length is that serialisation (the array was hydrated from it),
+            // so the entry can keep its backing as chosen.
+            CacheEntry::MemorySqueezedLiquid(_) => {
+                if wanted.bytes != copy.bytes {
+                    return keep_write(entry);
+                }
+                entry
+            }
+            CacheEntry::DiskLiquid { data_type, .. } => {
+                CacheEntry::disk_liquid(data_type, copy.bytes)
+            }
+            CacheEntry::DiskArrow { data_type, .. } => {
+                CacheEntry::disk_arrow(data_type, copy.bytes)
+            }
+            CacheEntry::MemoryArrow(_) | CacheEntry::MemoryLiquid(_) => {
+                unreachable!("referenced_by only matches entries backed by a store object")
+            }
+        };
+        SqueezeOutcome::Replace {
+            entry,
+            bytes_to_write: None,
         }
     }
 
@@ -434,7 +601,10 @@ impl LiquidCache {
         Ok(())
     }
 
-    fn drop_memory_entry(&self, entry_id: EntryID, _expected: &CacheEntry) {
+    /// Drop a memory entry from the cache altogether, including the disk copy
+    /// it may hold: with the index entry gone nothing could reach that object
+    /// again, and its reservation would shrink the disk tier for good.
+    async fn drop_memory_entry(&self, entry_id: EntryID, _expected: &CacheEntry) {
         let Some(removed) = self.index.remove(&entry_id) else {
             return;
         };
@@ -450,6 +620,7 @@ impl LiquidCache {
         self.budget
             .try_update_memory_usage(removed.memory_usage_bytes(), 0)
             .expect("memory release cannot fail");
+        self.discard_disk_copy(entry_id).await;
         self.cache_policy.notify_remove(&entry_id);
     }
 
@@ -466,6 +637,7 @@ impl LiquidCache {
             .remove(&entry_id_to_key(&entry_id))
             .await
             .expect("disk remove failed");
+        self.disk_copies.lock().unwrap().remove(&entry_id);
         self.budget.release_disk(disk_bytes);
         self.cache_policy.notify_remove(&entry_id);
         self.trace(InternalEvent::DiskEvict {
@@ -524,12 +696,18 @@ impl LiquidCache {
         ));
 
         loop {
+            // The policy always decides the next form, so an entry hydrated
+            // from the disk tier can still reach the squeezed tier (floats
+            // squeeze even without a hint). `reuse_disk_copy` then drops the
+            // write when the form's backing is the copy already on disk; the
+            // serialisation the policy produced for it is the only cost.
             let outcome = self.squeeze_policy.squeeze(
                 to_squeeze_batch.as_ref(),
                 compressor.as_ref(),
                 squeeze_hint,
                 &squeeze_io,
             );
+            let outcome = self.reuse_disk_copy(&to_squeeze, outcome);
 
             match outcome {
                 SqueezeOutcome::Replace {
@@ -815,6 +993,26 @@ impl LiquidCache {
             .put(entry_id_to_key(&entry_id), bytes.to_vec())
             .await
             .expect("write failed");
+        // `bytes` is whatever `batch` serialises to: Arrow IPC for an arrow
+        // entry (the flush path writes those directly), liquid otherwise.
+        let kind = match batch {
+            CacheEntry::DiskArrow { .. } | CacheEntry::MemoryArrow(_) => DiskKind::Arrow,
+            CacheEntry::MemorySqueezedLiquid(squeezed) => match squeezed.disk_backing() {
+                SqueezedBacking::Arrow(_) => DiskKind::Arrow,
+                SqueezedBacking::Liquid(_) => DiskKind::Liquid,
+            },
+            CacheEntry::DiskLiquid { .. } | CacheEntry::MemoryLiquid(_) => DiskKind::Liquid,
+        };
+        let previous = self
+            .disk_copies
+            .lock()
+            .unwrap()
+            .insert(entry_id, DiskCopy { kind, bytes: len });
+        if let Some(previous) = previous {
+            // The put replaced the object under this key, so the previous
+            // copy's reservation goes with it.
+            self.budget.release_disk(previous.bytes);
+        }
         Ok(())
     }
 
@@ -966,7 +1164,7 @@ impl LiquidCache {
 mod tests {
     use super::*;
     use crate::cache::{
-        CacheEntry, CacheExpression, CachePolicy, LiquidCacheBuilder, LiquidPolicy,
+        AlwaysHydrate, CacheEntry, CacheExpression, CachePolicy, LiquidCacheBuilder, LiquidPolicy,
         TranscodeSqueezeEvict, transcode_liquid_inner,
         utils::{
             LiquidCompressorStates, arrow_to_bytes, create_cache_store, create_test_array,
@@ -1362,5 +1560,288 @@ mod tests {
 
         assert_eq!(result, Ok(()));
         assert!(!cache.is_cached(&entry_id));
+    }
+
+    async fn hydrating_cache() -> Arc<LiquidCache> {
+        LiquidCacheBuilder::new()
+            .with_max_memory_bytes(1 << 20)
+            .with_max_disk_bytes(1 << 20)
+            .with_squeeze_policy(Box::new(TranscodeSqueezeEvict))
+            .with_cache_policy(Box::new(LiquidPolicy::new()))
+            .with_hydration_policy(Box::new(AlwaysHydrate::new()))
+            .build()
+            .await
+    }
+
+    /// Two squeezes take a fresh arrow entry through liquid to a disk stub.
+    async fn demote_to_disk(cache: &LiquidCache, id: EntryID) -> usize {
+        cache.squeeze_victims(vec![id]).await.unwrap();
+        cache.squeeze_victims(vec![id]).await.unwrap();
+        let entry = cache.index().get(&id).expect("entry present");
+        let CacheEntry::DiskLiquid { disk_bytes, .. } = entry.as_ref() else {
+            panic!("expected a disk stub, got {entry:?}");
+        };
+        *disk_bytes
+    }
+
+    /// Overwriting an entry that sits on disk must drop the disk copy of the
+    /// value it replaces: demoting the new value must not flip the index to a
+    /// stub over the old bytes, and the old reservation must be released.
+    #[tokio::test]
+    async fn overwrite_of_disk_stub_invalidates_disk_copy() {
+        let cache = hydrating_cache().await;
+        let id = EntryID::from(920usize);
+        let v1: ArrayRef = Arc::new(Int32Array::from_iter_values(0..16));
+        let v2: ArrayRef = Arc::new(Int32Array::from_iter_values(100..164));
+
+        cache.insert(id, v1).await.unwrap();
+        let v1_disk_bytes = demote_to_disk(&cache, id).await;
+        assert_eq!(cache.budget().disk_usage_bytes(), v1_disk_bytes);
+
+        cache.insert(id, v2.clone()).await.unwrap();
+        let disk_after_overwrite = cache.budget().disk_usage_bytes();
+
+        let v2_disk_bytes = demote_to_disk(&cache, id).await;
+        let read = cache.get(&id).await.expect("present");
+        assert_eq!(read.as_ref(), v2.as_ref(), "read back the superseded value");
+        assert_eq!(
+            disk_after_overwrite, 0,
+            "the superseded object's reservation must be released"
+        );
+        assert_eq!(cache.budget().disk_usage_bytes(), v2_disk_bytes);
+    }
+
+    /// The same, for an entry that was hydrated back into memory before the
+    /// overwrite, so the index holds a memory entry and only the disk-copy
+    /// record points at the old bytes.
+    #[tokio::test]
+    async fn overwrite_of_hydrated_entry_invalidates_disk_copy() {
+        let cache = hydrating_cache().await;
+        let id = EntryID::from(921usize);
+        let v1: ArrayRef = Arc::new(Int32Array::from_iter_values(0..16));
+        let v2: ArrayRef = Arc::new(Int32Array::from_iter_values(100..164));
+
+        cache.insert(id, v1.clone()).await.unwrap();
+        let v1_disk_bytes = demote_to_disk(&cache, id).await;
+        let read = cache.get(&id).await.expect("present");
+        assert_eq!(read.as_ref(), v1.as_ref());
+        assert!(matches!(
+            cache.index().get(&id).unwrap().as_ref(),
+            CacheEntry::MemoryLiquid(_)
+        ));
+        assert_eq!(cache.budget().disk_usage_bytes(), v1_disk_bytes);
+
+        cache.insert(id, v2.clone()).await.unwrap();
+        let disk_after_overwrite = cache.budget().disk_usage_bytes();
+
+        let v2_disk_bytes = demote_to_disk(&cache, id).await;
+        let read = cache.get(&id).await.expect("present");
+        assert_eq!(read.as_ref(), v2.as_ref(), "read back the superseded value");
+        assert_eq!(disk_after_overwrite, 0);
+        assert_eq!(cache.budget().disk_usage_bytes(), v2_disk_bytes);
+    }
+
+    /// A flush writes an arrow entry as Arrow IPC and must record the copy as
+    /// such: once hydrated and transcoded, the entry is demoted through the
+    /// policy to freshly written liquid bytes, not flipped to a liquid stub
+    /// over the arrow bytes. The replaced object's reservation is released.
+    #[tokio::test]
+    async fn flushed_arrow_copy_is_not_reused_as_liquid() {
+        let cache = hydrating_cache().await;
+        let id = EntryID::from(922usize);
+        let array: ArrayRef = Arc::new(Int32Array::from_iter_values(0..64));
+
+        cache.insert(id, array.clone()).await.unwrap();
+        cache.flush_all_to_disk().await.unwrap();
+        assert!(matches!(
+            cache.index().get(&id).unwrap().as_ref(),
+            CacheEntry::DiskArrow { .. }
+        ));
+        let read = cache.get(&id).await.expect("present");
+        assert_eq!(read.as_ref(), array.as_ref());
+        assert!(matches!(
+            cache.index().get(&id).unwrap().as_ref(),
+            CacheEntry::MemoryArrow(_)
+        ));
+
+        let disk_bytes = demote_to_disk(&cache, id).await;
+        assert_eq!(cache.budget().disk_usage_bytes(), disk_bytes);
+        let read = cache.get(&id).await.expect("present");
+        assert_eq!(read.as_ref(), array.as_ref());
+    }
+
+    /// A hinted entry rehydrated from its liquid disk copy must still reach
+    /// the squeezed tier on its next demotion, and must not rewrite the copy
+    /// its squeezed form reads back through.
+    #[tokio::test]
+    async fn rehydrated_hinted_entry_returns_to_squeezed_tier_without_rewrite() {
+        let cache = hydrating_cache().await;
+        let id = EntryID::from(923usize);
+        let dates: ArrayRef = Arc::new(Date32Array::from(vec![
+            Some(2),
+            Some(365 + 1),
+            None,
+            Some(365 + 100),
+        ]));
+        let expr = Arc::new(CacheExpression::extract_date32(Date32Field::Year));
+
+        cache
+            .insert(id, dates.clone())
+            .with_squeeze_hint(expr.clone())
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            cache.squeeze_victims(vec![id]).await.unwrap();
+        }
+        let entry = cache.index().get(&id).unwrap();
+        let CacheEntry::DiskLiquid { disk_bytes, .. } = entry.as_ref() else {
+            panic!("expected a disk stub, got {entry:?}");
+        };
+        let disk_bytes = *disk_bytes;
+        assert_eq!(cache.budget().disk_usage_bytes(), disk_bytes);
+        // Drain the IO counters so the count below covers only the re-eviction.
+        let _ = cache.observer().runtime_snapshot();
+
+        let read = cache.get(&id).await.expect("present");
+        assert_eq!(read.as_ref(), dates.as_ref());
+        assert!(matches!(
+            cache.index().get(&id).unwrap().as_ref(),
+            CacheEntry::MemoryLiquid(_)
+        ));
+
+        cache.squeeze_victims(vec![id]).await.unwrap();
+        assert!(
+            matches!(
+                cache.index().get(&id).unwrap().as_ref(),
+                CacheEntry::MemorySqueezedLiquid(_)
+            ),
+            "the squeeze policy must run for a hinted entry"
+        );
+        assert_eq!(
+            cache.observer().runtime_snapshot().write_io_count,
+            0,
+            "the squeezed form's backing is already on disk"
+        );
+        assert_eq!(cache.budget().disk_usage_bytes(), disk_bytes);
+
+        let years = cache
+            .get(&id)
+            .with_expression_hint(expr)
+            .read()
+            .await
+            .expect("present");
+        let years = years.as_any().downcast_ref::<Date32Array>().unwrap();
+        assert_eq!(years.value(0), 0);
+        assert_eq!(years.value(1), 365);
+        assert!(years.is_null(2));
+        assert_eq!(years.value(3), 365);
+    }
+
+    /// A policy with no eviction advice, so an insert that does not fit
+    /// falls straight through to the disk tier.
+    #[derive(Debug)]
+    struct NoVictims;
+
+    impl CachePolicy for NoVictims {
+        fn find_memory_victim(&self, _cnt: usize) -> Vec<EntryID> {
+            Vec::new()
+        }
+    }
+
+    /// Overwriting an entry that sits in the squeezed tier must take the
+    /// entry out of the index along with the object it reads through, even
+    /// when the new value then fails to insert: a squeezed entry left over a
+    /// deleted object would panic on its next read.
+    #[tokio::test]
+    async fn overwrite_of_squeezed_entry_that_fails_to_insert_leaves_no_entry() {
+        let dates: ArrayRef = Arc::new(Date32Array::from(vec![
+            Some(2),
+            Some(365 + 1),
+            None,
+            Some(365 + 100),
+        ]));
+        let expr = Arc::new(CacheExpression::extract_date32(Date32Field::Year));
+        let squeeze_to_tier = |cache: Arc<LiquidCache>, id| {
+            let dates = dates.clone();
+            let expr = expr.clone();
+            async move {
+                cache
+                    .insert(id, dates)
+                    .with_squeeze_hint(expr)
+                    .await
+                    .unwrap();
+                cache.squeeze_victims(vec![id]).await.unwrap();
+                cache.squeeze_victims(vec![id]).await.unwrap();
+                assert!(matches!(
+                    cache.index().get(&id).unwrap().as_ref(),
+                    CacheEntry::MemorySqueezedLiquid(_)
+                ));
+            }
+        };
+        // Learn the backing size, then size the disk tier to exactly it.
+        let probe = hydrating_cache().await;
+        squeeze_to_tier(probe.clone(), EntryID::from(1usize)).await;
+        let backing_bytes = probe.budget().disk_usage_bytes();
+        assert!(backing_bytes > 0);
+
+        let cache = LiquidCacheBuilder::new()
+            .with_max_memory_bytes(64 * 1024)
+            .with_max_disk_bytes(backing_bytes)
+            .with_squeeze_policy(Box::new(TranscodeSqueezeEvict))
+            .with_cache_policy(Box::new(NoVictims))
+            .build()
+            .await;
+        let id = EntryID::from(924usize);
+        squeeze_to_tier(cache.clone(), id).await;
+        assert_eq!(cache.budget().disk_usage_bytes(), backing_bytes);
+
+        // Too big for memory, and the disk tier is full with no victims.
+        let too_big: ArrayRef = Arc::new(Int32Array::from_iter_values(0..(1 << 16)));
+        let result = cache.insert(id, too_big).await;
+        assert_eq!(result, Err(CacheFull));
+
+        assert!(!cache.is_cached(&id));
+        assert!(cache.get(&id).await.is_none());
+        assert_eq!(cache.budget().disk_usage_bytes(), 0);
+        assert_eq!(cache.budget().memory_usage_bytes(), 0);
+    }
+
+    /// A flush that cannot write an entry drops it; if that entry still held
+    /// a disk copy, the object and its reservation must go with it, or the
+    /// disk tier shrinks by that much for good.
+    #[tokio::test]
+    async fn flush_dropping_hydrated_entry_releases_its_disk_copy() {
+        let array: ArrayRef = Arc::new(Int32Array::from_iter_values(0..64));
+        let disk_bytes = arrow_to_bytes(&array).unwrap().len();
+        let cache = LiquidCacheBuilder::new()
+            .with_max_memory_bytes(1 << 20)
+            .with_max_disk_bytes(disk_bytes)
+            .with_squeeze_policy(Box::new(TranscodeSqueezeEvict))
+            .with_cache_policy(Box::new(LiquidPolicy::new()))
+            .with_hydration_policy(Box::new(AlwaysHydrate::new()))
+            .build()
+            .await;
+        let id = EntryID::from(925usize);
+
+        cache.insert(id, array.clone()).await.unwrap();
+        cache.flush_all_to_disk().await.unwrap();
+        let read = cache.get(&id).await.expect("present");
+        assert_eq!(read.as_ref(), array.as_ref());
+        assert!(matches!(
+            cache.index().get(&id).unwrap().as_ref(),
+            CacheEntry::MemoryArrow(_)
+        ));
+        assert_eq!(cache.budget().disk_usage_bytes(), disk_bytes);
+
+        // The second flush wants to write the arrow bytes again into a tier
+        // that is full with the entry's own copy, so the entry is dropped.
+        cache.flush_all_to_disk().await.unwrap();
+
+        assert!(!cache.is_cached(&id));
+        assert_eq!(
+            cache.budget().disk_usage_bytes(),
+            0,
+            "the dropped entry's disk copy must be released"
+        );
     }
 }
