@@ -378,8 +378,9 @@ fn pushdown_columns(
 /// schema but are turned into literals by the opener's physical-expr adapter
 /// before the row filter ever sees them — refusing on their account would
 /// needlessly bypass the cache. What genuinely cannot be evaluated is a
-/// reference to a nested column, or to a column that exists nowhere in the
-/// table.
+/// reference to a column that exists nowhere in the table. (A nested column is
+/// fine: the cache holds what it cannot transcode as Arrow and the predicate
+/// evaluates against that.)
 pub fn unevaluable_conjunct<'e>(
     expr: &'e Arc<dyn PhysicalExpr>,
     schema: &Schema,
