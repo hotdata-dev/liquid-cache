@@ -1028,3 +1028,32 @@ fn test_offset_stress() {
         assert!(offsets[i] >= offsets[i - 1], "Offsets should be monotonic");
     }
 }
+
+/// A decoded array must report the memory it actually holds: within 5% of
+/// the serialized byte count, and within 5% of the freshly transcoded array.
+#[test]
+fn decoded_memory_usage_matches_transcoded_and_bytes() {
+    let mut rng = rand::rngs::StdRng::seed_from_u64(43);
+    let mut builder = arrow::array::StringViewBuilder::new();
+    for _ in 0..2048 {
+        let s: String = (0..1024)
+            .map(|_| rng.random_range(b'a'..=b'z') as char)
+            .collect();
+        builder.append_value(&s);
+    }
+    let input = builder.finish();
+
+    let compressor = LiquidByteViewArray::<FsstArray>::train_compressor(input.iter());
+    let transcoded = LiquidByteViewArray::<FsstArray>::from_string_view_array(&input, compressor);
+    let bytes = transcoded.to_bytes();
+    let decoded = LiquidByteViewArray::<FsstArray>::from_bytes(
+        bytes.clone().into(),
+        transcoded.fsst_buffer.compressor_arc(),
+    );
+
+    let decoded_size = decoded.get_detailed_memory_usage().total() as f64;
+    let transcoded_size = transcoded.get_detailed_memory_usage().total() as f64;
+    let bytes_len = bytes.len() as f64;
+    assert!((decoded_size - bytes_len).abs() <= 0.05 * bytes_len);
+    assert!((decoded_size - transcoded_size).abs() <= 0.05 * transcoded_size);
+}
