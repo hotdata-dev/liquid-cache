@@ -24,9 +24,47 @@ use crate::liquid_array::{
     LiquidSqueezedArrayRef, SqueezeIoHandler, SqueezedBacking, SqueezedDate32Array,
     VariantStructSqueezedArray,
 };
-use crate::sync::Arc;
+use crate::sync::{Arc, Mutex};
+use std::collections::HashMap;
 
 // CacheStats and RuntimeStats moved to stats.rs
+
+/// What the disk tier holds for an entry that is currently (also) in memory.
+///
+/// Hydrating a disk entry replaces its index entry with a memory one, but the
+/// bytes stay in the store under the same key and stay counted against the
+/// disk budget. Without this record, evicting the hydrated entry serialised
+/// and wrote the same bytes again — one redundant write per read of an
+/// oversized working set, and a second disk reservation for one object, so
+/// the disk tally drifted up until the tier evicted real entries early
+/// (liquid-cache#43).
+#[derive(Debug, Clone, Copy)]
+struct DiskCopy {
+    kind: DiskKind,
+    bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiskKind {
+    Liquid,
+    Arrow,
+}
+
+impl DiskCopy {
+    fn of(entry: &CacheEntry) -> Option<Self> {
+        match entry {
+            CacheEntry::DiskLiquid { disk_bytes, .. } => Some(Self {
+                kind: DiskKind::Liquid,
+                bytes: *disk_bytes,
+            }),
+            CacheEntry::DiskArrow { disk_bytes, .. } => Some(Self {
+                kind: DiskKind::Arrow,
+                bytes: *disk_bytes,
+            }),
+            _ => None,
+        }
+    }
+}
 
 /// Cache storage for liquid cache.
 ///
@@ -60,6 +98,7 @@ pub struct LiquidCache {
     metadata: Arc<dyn EntryMetadata>,
     store: t4::Store,
     squeeze_victims_concurrently: bool,
+    disk_copies: Mutex<HashMap<EntryID, DiskCopy>>,
 }
 
 /// Builder returned by [`LiquidCache::insert`] for configuring cache writes.
@@ -183,6 +222,7 @@ impl LiquidCache {
     pub fn reset(&self) {
         self.index.reset();
         self.budget.reset_usage();
+        self.disk_copies.lock().unwrap().clear();
     }
 
     /// Check if a batch is cached.
@@ -243,6 +283,19 @@ impl LiquidCache {
                     }
                 }
                 CacheEntry::MemoryLiquid(liquid_array) => {
+                    let data_type = liquid_array.original_arrow_data_type();
+                    if let Some(DiskCopy {
+                        kind: DiskKind::Liquid,
+                        bytes,
+                    }) = self.disk_copy(&entry_id)
+                    {
+                        // Hydrated from disk and never modified since: the
+                        // bytes are already there, flip the index rather
+                        // than re-serialising and rewriting them.
+                        self.try_insert(entry_id, CacheEntry::disk_liquid(data_type, bytes))
+                            .expect("failed to insert disk liquid entry");
+                        continue;
+                    }
                     let liquid_bytes = liquid_array.to_bytes();
                     let disk_bytes = liquid_bytes.len();
                     match self
@@ -252,10 +305,7 @@ impl LiquidCache {
                         Ok(()) => {
                             self.try_insert(
                                 entry_id,
-                                CacheEntry::disk_liquid(
-                                    liquid_array.original_arrow_data_type(),
-                                    disk_bytes,
-                                ),
+                                CacheEntry::disk_liquid(data_type, disk_bytes),
                             )
                             .expect("failed to insert disk liquid entry");
                         }
@@ -311,14 +361,19 @@ impl LiquidCache {
                 Ok(new_batch)
             }
             CacheEntry::MemoryLiquid(liquid_array) => {
+                let data_type = liquid_array.original_arrow_data_type();
+                if let Some(DiskCopy {
+                    kind: DiskKind::Liquid,
+                    bytes,
+                }) = self.disk_copy(&entry_id)
+                {
+                    return Ok(CacheEntry::disk_liquid(data_type, bytes));
+                }
                 let liquid_bytes = Bytes::from(liquid_array.to_bytes());
                 let disk_bytes = liquid_bytes.len();
                 self.write_batch_to_disk(entry_id, &batch, liquid_bytes)
                     .await?;
-                Ok(CacheEntry::disk_liquid(
-                    liquid_array.original_arrow_data_type(),
-                    disk_bytes,
-                ))
+                Ok(CacheEntry::disk_liquid(data_type, disk_bytes))
             }
             CacheEntry::MemorySqueezedLiquid(squeezed_array) => {
                 // The full data is already on disk, so we just need to mark ourself as disk entry
@@ -398,6 +453,43 @@ impl LiquidCache {
             metadata,
             store,
             squeeze_victims_concurrently,
+            disk_copies: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn disk_copy(&self, entry_id: &EntryID) -> Option<DiskCopy> {
+        self.disk_copies.lock().unwrap().get(entry_id).copied()
+    }
+
+    /// If `outcome` demotes an entry to a disk stub whose bytes are already in
+    /// the store, drop the write and point the stub at the existing copy.
+    fn reuse_disk_copy(&self, entry_id: &EntryID, outcome: SqueezeOutcome) -> SqueezeOutcome {
+        let SqueezeOutcome::Replace {
+            entry,
+            bytes_to_write: Some(_),
+        } = &outcome
+        else {
+            return outcome;
+        };
+        let (Some(copy), Some(stub)) = (self.disk_copy(entry_id), DiskCopy::of(entry)) else {
+            return outcome;
+        };
+        if copy.kind != stub.kind {
+            return outcome;
+        }
+        let data_type = match entry {
+            CacheEntry::DiskLiquid { data_type, .. } | CacheEntry::DiskArrow { data_type, .. } => {
+                data_type.clone()
+            }
+            _ => unreachable!("DiskCopy::of only matches disk stubs"),
+        };
+        let entry = match copy.kind {
+            DiskKind::Liquid => CacheEntry::disk_liquid(data_type, copy.bytes),
+            DiskKind::Arrow => CacheEntry::disk_arrow(data_type, copy.bytes),
+        };
+        SqueezeOutcome::Replace {
+            entry,
+            bytes_to_write: None,
         }
     }
 
@@ -466,6 +558,7 @@ impl LiquidCache {
             .remove(&entry_id_to_key(&entry_id))
             .await
             .expect("disk remove failed");
+        self.disk_copies.lock().unwrap().remove(&entry_id);
         self.budget.release_disk(disk_bytes);
         self.cache_policy.notify_remove(&entry_id);
         self.trace(InternalEvent::DiskEvict {
@@ -524,12 +617,31 @@ impl LiquidCache {
         ));
 
         loop {
-            let outcome = self.squeeze_policy.squeeze(
-                to_squeeze_batch.as_ref(),
-                compressor.as_ref(),
-                squeeze_hint,
-                &squeeze_io,
-            );
+            // A liquid entry hydrated from the disk tier still has its bytes
+            // there: demote it by flipping the index entry rather than
+            // re-serialising it into a hybrid whose backing would have to be
+            // written all over again.
+            let outcome = match (to_squeeze_batch.as_ref(), self.disk_copy(&to_squeeze)) {
+                (
+                    CacheEntry::MemoryLiquid(liquid),
+                    Some(DiskCopy {
+                        kind: DiskKind::Liquid,
+                        bytes,
+                    }),
+                ) => SqueezeOutcome::Replace {
+                    entry: CacheEntry::disk_liquid(liquid.original_arrow_data_type(), bytes),
+                    bytes_to_write: None,
+                },
+                _ => {
+                    let outcome = self.squeeze_policy.squeeze(
+                        to_squeeze_batch.as_ref(),
+                        compressor.as_ref(),
+                        squeeze_hint,
+                        &squeeze_io,
+                    );
+                    self.reuse_disk_copy(&to_squeeze, outcome)
+                }
+            };
 
             match outcome {
                 SqueezeOutcome::Replace {
@@ -815,6 +927,18 @@ impl LiquidCache {
             .put(entry_id_to_key(&entry_id), bytes.to_vec())
             .await
             .expect("write failed");
+        let kind = match batch {
+            CacheEntry::DiskArrow { .. } => DiskKind::Arrow,
+            CacheEntry::MemorySqueezedLiquid(squeezed) => match squeezed.disk_backing() {
+                SqueezedBacking::Arrow(_) => DiskKind::Arrow,
+                SqueezedBacking::Liquid(_) => DiskKind::Liquid,
+            },
+            _ => DiskKind::Liquid,
+        };
+        self.disk_copies
+            .lock()
+            .unwrap()
+            .insert(entry_id, DiskCopy { kind, bytes: len });
         Ok(())
     }
 
