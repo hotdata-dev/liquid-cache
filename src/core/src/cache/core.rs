@@ -291,7 +291,7 @@ impl LiquidCache {
                             )
                             .expect("failed to insert disk arrow entry");
                         }
-                        Err(CacheFull) => self.drop_memory_entry(entry_id, &batch),
+                        Err(CacheFull) => self.drop_memory_entry(entry_id, &batch).await,
                     }
                 }
                 CacheEntry::MemoryLiquid(liquid_array) => {
@@ -321,7 +321,7 @@ impl LiquidCache {
                             )
                             .expect("failed to insert disk liquid entry");
                         }
-                        Err(CacheFull) => self.drop_memory_entry(entry_id, &batch),
+                        Err(CacheFull) => self.drop_memory_entry(entry_id, &batch).await,
                     }
                 }
                 CacheEntry::MemorySqueezedLiquid(array) => {
@@ -487,16 +487,27 @@ impl LiquidCache {
         if self.disk_copy(&entry_id).is_none() {
             return;
         }
-        if let Some(entry) = self.index.get(&entry_id)
-            && matches!(
-                entry.as_ref(),
-                CacheEntry::DiskLiquid { .. } | CacheEntry::DiskArrow { .. }
-            )
-        {
-            // Still a stub: the whole entry is the superseded object.
-            self.remove_disk_entry(entry_id).await;
-            return;
+        match self.index.get(&entry_id).as_deref() {
+            Some(CacheEntry::DiskLiquid { .. } | CacheEntry::DiskArrow { .. }) => {
+                // Still a stub: the whole entry is the superseded object.
+                self.remove_disk_entry(entry_id).await;
+            }
+            Some(squeezed @ CacheEntry::MemorySqueezedLiquid(_)) => {
+                // A squeezed entry reads back through the object too, so it
+                // cannot stay in the index over a deleted one, not even for
+                // the span of an insert that then fails with `CacheFull`.
+                self.drop_memory_entry(entry_id, squeezed).await;
+            }
+            Some(CacheEntry::MemoryArrow(_) | CacheEntry::MemoryLiquid(_)) | None => {
+                self.discard_disk_copy(entry_id).await;
+            }
         }
+    }
+
+    /// Delete the store object recorded for `entry_id`, if any, and release
+    /// its reservation. The index entry, if one remains, must not be a form
+    /// that reads through the object.
+    async fn discard_disk_copy(&self, entry_id: EntryID) {
         let Some(copy) = self.disk_copies.lock().unwrap().remove(&entry_id) else {
             return;
         };
@@ -590,7 +601,10 @@ impl LiquidCache {
         Ok(())
     }
 
-    fn drop_memory_entry(&self, entry_id: EntryID, _expected: &CacheEntry) {
+    /// Drop a memory entry from the cache altogether, including the disk copy
+    /// it may hold: with the index entry gone nothing could reach that object
+    /// again, and its reservation would shrink the disk tier for good.
+    async fn drop_memory_entry(&self, entry_id: EntryID, _expected: &CacheEntry) {
         let Some(removed) = self.index.remove(&entry_id) else {
             return;
         };
@@ -606,6 +620,7 @@ impl LiquidCache {
         self.budget
             .try_update_memory_usage(removed.memory_usage_bytes(), 0)
             .expect("memory release cannot fail");
+        self.discard_disk_copy(entry_id).await;
         self.cache_policy.notify_remove(&entry_id);
     }
 
@@ -681,40 +696,18 @@ impl LiquidCache {
         ));
 
         loop {
-            // A liquid entry hydrated from the disk tier still has its bytes
-            // there. Without a squeeze hint every policy demotes it to a disk
-            // stub (no `LiquidArray::squeeze` produces a squeezed form
-            // unhinted), so flip the index entry rather than re-serialising
-            // the array to arrive at the same stub. With a hint the policy
-            // runs, so the entry can return to the squeezed tier, and
-            // `reuse_disk_copy` drops the write when the squeezed form's
-            // backing is the copy already on disk.
-            let outcome = match (
+            // The policy always decides the next form, so an entry hydrated
+            // from the disk tier can still reach the squeezed tier (floats
+            // squeeze even without a hint). `reuse_disk_copy` then drops the
+            // write when the form's backing is the copy already on disk; the
+            // serialisation the policy produced for it is the only cost.
+            let outcome = self.squeeze_policy.squeeze(
                 to_squeeze_batch.as_ref(),
-                self.disk_copy(&to_squeeze),
+                compressor.as_ref(),
                 squeeze_hint,
-            ) {
-                (
-                    CacheEntry::MemoryLiquid(liquid),
-                    Some(DiskCopy {
-                        kind: DiskKind::Liquid,
-                        bytes,
-                    }),
-                    None,
-                ) => SqueezeOutcome::Replace {
-                    entry: CacheEntry::disk_liquid(liquid.original_arrow_data_type(), bytes),
-                    bytes_to_write: None,
-                },
-                _ => {
-                    let outcome = self.squeeze_policy.squeeze(
-                        to_squeeze_batch.as_ref(),
-                        compressor.as_ref(),
-                        squeeze_hint,
-                        &squeeze_io,
-                    );
-                    self.reuse_disk_copy(&to_squeeze, outcome)
-                }
-            };
+                &squeeze_io,
+            );
+            let outcome = self.reuse_disk_copy(&to_squeeze, outcome);
 
             match outcome {
                 SqueezeOutcome::Replace {
@@ -1742,5 +1735,113 @@ mod tests {
         assert_eq!(years.value(1), 365);
         assert!(years.is_null(2));
         assert_eq!(years.value(3), 365);
+    }
+
+    /// A policy with no eviction advice, so an insert that does not fit
+    /// falls straight through to the disk tier.
+    #[derive(Debug)]
+    struct NoVictims;
+
+    impl CachePolicy for NoVictims {
+        fn find_memory_victim(&self, _cnt: usize) -> Vec<EntryID> {
+            Vec::new()
+        }
+    }
+
+    /// Overwriting an entry that sits in the squeezed tier must take the
+    /// entry out of the index along with the object it reads through, even
+    /// when the new value then fails to insert: a squeezed entry left over a
+    /// deleted object would panic on its next read.
+    #[tokio::test]
+    async fn overwrite_of_squeezed_entry_that_fails_to_insert_leaves_no_entry() {
+        let dates: ArrayRef = Arc::new(Date32Array::from(vec![
+            Some(2),
+            Some(365 + 1),
+            None,
+            Some(365 + 100),
+        ]));
+        let expr = Arc::new(CacheExpression::extract_date32(Date32Field::Year));
+        let squeeze_to_tier = |cache: Arc<LiquidCache>, id| {
+            let dates = dates.clone();
+            let expr = expr.clone();
+            async move {
+                cache
+                    .insert(id, dates)
+                    .with_squeeze_hint(expr)
+                    .await
+                    .unwrap();
+                cache.squeeze_victims(vec![id]).await.unwrap();
+                cache.squeeze_victims(vec![id]).await.unwrap();
+                assert!(matches!(
+                    cache.index().get(&id).unwrap().as_ref(),
+                    CacheEntry::MemorySqueezedLiquid(_)
+                ));
+            }
+        };
+        // Learn the backing size, then size the disk tier to exactly it.
+        let probe = hydrating_cache().await;
+        squeeze_to_tier(probe.clone(), EntryID::from(1usize)).await;
+        let backing_bytes = probe.budget().disk_usage_bytes();
+        assert!(backing_bytes > 0);
+
+        let cache = LiquidCacheBuilder::new()
+            .with_max_memory_bytes(64 * 1024)
+            .with_max_disk_bytes(backing_bytes)
+            .with_squeeze_policy(Box::new(TranscodeSqueezeEvict))
+            .with_cache_policy(Box::new(NoVictims))
+            .build()
+            .await;
+        let id = EntryID::from(924usize);
+        squeeze_to_tier(cache.clone(), id).await;
+        assert_eq!(cache.budget().disk_usage_bytes(), backing_bytes);
+
+        // Too big for memory, and the disk tier is full with no victims.
+        let too_big: ArrayRef = Arc::new(Int32Array::from_iter_values(0..(1 << 16)));
+        let result = cache.insert(id, too_big).await;
+        assert_eq!(result, Err(CacheFull));
+
+        assert!(!cache.is_cached(&id));
+        assert!(cache.get(&id).await.is_none());
+        assert_eq!(cache.budget().disk_usage_bytes(), 0);
+        assert_eq!(cache.budget().memory_usage_bytes(), 0);
+    }
+
+    /// A flush that cannot write an entry drops it; if that entry still held
+    /// a disk copy, the object and its reservation must go with it, or the
+    /// disk tier shrinks by that much for good.
+    #[tokio::test]
+    async fn flush_dropping_hydrated_entry_releases_its_disk_copy() {
+        let array: ArrayRef = Arc::new(Int32Array::from_iter_values(0..64));
+        let disk_bytes = arrow_to_bytes(&array).unwrap().len();
+        let cache = LiquidCacheBuilder::new()
+            .with_max_memory_bytes(1 << 20)
+            .with_max_disk_bytes(disk_bytes)
+            .with_squeeze_policy(Box::new(TranscodeSqueezeEvict))
+            .with_cache_policy(Box::new(LiquidPolicy::new()))
+            .with_hydration_policy(Box::new(AlwaysHydrate::new()))
+            .build()
+            .await;
+        let id = EntryID::from(925usize);
+
+        cache.insert(id, array.clone()).await.unwrap();
+        cache.flush_all_to_disk().await.unwrap();
+        let read = cache.get(&id).await.expect("present");
+        assert_eq!(read.as_ref(), array.as_ref());
+        assert!(matches!(
+            cache.index().get(&id).unwrap().as_ref(),
+            CacheEntry::MemoryArrow(_)
+        ));
+        assert_eq!(cache.budget().disk_usage_bytes(), disk_bytes);
+
+        // The second flush wants to write the arrow bytes again into a tier
+        // that is full with the entry's own copy, so the entry is dropped.
+        cache.flush_all_to_disk().await.unwrap();
+
+        assert!(!cache.is_cached(&id));
+        assert_eq!(
+            cache.budget().disk_usage_bytes(),
+            0,
+            "the dropped entry's disk copy must be released"
+        );
     }
 }
