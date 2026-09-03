@@ -306,13 +306,20 @@ impl LiquidCacheReaderInner {
             .snapshot_selection(self.current_batch_id)
         {
             // A plain AND, not `boolean_buffer_and_then`: the prefetch stored this
-            // snapshot against the *same* window this reader is looking at, so both
-            // buffers index rows of the window absolutely. `and_then` instead reads
-            // the right operand as positions among the left's set bits, which is
-            // only the same thing when every row of the window is selected. Page
-            // index pruning breaks that -- the window keeps its full length while
-            // most of its bits are clear -- and the two then disagree on both
-            // length and meaning.
+            // snapshot against the *same* window this reader is looking at (both
+            // come from `take_next_batch` over the one `RowSelection`, at the cache
+            // batch size), so both buffers index rows of the window absolutely.
+            // `and_then` instead reads its right operand as positions among the
+            // left's set bits, and asserts `left.count_set_bits() == right.len()`.
+            // That holds only while every row of the window is selected; page index
+            // pruning clears most bits without shortening the window, and the
+            // assertion then trips on any pruned, filtered scan.
+            //
+            // Release builds were not returning wrong rows: equal lengths took
+            // `boolean_buffer_and_then`'s early return, which yields the right
+            // operand, and the snapshot is `apply_predicates(input_selection)` and
+            // so already a subset. The AND says that directly instead of relying on
+            // a shortcut inside a function whose contract this call does not meet.
             debug_assert_eq!(
                 input_selection.len(),
                 snapshot_selection.len(),

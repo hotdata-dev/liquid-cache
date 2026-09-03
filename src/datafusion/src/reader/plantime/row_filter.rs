@@ -625,9 +625,10 @@ mod tests {
     /// A nested column is evaluable: `PushdownChecker` no longer refuses structs.
     /// The blanket "non-primitive" bar was inherited from DataFusion's own
     /// `row_filter.rs` and says nothing about what LiquidCache can do — a column
-    /// it cannot transcode is simply held as Arrow (`CacheEntry::MemoryArrow`) and
-    /// the predicate evaluates against that. Declining instead cost the whole scan
-    /// its cache for any table carrying one struct column.
+    /// it cannot transcode is simply held as Arrow, in memory or demoted to disk
+    /// under squeeze pressure, and the predicate evaluates against that. Declining
+    /// instead cost the whole scan its cache for any table carrying one struct
+    /// column.
     #[test]
     fn nested_column_conjunct_is_evaluable() {
         let schema = schema_with_struct();
