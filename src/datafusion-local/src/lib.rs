@@ -7,10 +7,9 @@ mod tests;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use datafusion::common::config::ConfigNonZeroUsize;
-use datafusion::error::Result;
 use datafusion::logical_expr::ScalarUDF;
 use datafusion::prelude::{SessionConfig, SessionContext};
+use datafusion::{common::config::ConfigNonZeroUsize, error::Result};
 use liquid_cache::cache::squeeze_policies::{SqueezePolicy, TranscodeSqueezeEvict};
 use liquid_cache::cache::{AlwaysHydrate, HydrationPolicy, default_max_memory_bytes};
 use liquid_cache::cache_policies::{CachePolicy, LiquidPolicy};
@@ -74,6 +73,7 @@ pub struct LiquidCacheLocalBuilder {
     /// When set, a scan is cached only if its estimated liquid footprint stays
     /// within `budget × tolerance`; `strict` toggles fail-loud panic handling.
     admission: Option<(f64, f64, f64, bool)>,
+    prefetch: bool,
     span: fastrace::Span,
 }
 
@@ -90,6 +90,7 @@ impl Default for LiquidCacheLocalBuilder {
             squeeze_policy: Box::new(TranscodeSqueezeEvict),
             hydration_policy: Box::new(AlwaysHydrate::new()),
             admission: None,
+            prefetch: true,
             span: fastrace::Span::enter_with_local_parent("liquid_cache_datafusion_local_builder"),
         }
     }
@@ -142,6 +143,12 @@ impl LiquidCacheLocalBuilder {
     /// Set hydration policy
     pub fn with_hydration_policy(mut self, hydration_policy: Box<dyn HydrationPolicy>) -> Self {
         self.hydration_policy = hydration_policy;
+        self
+    }
+
+    /// Enable or disable row-group prefetching.
+    pub fn with_prefetch(mut self, prefetch: bool) -> Self {
+        self.prefetch = prefetch;
         self
     }
 
@@ -215,7 +222,7 @@ impl LiquidCacheLocalBuilder {
         .await;
         let cache_ref = Arc::new(cache);
 
-        let mut optimizer = LocalModeOptimizer::new(cache_ref.clone());
+        let mut optimizer = LocalModeOptimizer::new(cache_ref.clone()).with_prefetch(self.prefetch);
         if let Some((expansion, safety, tolerance, strict)) = self.admission {
             optimizer = optimizer.with_admission_gate(expansion, safety, tolerance, strict);
         }

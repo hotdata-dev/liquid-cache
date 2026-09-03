@@ -1,11 +1,15 @@
 use std::{collections::HashMap, sync::Arc};
 
 use datafusion::{
-    config::ConfigOptions, datasource::source::DataSourceExec, error::Result,
-    execution::object_store::ObjectStoreUrl, physical_optimizer::PhysicalOptimizerRule,
-    physical_plan::ExecutionPlan, physical_plan::aggregates::AggregateExec,
-    physical_plan::aggregates::AggregateMode, physical_plan::repartition::RepartitionExec,
-    physical_plan::replace_children_if_necessary,
+    config::ConfigOptions,
+    datasource::source::DataSourceExec,
+    error::Result,
+    execution::object_store::ObjectStoreUrl,
+    physical_optimizer::PhysicalOptimizerRule,
+    physical_plan::aggregates::AggregateExec,
+    physical_plan::aggregates::AggregateMode,
+    physical_plan::repartition::RepartitionExec,
+    physical_plan::{ExecutionPlan, execution_plan::replace_children_if_necessary},
 };
 
 use liquid_cache_datafusion::optimizers::SqueezeHintMap;

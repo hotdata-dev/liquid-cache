@@ -100,16 +100,13 @@ async fn nested_column_conjunct_is_still_applied() {
 
     let sql = "SELECT id FROM t WHERE id >= 0 AND st.a = 3";
 
-    // The scan is declined rather than taken over with a filter that cannot
-    // evaluate `st.a`, so the plan still carries the whole predicate.
+    // A nested conjunct is evaluable now, so the scan is taken over and keeps the
+    // cache. What must not change is the answer: the conjunct is applied, not
+    // dropped.
     let plan = plan_of(&ctx, sql).await;
     assert!(
-        plan.contains("id@0 >= 0 AND get_field(st@1, a) = 3"),
-        "the unevaluable conjunct left the plan:\n{plan}"
-    );
-    assert!(
-        !plan.contains("liquid_parquet"),
-        "the scan was taken over despite an unevaluable conjunct:\n{plan}"
+        plan.contains("liquid_parquet"),
+        "a nested conjunct should no longer cost the scan its cache:\n{plan}"
     );
 
     // The first pass reads through the parquet fallback and would fill the cache;
@@ -144,12 +141,14 @@ async fn sole_unevaluable_conjunct_is_still_applied() {
     }
 }
 
-/// Declining a scan costs it the cache, so the refusal has to stay narrow: it is
-/// a nested column *in the predicate* that the row filter cannot evaluate, not
-/// the mere presence of one in the table or in the projection. Projecting `st.a`
-/// is still cached, and so is a scan of a table that merely has a struct column.
+/// A struct column costs the scan nothing, wherever it appears. The row filter
+/// used to refuse any nested column outright — a bar inherited from DataFusion's
+/// own `row_filter.rs` — which declined the whole scan to `ParquetSource` and so
+/// lost the cache for every filtered query on a table carrying one. A column the
+/// cache cannot transcode is simply held as Arrow and the predicate evaluates
+/// against that, so nothing here needs declining.
 #[tokio::test]
-async fn only_a_nested_predicate_costs_the_cache() {
+async fn a_nested_column_never_costs_the_cache() {
     let dir = TempDir::new().unwrap();
     let parquet = dir.path().join("t.parquet");
     write_t(&parquet);
@@ -166,23 +165,24 @@ async fn only_a_nested_predicate_costs_the_cache() {
         "SELECT st.a FROM t WHERE id >= 0",
         "SELECT id FROM t WHERE id >= 0",
         "SELECT id FROM t",
-    ] {
-        let plan = plan_of(&ctx, sql).await;
-        assert!(
-            plan.contains("liquid_parquet"),
-            "`{sql}` lost the cache; the refusal has widened:\n{plan}"
-        );
-    }
-
-    for sql in [
         "SELECT id FROM t WHERE st.a = 3",
         "SELECT id FROM t WHERE id >= 0 AND st.a = 3",
     ] {
         let plan = plan_of(&ctx, sql).await;
         assert!(
-            !plan.contains("liquid_parquet"),
-            "`{sql}` kept a filter it cannot evaluate:\n{plan}"
+            plan.contains("liquid_parquet"),
+            "`{sql}` lost the cache:\n{plan}"
         );
+    }
+
+    // And the nested predicates still return the right rows through the cache.
+    for sql in [
+        "SELECT id FROM t WHERE st.a = 3",
+        "SELECT id FROM t WHERE id >= 0 AND st.a = 3",
+    ] {
+        for pass in ["cold", "warm"] {
+            assert_eq!(ids(&ctx, sql).await, vec![3], "{sql} ({pass})");
+        }
     }
 }
 

@@ -26,6 +26,7 @@ mod batch_size_alignment;
 mod column_free_conjunct;
 mod date_optimizer;
 mod filter_limit;
+mod nested_filter;
 mod page_index;
 mod squeeze;
 mod unevaluable_conjunct;
@@ -121,9 +122,14 @@ async fn create_session_context_with_liquid_cache(
     cache_size_bytes: usize,
     cache_dir: &Path,
 ) -> Result<(SessionContext, LiquidCacheParquetRef)> {
-    let mut config = cache_test_config();
+    // These tests snapshot exact cache contents and counters. A repartitioned
+    // file scan populates the cache concurrently, so insertion order (and, for
+    // LIMIT queries, which partitions finish before cancellation) is not a
+    // stable property to snapshot.
+    let mut config = SessionConfig::new().with_repartition_file_scans(false);
     config.options_mut().execution.target_partitions = 4;
     let (ctx, cache) = LiquidCacheLocalBuilder::new()
+        .with_prefetch(false)
         .with_max_memory_bytes(cache_size_bytes)
         .with_cache_dir(cache_dir.to_path_buf())
         .with_squeeze_policy(squeeze_policy)
@@ -145,6 +151,54 @@ async fn get_physical_plan(sql: &str, ctx: &SessionContext) -> Arc<dyn Execution
     state.create_physical_plan(&plan).await.unwrap()
 }
 
+async fn get_result(ctx: &SessionContext, sql: &str) -> String {
+    let plan = get_physical_plan(sql, ctx).await;
+    let batches = collect(plan, ctx.task_ctx()).await.unwrap();
+    pretty_format_batches(&batches).unwrap().to_string()
+}
+
+async fn run_io_profile(prefetch: bool, cache_dir: &Path) -> (String, u64, u64, u64) {
+    let config = SessionConfig::new().with_repartition_file_scans(false);
+    let builder = LiquidCacheLocalBuilder::new()
+        .with_max_memory_bytes(64 * 1024 * 1024)
+        .with_cache_dir(cache_dir.to_path_buf());
+    let builder = if prefetch {
+        builder
+    } else {
+        builder.with_prefetch(false)
+    };
+    let (ctx, cache) = builder.build(config).await.unwrap();
+    ctx.register_parquet("hits", TEST_FILE, ParquetReadOptions::default())
+        .await
+        .unwrap();
+    let sql = r#"SELECT "WatchID" FROM hits WHERE "SearchPhrase" LIKE '%abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789%'"#;
+
+    let first = get_result(&ctx, sql).await;
+    cache.flush_data().await.unwrap();
+    cache.storage().stats();
+    let second = get_result(&ctx, sql).await;
+    let runtime = cache.storage().stats().runtime;
+    assert_eq!(first, second);
+
+    (
+        second,
+        runtime.read_io_count,
+        runtime.get,
+        runtime.eval_predicate,
+    )
+}
+
+#[tokio::test]
+async fn prefetch_matches_lazy_io() {
+    let lazy_dir = TempDir::new().unwrap();
+    let prefetch_dir = TempDir::new().unwrap();
+
+    let lazy = run_io_profile(false, lazy_dir.path()).await;
+    let prefetch = run_io_profile(true, prefetch_dir.path()).await;
+
+    assert_eq!(lazy, prefetch);
+}
+
 async fn run_sql_with_cache(
     sql: &str,
     squeeze_policy: Box<dyn SqueezePolicy>,
@@ -160,13 +214,7 @@ async fn run_sql_with_cache(
     let displayable = DisplayableExecutionPlan::new(plan.as_ref());
     let plan_string = format!("{}", displayable.tree_render());
 
-    async fn get_result(ctx: &SessionContext, sql: &str) -> String {
-        let plan = get_physical_plan(sql, ctx).await;
-        let batches = collect(plan, ctx.task_ctx()).await.unwrap();
-        pretty_format_batches(&batches).unwrap().to_string()
-    }
-
-    // Clear any historical runtime counters before warming the cache.
+    // Clear any historical runtime counters before prefetching the cache.
     cache.storage().stats();
 
     let first_run = get_result(&ctx, sql).await;
@@ -405,6 +453,7 @@ async fn test_provide_schema2() {
     let mut config = cache_test_config();
     config.options_mut().execution.target_partitions = 4;
     let (liquid_ctx, cache) = LiquidCacheLocalBuilder::new()
+        .with_prefetch(false)
         .with_cache_dir(cache_dir.path().to_path_buf())
         .with_max_memory_bytes(1024 * 1024)
         .with_squeeze_policy(Box::new(TranscodeSqueezeEvict))
@@ -453,7 +502,7 @@ async fn test_provide_schema2() {
         let displayable = DisplayableExecutionPlan::new(plan.as_ref());
         let plan_string = format!("{}", displayable.tree_render());
 
-        // Reset runtime counters so we measure hits from the warm run onwards.
+        // Reset runtime counters so we measure hits from the prefetch run onwards.
         cache.storage().stats();
 
         let first_liquid_run = liquid_ctx.sql(sql).await.unwrap().collect().await.unwrap();
@@ -477,17 +526,23 @@ async fn test_provide_schema2() {
         }
     }
 
-    #[cfg(target_arch = "x86_64")]
+    // FSST breaks equal-gain symbol ties using target-specific HashMap iteration order.
+    // Canonicalize the known AArch64 totals to x86_64 while leaving unexpected totals visible.
+    #[cfg(target_arch = "aarch64")]
+    let snapshot = snapshot
+        .replace("usage.memory_bytes: 999980", "usage.memory_bytes: 1000915")
+        .replace("usage.memory_bytes: 1035369", "usage.memory_bytes: 1036304");
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     insta::assert_snapshot!(snapshot);
 
-    // Off x86_64 the byte-exact snapshot cannot match, because FSST picks a
-    // different symbol table (see above). Bound the figures instead of skipping
-    // the test: arm64 is a production target, so it still deserves a tripwire on
-    // a gross accounting regression. The plan text is only checked byte-for-byte
-    // on x86_64, but what this test covers besides it — the DataFusion-vs-liquid
-    // column equality, the cache hits, the tier split, the `Utf8`-declared schema
-    // over a `string_view` file — is architecture-independent and worth running.
-    #[cfg(not(target_arch = "x86_64"))]
+    // On any other target the byte-exact snapshot cannot match, because FSST
+    // picks a different symbol table (see above) and only the x86_64/aarch64
+    // totals are known. Bound the figures instead of skipping the test: what this
+    // test covers besides the plan text — the DataFusion-vs-liquid column
+    // equality, the cache hits, the tier split, the `Utf8`-declared schema over a
+    // `string_view` file — is architecture-independent and worth running.
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     assert_memory_bytes_within_1pct(
         &snapshot,
         include_str!("snapshots/liquid_cache_datafusion_local__tests__provide_schema2.snap"),
@@ -505,6 +560,7 @@ async fn test_provide_schema2() {
 /// order of magnitude of headroom while still catching the kind of regression that
 /// matters — a buffer counted twice, or a tier accounted at the wrong size.
 #[cfg(not(target_arch = "x86_64"))]
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 fn assert_memory_bytes_within_1pct(snapshot: &str, recorded: &str) {
     let actual = memory_bytes(snapshot);
     let expected = memory_bytes(recorded);
@@ -540,6 +596,7 @@ fn assert_memory_bytes_within_1pct(snapshot: &str, recorded: &str) {
 /// Works on both the live snapshot and a committed `.snap` file: insta writes the
 /// snapshot body unindented after its YAML header, so the same prefix matches.
 #[cfg(not(target_arch = "x86_64"))]
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 fn memory_bytes(snapshot: &str) -> Vec<u64> {
     snapshot
         .lines()
@@ -614,8 +671,8 @@ async fn test_provide_schema_with_filter() {
 
 /// Covers the multi-partition scan path against the shared cache.
 ///
-/// The tests above pin `repartition_file_min_size` above the test file size so
-/// the scan stays single-partition and their traces stay reproducible. That pin
+/// The tests above disable file-scan repartitioning outright so
+/// the scan stays single-partition and their traces stay reproducible. That is
 /// is deliberate, but it also means nothing else exercises several scan
 /// partitions admitting into one cache concurrently — which is exactly what a
 /// default DataFusion 55 deployment does for any file over 1 MiB, since DF 55
@@ -702,4 +759,54 @@ async fn test_multi_partition_scan_shares_cache() {
     single_config.options_mut().execution.target_partitions = 4;
     let (single_ctx, _single_cache) = build_ctx(single_config, single_dir.path()).await;
     assert_eq!(sorted_rows(&single_ctx, sql).await, second_run);
+}
+
+#[tokio::test]
+async fn test_repartitioned_file_scan_cache_correctness() {
+    let reference_cache_dir = TempDir::new().unwrap();
+    let parallel_cache_dir = TempDir::new().unwrap();
+    let sql = r#"select "WatchID", "OS", "EventTime" from hits where "OS" <> 2 order by "WatchID" desc limit 10"#;
+
+    let reference = run_sql_with_cache(
+        sql,
+        Box::new(TranscodeSqueezeEvict),
+        1024 * 1024,
+        reference_cache_dir.path(),
+    )
+    .await
+    .values;
+
+    // DataFusion 55 lowered repartition_file_min_size from 10 MiB to 1 MiB,
+    // which splits the 2.3 MiB fixture into four concurrent scan partitions.
+    let mut config = SessionConfig::new();
+    config.options_mut().execution.target_partitions = 4;
+    let (ctx, cache) = LiquidCacheLocalBuilder::new()
+        .with_max_memory_bytes(1024 * 1024)
+        .with_cache_dir(parallel_cache_dir.path().to_path_buf())
+        .with_squeeze_policy(Box::new(TranscodeSqueezeEvict))
+        .with_cache_policy(Box::new(LiquidPolicy::new()))
+        .build(config)
+        .await
+        .unwrap();
+    ctx.register_parquet("hits", TEST_FILE, ParquetReadOptions::default())
+        .await
+        .unwrap();
+
+    let plan = get_physical_plan(sql, &ctx).await;
+    let plan = format!(
+        "{}",
+        DisplayableExecutionPlan::new(plan.as_ref()).tree_render()
+    );
+    assert!(
+        plan.contains("files: 4"),
+        "expected a repartitioned scan:\n{plan}"
+    );
+
+    assert_eq!(get_result(&ctx, sql).await, reference);
+    let entries_after_first_run = cache.storage().stats().total_entries;
+    assert_eq!(get_result(&ctx, sql).await, reference);
+
+    let stats = cache.storage().stats();
+    assert!(stats.runtime.get_with_selection > 0);
+    assert!(stats.total_entries >= entries_after_first_run);
 }

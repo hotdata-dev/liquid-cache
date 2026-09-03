@@ -18,7 +18,7 @@ jobs:
         name: Basic check
         runs-on: ubuntu-latest
         steps:
-            - uses: actions/checkout@v4
+            - uses: actions/checkout@v7
             - uses: ./.github/actions/free-disk-space
             - uses: dtolnay/rust-toolchain@stable
               with:
@@ -56,11 +56,29 @@ jobs:
             - name: Check for unused dependencies
               run: cargo shear
 
+    macos:
+        name: macOS check
+        runs-on: macos-latest
+        steps:
+            - uses: actions/checkout@v7
+            - uses: dtolnay/rust-toolchain@stable
+              with:
+                  components: clippy
+            - uses: Swatinem/rust-cache@v2
+              with:
+                  shared-key: ci-${{ runner.os }}
+                  save-if: ${{ github.ref == 'refs/heads/main' }}
+            # dev-tools needs a generated tailwind.css, covered by the Linux jobs.
+            - name: Run clippy
+              run: cargo clippy --workspace --exclude dev-tools --all-targets --all-features -- -D warnings
+            - name: Run unit tests
+              run: cargo test --workspace --exclude dev-tools
+
     dev_tools:
         name: Dev Tools
         runs-on: ubuntu-latest
         steps:
-            - uses: actions/checkout@v4
+            - uses: actions/checkout@v7
             - uses: ./.github/actions/free-disk-space
             - uses: cachix/install-nix-action@v31
               with:
@@ -76,7 +94,7 @@ jobs:
         name: Unit Test
         runs-on: ubuntu-latest
         steps:
-            - uses: actions/checkout@v4
+            - uses: actions/checkout@v7
             - uses: ./.github/actions/free-disk-space
             - uses: dtolnay/rust-toolchain@stable
             - uses: Swatinem/rust-cache@v2
@@ -96,7 +114,7 @@ jobs:
             - name: Generate code coverage
               run: cargo llvm-cov --workspace --codecov --output-path codecov.json
             - name: Upload coverage to Codecov
-              uses: codecov/codecov-action@v5
+              uses: codecov/codecov-action@v7
               with:
                   token: ${{ secrets.CODECOV_TOKEN }}
                   files: codecov.json
@@ -128,7 +146,7 @@ jobs:
         name: Shuttle Test
         runs-on: ubuntu-latest
         steps:
-            - uses: actions/checkout@v4
+            - uses: actions/checkout@v7
             - uses: ./.github/actions/free-disk-space
             - uses: dtolnay/rust-toolchain@stable
             - uses: Swatinem/rust-cache@v2
@@ -144,7 +162,7 @@ jobs:
         name: Address Sanitizer
         runs-on: ubuntu-latest
         steps:
-            - uses: actions/checkout@v4
+            - uses: actions/checkout@v7
             - uses: ./.github/actions/free-disk-space
             # Sanitizers can only run on nightly
             - uses: dtolnay/rust-toolchain@nightly
@@ -161,7 +179,7 @@ jobs:
         name: ClickBench
         runs-on: ubuntu-latest
         steps:
-            - uses: actions/checkout@v4
+            - uses: actions/checkout@v7
             - uses: ./.github/actions/free-disk-space
             - uses: dtolnay/rust-toolchain@stable
             - run: sudo apt-get update && sudo apt-get install -y wget
@@ -196,7 +214,7 @@ jobs:
                   env RUST_LOG=info cargo run --bin in_process -- --manifest benchmark/clickbench/benchmark_manifest.json --bench-mode liquid --max-memory-mb 256
                   cargo llvm-cov report --codecov --output-path codecov_clickbench.json
             - name: Upload coverage to Codecov
-              uses: codecov/codecov-action@v5
+              uses: codecov/codecov-action@v7
               with:
                   token: ${{ secrets.CODECOV_TOKEN }}
                   files: codecov_clickbench.json
@@ -206,7 +224,7 @@ jobs:
         name: TPC-H
         runs-on: ubuntu-latest
         steps:
-            - uses: actions/checkout@v4
+            - uses: actions/checkout@v7
             - uses: ./.github/actions/free-disk-space
             - uses: dtolnay/rust-toolchain@stable
             - run: sudo apt-get update && sudo apt-get install -y wget
@@ -236,7 +254,7 @@ jobs:
                   env RUST_LOG=info cargo run --bin in_process -- --manifest benchmark/tpch/manifest.json --bench-mode liquid --max-memory-mb 256
                   cargo llvm-cov report --codecov --output-path codecov_tpch.json
             - name: Upload coverage to Codecov
-              uses: codecov/codecov-action@v5
+              uses: codecov/codecov-action@v7
               with:
                   token: ${{ secrets.CODECOV_TOKEN }}
                   files: codecov_tpch.json
@@ -246,7 +264,7 @@ jobs:
         name: TPC-DS
         runs-on: ubuntu-latest
         steps:
-            - uses: actions/checkout@v4
+            - uses: actions/checkout@v7
             - uses: ./.github/actions/free-disk-space
             - uses: dtolnay/rust-toolchain@stable
             - run: sudo apt-get update && sudo apt-get install -y wget
@@ -276,7 +294,7 @@ jobs:
                   env RUST_LOG=info cargo run --bin in_process -- --manifest benchmark/tpcds/manifest.json --bench-mode liquid --max-memory-mb 256
                   cargo llvm-cov report --codecov --output-path codecov_tpcds.json
             - name: Upload coverage to Codecov
-              uses: codecov/codecov-action@v5
+              uses: codecov/codecov-action@v7
               with:
                   token: ${{ secrets.CODECOV_TOKEN }}
                   files: codecov_tpcds.json
@@ -286,7 +304,7 @@ jobs:
         name: StackOverflow
         runs-on: ubuntu-latest
         steps:
-            - uses: actions/checkout@v4
+            - uses: actions/checkout@v7
             - uses: ./.github/actions/free-disk-space
             - uses: dtolnay/rust-toolchain@stable
             - name: Install system dependencies
@@ -298,7 +316,7 @@ jobs:
                   mkdir -p benchmark/stackoverflow/data/dba
                   mkdir -p benchmark/stackoverflow/downloads
             - name: Cache StackOverflow dataset
-              uses: actions/cache@v4
+              uses: actions/cache@v6
               with:
                   path: |
                       benchmark/stackoverflow/data/dba
@@ -331,7 +349,7 @@ jobs:
                   env RUST_LOG=info cargo run --bin in_process -- --manifest benchmark/stackoverflow/manifest.dba.json --bench-mode liquid --max-memory-mb 10
                   cargo llvm-cov report --codecov --output-path codecov_stackoverflow.json
             - name: Upload coverage to Codecov
-              uses: codecov/codecov-action@v5
+              uses: codecov/codecov-action@v7
               with:
                   token: ${{ secrets.CODECOV_TOKEN }}
                   files: codecov_stackoverflow.json
@@ -344,7 +362,7 @@ jobs:
             contents: write
             pull-requests: write
         steps:
-            - uses: actions/checkout@v4
+            - uses: actions/checkout@v7
               with:
                   fetch-depth: 0
                   token: ${{ secrets.GITHUB_TOKEN }}
@@ -367,10 +385,20 @@ jobs:
             - name: Build benchmark binary
               run: cargo build --release --bin in_process
 
+            # The LiquidCache run reads every query's columns before the DataFusion
+            # run. Without an explicit warmup, Linux's page cache makes DataFusion's
+            # "cold" measurements warm and creates a large, order-dependent bias.
+            - name: Warm filesystem cache
+              run: |
+                  env RUST_LOG=warn target/release/in_process \
+                    --manifest benchmark/clickbench/benchmark_manifest.json \
+                    --iteration 1 \
+                    --bench-mode datafusion-default
+
             - name: Run LiquidCache benchmark (in-process)
               run: |
                   mkdir -p benchmark_results
-                  env RUST_LOG=info cargo run --release --bin in_process -- \
+                  env RUST_LOG=info target/release/in_process \
                     --manifest benchmark/clickbench/benchmark_manifest.json \
                     --output benchmark_results/liquid.json \
                     --iteration 5 \
@@ -380,7 +408,7 @@ jobs:
 
             - name: Run DataFusion benchmark (plain parquet)
               run: |
-                  env RUST_LOG=info cargo run --release --bin in_process -- \
+                  env RUST_LOG=info target/release/in_process \
                     --manifest benchmark/clickbench/benchmark_manifest.json \
                     --output benchmark_results/parquet.json \
                     --iteration 5 \
@@ -388,7 +416,7 @@ jobs:
 
             - name: Run DataFusion benchmark (default config)
               run: |
-                  env RUST_LOG=info cargo run --release --bin in_process -- \
+                  env RUST_LOG=info target/release/in_process \
                     --manifest benchmark/clickbench/benchmark_manifest.json \
                     --output benchmark_results/df_default.json \
                     --iteration 5 \
@@ -417,7 +445,7 @@ jobs:
 
             - name: Comment PR with benchmark results
               if: steps.compare.outputs.COMPARISON_AVAILABLE == 'true' && github.event_name == 'pull_request'
-              uses: actions/github-script@v7
+              uses: actions/github-script@v9
               with:
                   script: |
                       const fs = require('fs');
@@ -479,7 +507,7 @@ jobs:
         name: Run client/server/inprocess examples
         runs-on: ubuntu-latest
         steps:
-            - uses: actions/checkout@v4
+            - uses: actions/checkout@v7
             - uses: dtolnay/rust-toolchain@stable
             - uses: Swatinem/rust-cache@v2
               with:
