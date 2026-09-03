@@ -57,8 +57,15 @@ impl ArtIndex {
 
     pub(crate) fn get(&self, entry_id: &EntryID) -> Option<Arc<CacheEntry>> {
         let guard = self.art.pin();
-        // A slot emptied by a concurrent remove reads as a miss, exactly as if
-        // the remove had won the race outright.
+        // An empty slot means the entry was removed or replaced between the
+        // tree lookup and the load. A remove reading as a miss is exactly as
+        // if it had won the race outright, but after a replace the key is
+        // still present with a new slot, so look the key up once more rather
+        // than report a cached entry as absent.
+        let slot = self.art.get(*entry_id, &guard)?;
+        if let Some(entry) = slot.load() {
+            return Some(entry);
+        }
         self.art.get(*entry_id, &guard)?.load()
     }
 
