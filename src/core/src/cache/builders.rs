@@ -213,6 +213,7 @@ impl<'a> Insert<'a> {
             self.storage.add_squeeze_hint(&self.entry_id, squeeze_hint);
         }
         let batch = CacheEntry::memory_arrow(batch);
+        self.storage.supersede_disk_copy(self.entry_id).await;
         self.storage.insert_inner(self.entry_id, batch).await
     }
 }
