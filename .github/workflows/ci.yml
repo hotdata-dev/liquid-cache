@@ -42,6 +42,13 @@ jobs:
             - name: Check formatting
               run: cargo fmt --all -- --check
 
+            # `compare_benchmarks.py` gates the benchmark comment on every PR, so
+            # its tests run here rather than in the benchmark job: they need none
+            # of that job's artifacts, and this way a regression surfaces in
+            # minutes instead of after a full benchmark run.
+            - name: Test benchmark comparison script
+              run: python3 -m unittest discover -s .github -p 'test_*.py'
+
             - name: Check documentation
               run: cargo doc --no-deps --document-private-items
               env:
