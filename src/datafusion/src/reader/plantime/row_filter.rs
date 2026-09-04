@@ -64,7 +64,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use arrow::array::BooleanArray;
-use arrow::datatypes::{DataType, Schema};
+use arrow::datatypes::Schema;
 use arrow::error::{ArrowError, Result as ArrowResult};
 use arrow::record_batch::RecordBatch;
 use arrow_schema::SchemaRef;
@@ -85,6 +85,7 @@ use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::{PhysicalExpr, split_conjunction};
 
 /// A row filter that can be used to filter rows from a parquet file.
+#[derive(Clone)]
 pub struct LiquidRowFilter {
     predicates: Vec<LiquidPredicate>,
 }
@@ -106,24 +107,6 @@ impl LiquidRowFilter {
     }
 }
 
-pub(crate) fn get_predicate_column_id(projection: &parquet::arrow::ProjectionMask) -> Vec<usize> {
-    #[derive(Debug, Clone)]
-    struct ProjectionMaskLiquid {
-        mask: Option<Vec<bool>>,
-    }
-    let project_inner: &ProjectionMaskLiquid = unsafe { std::mem::transmute(projection) };
-    project_inner
-        .mask
-        .as_ref()
-        .map(|m| {
-            m.iter()
-                .enumerate()
-                .filter_map(|(pos, &x)| if x { Some(pos) } else { None })
-                .collect::<Vec<usize>>()
-        })
-        .unwrap_or_default()
-}
-
 /// A "compiled" predicate passed to `ParquetRecordBatchStream` to perform
 /// row-level filtering during parquet decoding.
 ///
@@ -133,7 +116,7 @@ pub(crate) fn get_predicate_column_id(projection: &parquet::arrow::ProjectionMas
 ///
 /// An expression can be evaluated as a `DatafusionArrowPredicate` if it:
 /// * Does not reference any projected columns
-/// * Does not reference columns with non-primitive types (e.g. structs / lists)
+/// * References only columns present in the physical file schema
 #[derive(Debug, Clone)]
 pub struct LiquidPredicate {
     /// the filter expression
@@ -143,6 +126,9 @@ pub struct LiquidPredicate {
     /// Path to the columns in the parquet schema required to evaluate the
     /// expression
     projection_mask: ProjectionMask,
+    /// Indices into the file schema of the columns required to evaluate the
+    /// expression, in `filter_schema` order
+    column_ids: Vec<usize>,
     /// how many rows were filtered out by this predicate
     rows_pruned: metrics::Count,
     /// how many rows passed this predicate
@@ -173,6 +159,7 @@ impl LiquidPredicate {
             physical_expr,
             physical_expr_physical_column_index: candidate.expr,
             projection_mask: projection,
+            column_ids: candidate.projection,
             rows_pruned,
             rows_matched,
             time,
@@ -202,8 +189,7 @@ impl LiquidPredicate {
 
     /// Get the column ids of the predicate.
     pub fn predicate_column_ids(&self) -> Vec<usize> {
-        let projection = self.projection();
-        get_predicate_column_id(projection)
+        self.column_ids.clone()
     }
 }
 
@@ -313,11 +299,9 @@ impl FilterCandidateBuilder {
 
 // a struct that implements TreeNodeRewriter to traverse a PhysicalExpr tree structure to determine
 // if any column references in the expression would prevent it from being predicate-pushed-down.
-// if non_primitive_columns || projected_columns, it can't be pushed down.
+// if projected_columns, it can't be pushed down.
 // can't be reused between calls to `rewrite`; each construction must be used only once.
 struct PushdownChecker<'schema> {
-    /// Does the expression require any non-primitive columns (like structs)?
-    non_primitive_columns: bool,
     /// Does the expression reference any columns that are not in the file schema?
     projected_columns: bool,
     // Indices into the file schema of the columns required to evaluate the expression
@@ -328,7 +312,6 @@ struct PushdownChecker<'schema> {
 impl<'schema> PushdownChecker<'schema> {
     fn new(file_schema: &'schema Schema) -> Self {
         Self {
-            non_primitive_columns: false,
             projected_columns: false,
             required_columns: BTreeSet::default(),
             file_schema,
@@ -338,10 +321,6 @@ impl<'schema> PushdownChecker<'schema> {
     fn check_single_column(&mut self, column_name: &str) -> Option<TreeNodeRecursion> {
         if let Ok(idx) = self.file_schema.index_of(column_name) {
             self.required_columns.insert(idx);
-            if DataType::is_nested(self.file_schema.field(idx).data_type()) {
-                self.non_primitive_columns = true;
-                return Some(TreeNodeRecursion::Jump);
-            }
         } else {
             // If the column does not exist in the file schema then it cannot be pushed down.
             self.projected_columns = true;
@@ -353,7 +332,7 @@ impl<'schema> PushdownChecker<'schema> {
 
     #[inline]
     fn prevents_pushdown(&self) -> bool {
-        self.non_primitive_columns || self.projected_columns
+        self.projected_columns
     }
 }
 
@@ -399,8 +378,9 @@ fn pushdown_columns(
 /// schema but are turned into literals by the opener's physical-expr adapter
 /// before the row filter ever sees them — refusing on their account would
 /// needlessly bypass the cache. What genuinely cannot be evaluated is a
-/// reference to a nested column, or to a column that exists nowhere in the
-/// table.
+/// reference to a column that exists nowhere in the table. (A nested column is
+/// fine: the cache holds what it cannot transcode as Arrow and the predicate
+/// evaluates against that.)
 pub fn unevaluable_conjunct<'e>(
     expr: &'e Arc<dyn PhysicalExpr>,
     schema: &Schema,
@@ -578,7 +558,7 @@ fn get_priority(expr: &Arc<dyn PhysicalExpr>) -> u8 {
 mod tests {
     use super::*;
     use arrow::array::{Int32Array, Int64Array, RecordBatch, StructArray};
-    use arrow_schema::{Field, Fields};
+    use arrow_schema::{DataType, Field, Fields};
     use datafusion::common::ScalarValue;
     use datafusion::physical_plan::expressions::{BinaryExpr, Column, Literal};
     use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
@@ -642,16 +622,19 @@ mod tests {
         (schema, metadata)
     }
 
-    /// `PushdownChecker`'s `non_primitive_columns` path: `st` is a struct, so no
-    /// conjunct that reads it can be evaluated as an `ArrowPredicate`.
+    /// A nested column is evaluable: `PushdownChecker` no longer refuses structs.
+    /// The blanket "non-primitive" bar was inherited from DataFusion's own
+    /// `row_filter.rs` and says nothing about what LiquidCache can do — a column
+    /// it cannot transcode is simply held as Arrow, in memory or demoted to disk
+    /// under squeeze pressure, and the predicate evaluates against that. Declining
+    /// instead cost the whole scan its cache for any table carrying one struct
+    /// column.
     #[test]
-    fn nested_column_conjunct_is_unevaluable() {
+    fn nested_column_conjunct_is_evaluable() {
         let schema = schema_with_struct();
-        let nested = eq(col("st", 1), 3);
-        let expr = and(eq(col("id", 0), 0), Arc::clone(&nested));
+        let expr = and(eq(col("id", 0), 0), eq(col("st", 1), 3));
 
-        let found = unevaluable_conjunct(&expr, &schema).unwrap();
-        assert!(Arc::ptr_eq(found.unwrap(), &nested));
+        assert!(unevaluable_conjunct(&expr, &schema).unwrap().is_none());
     }
 
     /// `PushdownChecker`'s `projected_columns` path: `missing` is in no schema the
@@ -683,7 +666,9 @@ mod tests {
     #[cfg_attr(debug_assertions, should_panic(expected = "row filter dropped"))]
     fn build_row_filter_refuses_to_drop_a_conjunct() {
         let (schema, metadata) = metadata();
-        let expr = and(eq(col("id", 0), 0), eq(col("st", 1), 3));
+        // A column in no schema the scan can read -- the one path that still
+        // makes a conjunct unevaluable now that nested columns push down.
+        let expr = and(eq(col("id", 0), 0), eq(col("missing", 2), 3));
         let metrics = ExecutionPlanMetricsSet::new();
         let file_metrics = ParquetFileMetrics::new(0, "test.parquet", &metrics);
 

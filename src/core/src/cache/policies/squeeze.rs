@@ -676,9 +676,7 @@ mod tests {
                 inner
                     .column_by_name("metadata")
                     .cloned()
-                    .unwrap_or_else(|| {
-                        Arc::new(base_variant.metadata_column().clone()) as ArrayRef
-                    }),
+                    .unwrap_or_else(|| base_variant.metadata_column().clone()),
                 inner.column_by_name("value").cloned().unwrap_or_else(|| {
                     Arc::new(BinaryViewArray::from(vec![None::<&[u8]>; inner.len()])) as ArrayRef
                 }),

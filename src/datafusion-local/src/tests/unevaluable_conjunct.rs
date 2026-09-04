@@ -3,11 +3,13 @@
 //!
 //! `build_row_filter` splits the pushed-down predicate into conjuncts and builds
 //! one `FilterCandidate` per conjunct. `PushdownChecker` refuses a conjunct that
-//! touches a nested column, and one that references a column absent from the
-//! file schema. Those refusals used to be dropped silently, leaving the scan
-//! applying a *strictly weaker* filter than the query asked for — and since
-//! DataFusion removes the `FilterExec` when it pushes a predicate down, nothing
-//! re-applies the dropped conjunct.
+//! references a column absent from the table schema. Such a refusal used to be
+//! dropped silently, leaving the scan applying a *strictly weaker* filter than
+//! the query asked for — and since DataFusion removes the `FilterExec` when it
+//! pushes a predicate down, nothing re-applies the dropped conjunct.
+//!
+//! A nested column is not one of these: it pushes down like any other, so a
+//! struct in the predicate costs the scan nothing.
 //!
 //! The scan is now declined at plan time instead, so the predicate stays with
 //! the reader that planned it.
@@ -48,13 +50,22 @@ fn write_t(path: &Path) {
 }
 
 async fn liquid_ctx(cache_dir: &Path) -> SessionContext {
+    liquid_ctx_with_cache(cache_dir).await.0
+}
+
+async fn liquid_ctx_with_cache(
+    cache_dir: &Path,
+) -> (
+    SessionContext,
+    liquid_cache_datafusion::LiquidCacheParquetRef,
+) {
     std::fs::create_dir_all(cache_dir).unwrap();
-    let (ctx, _cache) = LiquidCacheLocalBuilder::new()
+    let (ctx, cache) = LiquidCacheLocalBuilder::new()
         .with_cache_dir(cache_dir.to_path_buf())
         .build(SessionConfig::new())
         .await
         .unwrap();
-    ctx
+    (ctx, cache)
 }
 
 async fn ids(ctx: &SessionContext, sql: &str) -> Vec<i64> {
@@ -100,16 +111,13 @@ async fn nested_column_conjunct_is_still_applied() {
 
     let sql = "SELECT id FROM t WHERE id >= 0 AND st.a = 3";
 
-    // The scan is declined rather than taken over with a filter that cannot
-    // evaluate `st.a`, so the plan still carries the whole predicate.
+    // A nested conjunct is evaluable now, so the scan is taken over and keeps the
+    // cache. What must not change is the answer: the conjunct is applied, not
+    // dropped.
     let plan = plan_of(&ctx, sql).await;
     assert!(
-        plan.contains("id@0 >= 0 AND get_field(st@1, a) = 3"),
-        "the unevaluable conjunct left the plan:\n{plan}"
-    );
-    assert!(
-        !plan.contains("liquid_parquet"),
-        "the scan was taken over despite an unevaluable conjunct:\n{plan}"
+        plan.contains("liquid_parquet"),
+        "a nested conjunct should no longer cost the scan its cache:\n{plan}"
     );
 
     // The first pass reads through the parquet fallback and would fill the cache;
@@ -144,12 +152,14 @@ async fn sole_unevaluable_conjunct_is_still_applied() {
     }
 }
 
-/// Declining a scan costs it the cache, so the refusal has to stay narrow: it is
-/// a nested column *in the predicate* that the row filter cannot evaluate, not
-/// the mere presence of one in the table or in the projection. Projecting `st.a`
-/// is still cached, and so is a scan of a table that merely has a struct column.
+/// A struct column costs the scan nothing, wherever it appears. The row filter
+/// used to refuse any nested column outright — a bar inherited from DataFusion's
+/// own `row_filter.rs` — which declined the whole scan to `ParquetSource` and so
+/// lost the cache for every filtered query on a table carrying one. A column the
+/// cache cannot transcode is simply held as Arrow and the predicate evaluates
+/// against that, so nothing here needs declining.
 #[tokio::test]
-async fn only_a_nested_predicate_costs_the_cache() {
+async fn a_nested_column_never_costs_the_cache() {
     let dir = TempDir::new().unwrap();
     let parquet = dir.path().join("t.parquet");
     write_t(&parquet);
@@ -166,24 +176,62 @@ async fn only_a_nested_predicate_costs_the_cache() {
         "SELECT st.a FROM t WHERE id >= 0",
         "SELECT id FROM t WHERE id >= 0",
         "SELECT id FROM t",
-    ] {
-        let plan = plan_of(&ctx, sql).await;
-        assert!(
-            plan.contains("liquid_parquet"),
-            "`{sql}` lost the cache; the refusal has widened:\n{plan}"
-        );
-    }
-
-    for sql in [
         "SELECT id FROM t WHERE st.a = 3",
         "SELECT id FROM t WHERE id >= 0 AND st.a = 3",
     ] {
         let plan = plan_of(&ctx, sql).await;
         assert!(
-            !plan.contains("liquid_parquet"),
-            "`{sql}` kept a filter it cannot evaluate:\n{plan}"
+            plan.contains("liquid_parquet"),
+            "`{sql}` lost the cache:\n{plan}"
         );
     }
+
+    // And the nested predicates still return the right rows through the cache.
+    for sql in [
+        "SELECT id FROM t WHERE st.a = 3",
+        "SELECT id FROM t WHERE id >= 0 AND st.a = 3",
+    ] {
+        for pass in ["cold", "warm"] {
+            assert_eq!(ids(&ctx, sql).await, vec![3], "{sql} ({pass})");
+        }
+    }
+}
+
+/// The cache is not merely *kept* on a nested predicate, it is *used*: the struct
+/// column is admitted and the warm pass reads it back from the cache.
+///
+/// What such a scan does not get is the encoded-data fast path
+/// (`eval_predicate`), because a struct root does not resolve to one cache column
+/// id — see `convert_parquet_scan`'s docs. Pinned here so that closing that gap
+/// shows up as a deliberate change to this test rather than passing unnoticed.
+#[tokio::test]
+async fn a_nested_predicate_is_served_from_the_cache() {
+    let dir = TempDir::new().unwrap();
+    let parquet = dir.path().join("t.parquet");
+    write_t(&parquet);
+    let (ctx, cache) = liquid_ctx_with_cache(&dir.path().join("cache")).await;
+    ctx.register_parquet(
+        "t",
+        parquet.to_str().unwrap(),
+        ParquetReadOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    let sql = "SELECT id FROM t WHERE st.a = 3";
+    cache.storage().stats();
+    assert_eq!(ids(&ctx, sql).await, vec![3], "cold");
+    assert_eq!(ids(&ctx, sql).await, vec![3], "warm");
+
+    let stats = cache.storage().stats();
+    assert!(
+        stats.total_entries > 0,
+        "the struct column was never admitted: {stats:?}"
+    );
+    assert!(
+        stats.runtime.get_with_selection > 0 || stats.runtime.get > 0,
+        "the warm pass did not read the cache: {stats:?}"
+    );
 }
 
 /// The other `PushdownChecker` refusal: a conjunct on a column that is not in the

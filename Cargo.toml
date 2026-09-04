@@ -1,6 +1,10 @@
 [workspace.package]
 version = "0.1.13"
 edition = "2024"
+# sysinfo 0.39 is the current floor; keep this in step with the oldest
+# toolchain the dependency tree accepts so a stale rustc fails with
+# cargo's own message rather than a deep type error.
+rust-version = "1.95"
 repository = "https://github.com/XiangpengHao/liquid-cache"
 authors = ["XiangpengHao <xiangpeng.hao@wisc.edu>"]
 license = "Apache-2.0 OR MIT"
@@ -30,25 +34,26 @@ liquid-cache-datafusion = { path = "src/datafusion", version = "0.1.13" }
 liquid-cache-common = { path = "src/common", version = "0.1.13" }
 liquid-cache = { path = "src/core", version = "0.1.13" }
 liquid-cache-datafusion-local = { path = "src/datafusion-local", version = "0.1.13" }
-arrow = { version = "59.2", default-features = false, features = [
+arrow = { version = "59.2.0", default-features = false, features = [
 	"prettyprint",
 	"ipc",
 ] }
-arrow-flight = { version = "59.2", features = ["flight-sql-experimental"] }
-arrow-schema = { version = "59.2", features = ["serde"] }
-parquet = { version = "59.2", features = [
+arrow-flight = { version = "59.2.0", features = ["flight-sql-experimental"] }
+arrow-schema = { version = "59.2.0", features = ["serde"] }
+parquet = { version = "59.2.0", features = [
 	"async",
 	"experimental",
 	"variant_experimental",
 ] }
-parquet-variant-json = { version = "59.2" }
-parquet-variant-compute = { version = "59.2" }
-datafusion = { version = "55" }
-datafusion-common = { version = "55" }
-datafusion-expr-common = { version = "55" }
-datafusion-physical-expr = { version = "55" }
-datafusion-physical-expr-common = { version = "55" }
-datafusion-proto = { version = "55" }
+parquet-variant-json = { version = "59.2.0" }
+parquet-variant-compute = { version = "59.2.0" }
+datafusion = { version = "55.0.0" }
+datafusion-datasource = { version = "55.0.0" }
+datafusion-common = { version = "55.0.0" }
+datafusion-expr-common = { version = "55.0.0" }
+datafusion-physical-expr = { version = "55.0.0" }
+datafusion-physical-expr-common = { version = "55.0.0" }
+datafusion-proto = { version = "55.0.0" }
 async-trait = "0.1.89"
 futures = { version = "0.3.32", default-features = false, features = ["std"] }
 tokio = { version = "1.52.3", features = ["rt-multi-thread"] }
@@ -67,7 +72,7 @@ fastrace = "0.7"
 fastrace-tonic = "0.2"
 congee = "0.4.1"
 insta = "1.47.2"
-t4 = "0.1.7"
+t4 = "0.1.9"
 
 [profile.dev.package]
 insta.opt-level = 3

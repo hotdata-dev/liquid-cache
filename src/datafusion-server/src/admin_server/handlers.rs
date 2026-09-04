@@ -315,6 +315,9 @@ pub(crate) async fn start_flamegraph_handler(
 impl From<&Arc<dyn ExecutionPlan>> for ExecutionPlanWithStats {
     fn from(plan: &Arc<dyn ExecutionPlan>) -> Self {
         let metrics = plan.metrics().unwrap().aggregate_by_name();
+        let statistics = StatisticsContext::new()
+            .compute(plan.as_ref(), &StatisticsArgs::new())
+            .unwrap();
         let mut metric_values = Vec::new();
         for metric in metrics.iter() {
             metric_values.push(MetricValues {
@@ -323,12 +326,8 @@ impl From<&Arc<dyn ExecutionPlan>> for ExecutionPlanWithStats {
             });
         }
 
-        let stats = StatisticsContext::new()
-            .compute(plan.as_ref(), &StatisticsArgs::new())
-            .unwrap();
-
         let mut column_statistics = Vec::new();
-        for (i, cs) in stats.column_statistics.iter().enumerate() {
+        for (i, cs) in statistics.column_statistics.iter().enumerate() {
             let min = if cs.min_value != Precision::Absent {
                 Some(cs.min_value.to_string())
             } else {
@@ -376,8 +375,8 @@ impl From<&Arc<dyn ExecutionPlan>> for ExecutionPlanWithStats {
                 })
                 .collect(),
             statistics: Statistics {
-                num_rows: stats.num_rows.to_string(),
-                total_byte_size: stats.total_byte_size.to_string(),
+                num_rows: statistics.num_rows.to_string(),
+                total_byte_size: statistics.total_byte_size.to_string(),
                 column_statistics,
             },
             metrics: metric_values,
