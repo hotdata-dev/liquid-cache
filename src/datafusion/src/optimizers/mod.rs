@@ -633,12 +633,12 @@ fn unproducible_virtual_columns(
 /// this rule runs, DataFusion has already removed the `FilterExec` on the
 /// strength of `ParquetSource` accepting the whole predicate (both entry points
 /// force `execution.parquet.pushdown_filters`, so that removal always happens),
-/// and the scan is the only place the predicate is applied. The liquid row filter
-/// is stricter than DataFusion's own — it refuses nested columns, which upstream
-/// handles — and it used to drop what it could not evaluate, running the scan
-/// with a strictly weaker filter than the query asked for (issues #21, #23).
-/// Declining the scan hands the predicate back to the reader that planned it,
-/// which applies all of it.
+/// and the scan is the only place the predicate is applied. What the liquid row
+/// filter cannot evaluate is a reference to a column that is in no schema the
+/// scan can read; it used to drop such a conjunct, running the scan with a
+/// strictly weaker filter than the query asked for (issues #21, #23). Declining
+/// the scan hands the predicate back to the reader that planned it, which
+/// applies all of it.
 ///
 /// Two things this is not, and why:
 ///
@@ -651,12 +651,16 @@ fn unproducible_virtual_columns(
 ///   conversion from gating would fix local mode — but not the server, which
 ///   receives a fragment whose `FilterExec` the *client* already removed. The
 ///   server has no pushdown negotiation to join, so this gate is needed either way.
-/// - **Not teaching the row filter about nested columns.** Upstream evaluates
-///   `st.a = 3` by building a leaf-level `ProjectionMask` from struct field paths.
-///   Liquid masks by root (`ProjectionMask::roots`) and `get_predicate_column_id`
-///   reads the mask's leaf bits back as cache column ids, so a struct root — one
-///   column, several leaves — would address several cache entries. Lifting that
-///   means changing the cache's column-id model, well past a correctness fix.
+/// - **Not a nested column.** A struct in the predicate no longer reaches this
+///   bypass at all: `PushdownChecker` stopped refusing nested columns, so such a
+///   scan converts, caches its columns and reads them back from the cache like
+///   any other. What it does *not* get is the encoded-data fast path — liquid
+///   masks by root (`ProjectionMask::roots`) while `get_predicate_column_id`
+///   reads the mask's leaf bits back as cache column ids, so a struct root (one
+///   column, several leaves) does not resolve to a single cache entry, and the
+///   predicate falls through to evaluating materialised Arrow. Closing that gap
+///   means changing the cache's column-id model, which is why it is still open;
+///   it costs speed on struct predicates, not correctness or cache residency.
 fn convert_parquet_scan(
     node: &Arc<dyn ExecutionPlan>,
     cache: &LiquidCacheParquetRef,
