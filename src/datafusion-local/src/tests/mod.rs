@@ -559,7 +559,6 @@ async fn test_provide_schema2() {
 /// The known architecture difference is ~0.1% (935 bytes in ~1 MiB), so 1% has an
 /// order of magnitude of headroom while still catching the kind of regression that
 /// matters — a buffer counted twice, or a tier accounted at the wrong size.
-#[cfg(not(target_arch = "x86_64"))]
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 fn assert_memory_bytes_within_1pct(snapshot: &str, recorded: &str) {
     let actual = memory_bytes(snapshot);
@@ -595,7 +594,6 @@ fn assert_memory_bytes_within_1pct(snapshot: &str, recorded: &str) {
 ///
 /// Works on both the live snapshot and a committed `.snap` file: insta writes the
 /// snapshot body unindented after its YAML header, so the same prefix matches.
-#[cfg(not(target_arch = "x86_64"))]
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 fn memory_bytes(snapshot: &str) -> Vec<u64> {
     snapshot
