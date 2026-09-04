@@ -56,24 +56,6 @@ jobs:
             - name: Check for unused dependencies
               run: cargo shear
 
-    macos:
-        name: macOS check
-        runs-on: macos-latest
-        steps:
-            - uses: actions/checkout@v7
-            - uses: dtolnay/rust-toolchain@stable
-              with:
-                  components: clippy
-            - uses: Swatinem/rust-cache@v2
-              with:
-                  shared-key: ci-${{ runner.os }}
-                  save-if: ${{ github.ref == 'refs/heads/main' }}
-            # dev-tools needs a generated tailwind.css, covered by the Linux jobs.
-            - name: Run clippy
-              run: cargo clippy --workspace --exclude dev-tools --all-targets --all-features -- -D warnings
-            - name: Run unit tests
-              run: cargo test --workspace --exclude dev-tools
-
     dev_tools:
         name: Dev Tools
         runs-on: ubuntu-latest
@@ -129,7 +111,7 @@ jobs:
         name: macOS
         runs-on: macos-latest
         steps:
-            - uses: actions/checkout@v4
+            - uses: actions/checkout@v7
             - uses: dtolnay/rust-toolchain@stable
               with:
                   components: clippy
