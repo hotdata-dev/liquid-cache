@@ -2,6 +2,7 @@
 name = "liquid-cache-benchmarks"
 description = "LiquidCache Benchmarks"
 edition = { workspace = true }
+rust-version = { workspace = true }
 publish = false
 
 [dependencies]

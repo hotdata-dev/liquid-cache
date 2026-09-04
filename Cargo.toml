@@ -1,6 +1,10 @@
 [workspace.package]
 version = "0.1.13"
 edition = "2024"
+# sysinfo 0.39 is the current floor; keep this in step with the oldest
+# toolchain the dependency tree accepts so a stale rustc fails with
+# cargo's own message rather than a deep type error.
+rust-version = "1.95"
 repository = "https://github.com/XiangpengHao/liquid-cache"
 authors = ["XiangpengHao <xiangpeng.hao@wisc.edu>"]
 license = "Apache-2.0 OR MIT"
