@@ -447,9 +447,9 @@ impl LiquidCacheParquet {
     /// # Safety
     /// This is unsafe because resetting the cache while other threads are using the cache may cause undefined behavior.
     /// You should only call this when no one else is using the cache.
-    pub unsafe fn reset(&self) {
+    pub async unsafe fn reset(&self) {
         self.file_ids.reset();
-        self.cache_store.reset();
+        self.cache_store.reset().await;
     }
 
     /// Flush all memory-based entries to disk while preserving their format.

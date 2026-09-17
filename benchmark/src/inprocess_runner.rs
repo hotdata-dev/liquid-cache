@@ -657,7 +657,7 @@ impl InProcessBenchmarkRunner {
                 && let Some(cache) = &cache
             {
                 unsafe {
-                    cache.reset();
+                    cache.reset().await;
                 }
             }
 

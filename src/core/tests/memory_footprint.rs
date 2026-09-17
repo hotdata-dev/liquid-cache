@@ -249,7 +249,7 @@ async fn heap_footprint_tracks_budget_for_oversized_working_set() {
 
     // What survives once the index is emptied is held by the store, the
     // policy, or the compressor state — not by indexed entries.
-    cache.reset();
+    cache.reset().await;
     report(&cache, "after reset", baseline);
     let idle_after_reset = live() - baseline;
     assert!(

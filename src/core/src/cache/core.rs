@@ -254,10 +254,25 @@ impl LiquidCache {
     }
 
     /// Reset the cache.
-    pub fn reset(&self) {
+    ///
+    /// Deletes the store objects before forgetting the records that name them.
+    /// The store key carries the identity that wrote it, so everything after a
+    /// reset writes under new keys and nothing would ever overwrite these
+    /// again — dropping the records first would strand up to `max_disk_bytes`
+    /// per reset, unreachable and uncounted.
+    pub async fn reset(&self) {
+        let recorded: Vec<(EntryID, DiskCopy)> = {
+            let mut copies = self.disk_copies.lock().unwrap();
+            copies.drain().collect()
+        };
+        for (entry_id, copy) in recorded {
+            self.store
+                .remove(&entry_id_to_key(&entry_id, copy.identity))
+                .await
+                .expect("disk remove failed");
+        }
         self.index.reset();
         self.budget.reset_usage();
-        self.disk_copies.lock().unwrap().clear();
     }
 
     /// Check if a batch is cached.
@@ -1672,6 +1687,43 @@ mod tests {
             200,
             "an owned write was dropped, so its entry would point at nothing"
         );
+    }
+
+    /// A reset must delete the objects it forgets. The store key carries the
+    /// identity that wrote it, so everything written after a reset lands under
+    /// new keys — nothing would overwrite the old objects, and with their
+    /// records gone nothing would ever find them either.
+    #[tokio::test]
+    async fn reset_deletes_the_store_objects_it_forgets() {
+        let store = create_cache_store(1024 * 1024, Box::new(LiquidPolicy::new())).await;
+        let entry_id = EntryID::from(61usize);
+
+        store
+            .insert_inner(entry_id, WriteIdentity::Owned(1), create_test_array(100))
+            .await
+            .unwrap();
+        store.flush_all_to_disk().await.unwrap();
+        assert!(store.budget.disk_usage_bytes() > 0, "something spilled");
+        assert!(
+            store
+                .store
+                .get(&crate::cache::io_context::entry_id_to_key(&entry_id, 1))
+                .await
+                .is_ok(),
+            "the object is there before the reset"
+        );
+
+        store.reset().await;
+
+        assert!(
+            store
+                .store
+                .get(&crate::cache::io_context::entry_id_to_key(&entry_id, 1))
+                .await
+                .is_err(),
+            "reset left an object nothing can reach and nothing counts"
+        );
+        assert_eq!(store.budget.disk_usage_bytes(), 0);
     }
 
     /// A dropped write must hand back the disk it reserved. Nothing records
