@@ -1154,46 +1154,42 @@ impl LiquidCache {
             },
             CacheEntry::DiskLiquid { .. } | CacheEntry::MemoryLiquid(_) => DiskKind::Liquid,
         };
-        // The ownership check above happened before the await, so a takeover
-        // can have landed while the bytes were being written. Re-check while
-        // swapping the record: a rewrite that is no longer the owner must
-        // leave the current owner's record and object alone, and take its own
-        // orphan with it. A caller taking the key may still supersede, which
-        // is what it is for.
         // The check above ran before the await, so a takeover can have landed
         // while the bytes were being written. Ask the index again, not the
         // record: the record may still name a previous owner this writer is
         // legitimately superseding, whereas the index names whoever the bytes
         // can actually be read by. A rewrite that is no longer that owner is
         // stale and must leave the current one's record and object alone.
-        let still_owner = !is_rewrite
-            || self
+        //
+        // The index read and the swap below are two steps, so this narrows the
+        // window rather than closing it — as with every other check-then-act
+        // pair in this file.
+        if is_rewrite
+            && self
                 .index
                 .get_with_identity(&entry_id)
-                .is_none_or(|(current, _)| current == identity);
-        let previous = if still_owner {
-            Some(self.disk_copies.lock().unwrap().insert(
-                entry_id,
-                DiskCopy {
-                    identity,
-                    kind,
-                    bytes: len,
-                },
-            ))
-        } else {
-            None
-        };
-        let Some(previous) = previous else {
-            // Stale: someone else owns the record now. Remove the object this
+                .is_some_and(|(current, _)| current != identity)
+        {
+            // Stale: another identity owns the key now. Remove the object this
             // write just made — nothing names it — and hand back its
-            // reservation.
+            // reservation. The remove holds no claim on the key, so a second
+            // caller may race it; `t4::Store::remove` reports a missing key as
+            // `Ok(false)` rather than an error, so that is harmless.
             self.store
                 .remove(&entry_id_to_key(&entry_id, identity))
                 .await
                 .expect("disk remove failed");
             self.budget.release_disk(len);
             return Ok(());
-        };
+        }
+        let previous = self.disk_copies.lock().unwrap().insert(
+            entry_id,
+            DiskCopy {
+                identity,
+                kind,
+                bytes: len,
+            },
+        );
         if let Some(previous) = previous {
             // Same owner: the put replaced that object, so its reservation
             // goes with it and there is nothing left to delete.
@@ -1758,6 +1754,7 @@ mod tests {
         );
         assert_eq!(store.budget.disk_usage_bytes(), 0);
     }
+
     /// A dropped write must hand back the disk it reserved. Nothing records
     /// those bytes — no `DiskCopy` names them — so no later path would ever
     /// release them, and repeated takeovers during squeezes would walk the
