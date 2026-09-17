@@ -14,19 +14,32 @@
 //! being read, not by everything that has ever been read.
 //!
 //! Cache *entries* deliberately do not hold a lease. An id can be reused while
-//! entries keyed from it are still resident, and those entries are simply
-//! unreachable: each records the identity of the file it came from, so the new
-//! owner's reads miss and its writes are refused (see
-//! `liquid_cache::cache::ArtIndex::get_checked`). The cost is cache space held
-//! by data nobody will read until it is evicted; the alternative — releasing
-//! ids from inside index removal — would take a process-wide lock underneath a
-//! crossbeam-epoch pin, and would deadlock against `reset`.
+//! entries keyed from it are still resident, and each entry records the
+//! identity of the file it came from, so the new owner's reads miss rather
+//! than returning the previous owner's rows.
+//!
+//! Its writes are not refused, though. A key held by another identity belongs
+//! to a file that has already let its id go, so nothing can read that entry
+//! any more and the new owner takes the key over
+//! (`liquid_cache::cache::ArtIndex::insert`). Refusing instead would leave the
+//! key occupied by data nobody can use, and on a cache below its budget
+//! nothing evicts it — the new owner would never cache that key again.
+//!
+//! The alternative, releasing ids from inside index removal, would take a
+//! process-wide lock underneath a crossbeam-epoch pin and deadlock against
+//! `reset`. Keeping id lifetime and entry lifetime separate is what avoids
+//! that, and the identity check is what makes the overlap safe.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ahash::AHashMap;
-use std::sync::{Arc, Mutex, Weak};
+// Through `crate::sync`, not `std::sync`: under the shuttle test feature this
+// resolves to shuttle's primitives, which is what lets the model checker
+// explore interleavings across `acquire` and `release`. A `std::sync::Mutex`
+// is opaque to it, so the pool would be excluded from the very job that is
+// meant to cover it.
+use crate::sync::{Arc, Mutex, Weak};
 
 /// A leased file id. The id returns to its pool when this is dropped.
 ///
@@ -201,6 +214,63 @@ impl FileIdPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two leases alive at the same time must never share an id, and never
+    /// share an identity. That is the property the whole scheme rests on:
+    /// a shared id means two files computing one key, and a shared identity
+    /// means the check that catches it cannot tell them apart.
+    ///
+    /// Run under the model checker because `acquire` and `release` race by
+    /// construction — a lease is released from `Drop`, on whatever thread
+    /// happened to hold it last.
+    fn concurrent_leases_stay_distinct() {
+        let pool = FileIdPool::new();
+        let mut threads = Vec::new();
+
+        for t in 0..3 {
+            let pool = Arc::clone(&pool);
+            threads.push(crate::sync::thread::spawn(move || {
+                for i in 0..3 {
+                    let mine = pool.acquire(&format!("f{t}-{i}.parquet"));
+
+                    // Held at the same time, so they cannot be the same file.
+                    let probe = pool.acquire("probe.parquet");
+                    assert_ne!(mine.get(), probe.get(), "two live leases shared an id");
+                    assert_ne!(
+                        mine.identity(),
+                        probe.identity(),
+                        "two live leases shared an identity"
+                    );
+                    drop(probe);
+
+                    // The same path always resolves to the same lease.
+                    let again = pool.acquire(&format!("f{t}-{i}.parquet"));
+                    assert_eq!(mine.get(), again.get());
+                    assert_eq!(mine.identity(), again.identity());
+                }
+            }));
+        }
+
+        for thread in threads {
+            thread.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn concurrent_leases_stay_distinct_single_threaded() {
+        concurrent_leases_stay_distinct();
+    }
+
+    #[cfg(feature = "shuttle")]
+    #[test]
+    fn shuttle_concurrent_leases_stay_distinct() {
+        let mut runner = shuttle::PortfolioRunner::new(true, Default::default());
+        let cores = std::thread::available_parallelism().unwrap().get().min(4);
+        for _ in 0..cores {
+            runner.add(shuttle::scheduler::PctScheduler::new(10, 1_000));
+        }
+        runner.run(concurrent_leases_stay_distinct);
+    }
 
     #[test]
     fn concurrent_readers_of_one_path_share_a_lease() {
