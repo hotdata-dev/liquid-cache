@@ -480,7 +480,7 @@ impl LiquidSqueezedArray for SqueezedDate32Array {
         &self,
         predicate: &LiquidExpr,
         filter: &BooleanBuffer,
-    ) -> BooleanArray {
+    ) -> Option<BooleanArray> {
         let filtered = self.filter(filter).await;
         eval_predicate_on_array(filtered, predicate)
     }

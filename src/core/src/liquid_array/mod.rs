@@ -124,7 +124,11 @@ pub trait LiquidArray: std::fmt::Debug + Send + Sync {
     ///
     /// Note that the filter is a boolean buffer, not a boolean array, i.e., filter can't be nullable.
     /// The returned boolean mask is nullable if the the original array is nullable.
-    fn try_eval_predicate(&self, predicate: &LiquidExpr, filter: &BooleanBuffer) -> BooleanArray {
+    fn try_eval_predicate(
+        &self,
+        predicate: &LiquidExpr,
+        filter: &BooleanBuffer,
+    ) -> Option<BooleanArray> {
         let filtered = self.filter(filter);
         eval_predicate_on_array(filtered, predicate)
     }
@@ -252,7 +256,7 @@ pub trait LiquidSqueezedArray: std::fmt::Debug + Send + Sync {
         &self,
         predicate: &LiquidExpr,
         filter: &BooleanBuffer,
-    ) -> BooleanArray {
+    ) -> Option<BooleanArray> {
         let filtered = self.filter(filter).await;
         eval_predicate_on_array(filtered, predicate)
     }
@@ -262,21 +266,26 @@ pub trait LiquidSqueezedArray: std::fmt::Debug + Send + Sync {
     fn disk_backing(&self) -> SqueezedBacking;
 }
 
-pub(crate) fn eval_predicate_on_array(array: ArrayRef, predicate: &LiquidExpr) -> BooleanArray {
+/// Evaluate `predicate` against a one-column batch built from `array`.
+///
+/// Returns `None` when the array cannot answer the predicate — a data type the
+/// expression was not built for, or a batch it cannot be evaluated against.
+/// That is reachable whenever a cached entry is not the one the predicate was
+/// built for, so it must not be an assertion: the caller treats `None` as "the
+/// cache cannot answer", materializes from the source and evaluates there.
+pub(crate) fn eval_predicate_on_array(
+    array: ArrayRef,
+    predicate: &LiquidExpr,
+) -> Option<BooleanArray> {
     let schema = Arc::new(Schema::new(vec![Field::new(
         "liquid_predicate_col",
         array.data_type().clone(),
         true,
     )]));
-    let record_batch = RecordBatch::try_new(schema, vec![array]).expect("predicate input batch");
-    let result = predicate
-        .physical_expr()
-        .evaluate(&record_batch)
-        .expect("validated LiquidExpr must evaluate");
-    let boolean_array = result
-        .into_array(record_batch.num_rows())
-        .expect("predicate output must be an array");
-    boolean_array.as_boolean().clone()
+    let record_batch = RecordBatch::try_new(schema, vec![array]).ok()?;
+    let result = predicate.physical_expr().evaluate(&record_batch).ok()?;
+    let boolean_array = result.into_array(record_batch.num_rows()).ok()?;
+    Some(boolean_array.as_boolean().clone())
 }
 
 /// A trait to read the backing bytes of a squeezed array from disk.

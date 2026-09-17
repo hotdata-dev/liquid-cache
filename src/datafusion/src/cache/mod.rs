@@ -3,7 +3,6 @@
 
 use crate::io::ParquetCacheMetadata;
 use crate::reader::{LiquidPredicate, extract_multi_column_or};
-use crate::sync::Mutex;
 use ahash::AHashMap;
 use arrow::array::{BooleanArray, RecordBatch, RecordBatchOptions};
 use arrow::buffer::BooleanBuffer;
@@ -16,11 +15,13 @@ use parquet::arrow::arrow_reader::ArrowPredicate;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 mod column;
+mod file_id;
 mod id;
 mod stats;
+
+use file_id::{FileId, FileIdPool};
 
 pub(crate) use column::InsertArrowArrayError;
 pub use column::{CachedColumn, CachedColumnRef};
@@ -58,16 +59,18 @@ impl CachedRowGroup {
     fn new(
         cache_store: Arc<LiquidCache>,
         row_group_idx: u64,
-        file_idx: u64,
+        file_id: Arc<FileId>,
         columns: &[CachedColumnSpec],
     ) -> Self {
         let mut column_maps = ColumnMaps::default();
         for (column_id, field, expression, is_predicate_column) in columns {
-            let column_access_path = ColumnAccessPath::new(file_idx, row_group_idx, *column_id);
+            let column_access_path =
+                ColumnAccessPath::new(file_id.get(), row_group_idx, *column_id);
             let column = Arc::new(CachedColumn::new(
                 Arc::clone(field),
                 Arc::clone(&cache_store),
                 column_access_path,
+                Arc::clone(&file_id),
                 expression.clone(),
                 *is_predicate_column,
             ));
@@ -138,7 +141,10 @@ impl CachedRowGroup {
                         }
                     };
                     let entry_id = column.entry_id(batch_id).into();
-                    let liquid_array = self.cache_store.try_read_liquid(&entry_id).await;
+                    let liquid_array = self
+                        .cache_store
+                        .try_read_liquid(&entry_id, column.identity())
+                        .await;
                     let liquid_array = match liquid_array {
                         None => {
                             combined_buffer = None;
@@ -146,7 +152,7 @@ impl CachedRowGroup {
                         }
                         Some(array) => array,
                     };
-                    let buffer = liquid_array.try_eval_predicate(&liquid_expr, selection);
+                    let buffer = liquid_array.try_eval_predicate(&liquid_expr, selection)?;
 
                     combined_buffer = Some(match combined_buffer {
                         None => buffer,
@@ -190,7 +196,9 @@ pub(crate) type CachedRowGroupRef = Arc<CachedRowGroup>;
 #[derive(Debug)]
 pub struct CachedFile {
     cache_store: Arc<LiquidCache>,
-    file_id: u64,
+    /// Held, not copied: the id stays allocated for as long as anything can
+    /// still compute a cache key from it.
+    file_id: Arc<FileId>,
     file_schema: SchemaRef,
     squeeze_hints: Arc<ColumnSqueezeHints>,
 }
@@ -198,7 +206,7 @@ pub struct CachedFile {
 impl CachedFile {
     fn new(
         cache_store: Arc<LiquidCache>,
-        file_id: u64,
+        file_id: Arc<FileId>,
         file_schema: SchemaRef,
         squeeze_hints: Arc<ColumnSqueezeHints>,
     ) -> Self {
@@ -236,9 +244,15 @@ impl CachedFile {
         Arc::new(CachedRowGroup::new(
             self.cache_store.clone(),
             row_group_id,
-            self.file_id,
+            Arc::clone(&self.file_id),
             &columns,
         ))
+    }
+
+    /// The leased id this file's cache keys are built from.
+    #[cfg(test)]
+    pub(crate) fn file_id(&self) -> u64 {
+        self.file_id.get()
     }
 
     /// Return the configured cache batch size.
@@ -258,12 +272,12 @@ pub(crate) type CachedFileRef = Arc<CachedFile>;
 /// The main cache structure.
 #[derive(Debug)]
 pub struct LiquidCacheParquet {
-    /// Map file path to file id.
-    files: Mutex<AHashMap<String, u64>>,
+    /// Leases the file ids that name cached data. Ids come back when nothing
+    /// is reading the file any more, so the number in use tracks what is being
+    /// read rather than everything ever read — see [`file_id`].
+    file_ids: Arc<FileIdPool>,
 
     cache_store: Arc<LiquidCache>,
-
-    current_file_id: AtomicU64,
 }
 
 /// A reference to the main cache structure.
@@ -322,9 +336,8 @@ impl LiquidCacheParquet {
             .await;
 
         LiquidCacheParquet {
-            files: Mutex::new(AHashMap::new()),
+            file_ids: FileIdPool::new(),
             cache_store: cache_storage,
-            current_file_id: AtomicU64::new(0),
         }
     }
 
@@ -345,15 +358,9 @@ impl LiquidCacheParquet {
         full_file_schema: SchemaRef,
         squeeze_hints: Arc<ColumnSqueezeHints>,
     ) -> CachedFileRef {
-        let mut files = self.files.lock().unwrap();
-        let file_id = *files
-            .entry(file_path.clone())
-            .or_insert_with(|| self.current_file_id.fetch_add(1, Ordering::Relaxed));
-        drop(files);
-
         Arc::new(CachedFile::new(
             self.cache_store.clone(),
-            file_id,
+            self.file_ids.acquire(&file_path),
             full_file_schema,
             squeeze_hints,
         ))
@@ -384,6 +391,34 @@ impl LiquidCacheParquet {
         self.cache_store.budget().disk_usage_bytes()
     }
 
+    /// How many file ids are currently leased.
+    ///
+    /// This tracks the files being read, not the files ever read. It is the
+    /// number that has to stay under the cache key's 16-bit file field, so it
+    /// is worth watching: rising without bound means leases are being held by
+    /// something that should have let go.
+    pub fn leased_file_ids(&self) -> usize {
+        self.file_ids.live_count()
+    }
+
+    /// How many ids have been handed out that do not fit the cache key's file
+    /// field.
+    ///
+    /// Expected to stay at zero. Above zero, distinct files are computing the
+    /// same keys — served correctly, because each entry records which file it
+    /// came from, but unable to share the cache.
+    pub fn file_ids_over_key_width(&self) -> u64 {
+        self.file_ids.over_key_width()
+    }
+
+    /// How many cache lookups or writes found a key held by another file.
+    ///
+    /// The consequence of the counter above, and the one that proves the
+    /// aliasing is being caught rather than served.
+    pub fn identity_mismatches(&self) -> u64 {
+        self.cache_store.stats().identity_mismatches
+    }
+
     /// Flush the cache trace to a file.
     pub fn flush_trace(&self, to_file: impl AsRef<Path>) {
         self.cache_store.observer().flush_cache_trace(to_file);
@@ -405,8 +440,7 @@ impl LiquidCacheParquet {
     /// This is unsafe because resetting the cache while other threads are using the cache may cause undefined behavior.
     /// You should only call this when no one else is using the cache.
     pub unsafe fn reset(&self) {
-        let mut files = self.files.lock().unwrap();
-        files.clear();
+        self.file_ids.reset();
         self.cache_store.reset();
     }
 
@@ -437,7 +471,7 @@ mod tests {
     use super::*;
     use crate::cache::{CachedRowGroupRef, LiquidCacheParquet};
     use crate::reader::FilterCandidateBuilder;
-    use arrow::array::{Array, Int32Array};
+    use arrow::array::{Array, ArrayRef, Int32Array};
     use arrow::buffer::BooleanBuffer;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
@@ -468,6 +502,115 @@ mod tests {
         .await;
         let file = cache.register_or_get_file("test".to_string(), schema);
         file.create_row_group(0, vec![])
+    }
+
+    /// What part of the fix is actually for: a process that reads far more
+    /// files than it holds open at once must not exhaust the key's 16-bit file
+    /// field. Before ids were leased this counter only ever climbed, so a
+    /// long-lived instance wrapped it purely by having *seen* enough files.
+    #[tokio::test]
+    async fn reading_files_one_after_another_does_not_consume_the_id_space() {
+        let schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let store = crate::test_utils::mount_test_store(tmp_dir.path()).await;
+        let cache = LiquidCacheParquet::new(
+            8,
+            usize::MAX,
+            usize::MAX,
+            store,
+            Box::new(LiquidPolicy::new()),
+            Box::new(TranscodeSqueezeEvict),
+            Box::new(AlwaysHydrate::new()),
+        )
+        .await;
+
+        // Well past the ceiling in total, but only ever one open at a time.
+        for i in 0..(u16::MAX as usize + 1_000) {
+            let file = cache.register_or_get_file(format!("scan-{i}.parquet"), Arc::clone(&schema));
+            assert_eq!(
+                file.file_id(),
+                0,
+                "each file should reuse the id the previous one gave back"
+            );
+        }
+
+        // And a file opened now still fits the key field.
+        let after = cache.register_or_get_file("after.parquet".to_string(), schema);
+        assert!(after.file_id() <= u16::MAX as u64);
+    }
+
+    /// The bug in its real shape, walked through the actual registration path.
+    ///
+    /// `ColumnAccessPath` narrows the file id to 16 bits, so the 65,537th
+    /// distinct file a process registers is keyed identically to the first.
+    /// Before entries recorded their identity, the newcomer read the
+    /// incumbent's data — a panic when the column types differed, silently
+    /// wrong rows when they matched.
+    #[tokio::test]
+    async fn a_file_past_the_key_ceiling_does_not_read_the_first_file_s_data() {
+        let batch_size = 8;
+        let schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let store = crate::test_utils::mount_test_store(tmp_dir.path()).await;
+        let cache = LiquidCacheParquet::new(
+            batch_size,
+            usize::MAX,
+            usize::MAX,
+            store,
+            Box::new(LiquidPolicy::new()),
+            Box::new(TranscodeSqueezeEvict),
+            Box::new(AlwaysHydrate::new()),
+        )
+        .await;
+
+        let batch_id = BatchID::from_row_id(0, batch_size);
+        let filter = BooleanBuffer::new_set(batch_size);
+
+        // File id 0, with data in the cache.
+        let first = cache.register_or_get_file("first.parquet".to_string(), Arc::clone(&schema));
+        let first_column = first.create_row_group(0, vec![]).get_column(0).unwrap();
+        let first_data: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6, 7, 8]));
+        first_column
+            .insert(batch_id, Arc::clone(&first_data))
+            .await
+            .unwrap();
+
+        // Burn the rest of the 16-bit id space. The handles are held: ids are
+        // leased, so files that are opened and closed hand their id straight
+        // back and the ceiling is only reachable with this many files open at
+        // once.
+        let _fillers: Vec<_> = (1..=u16::MAX as usize)
+            .map(|i| cache.register_or_get_file(format!("filler-{i}.parquet"), Arc::clone(&schema)))
+            .collect();
+
+        // Id 65536, which narrows to 0.
+        let wrapped = cache.register_or_get_file("wrapped.parquet".to_string(), schema);
+        let wrapped_column = wrapped.create_row_group(0, vec![]).get_column(0).unwrap();
+
+        assert_eq!(
+            usize::from(wrapped_column.entry_id(batch_id)),
+            usize::from(first_column.entry_id(batch_id)),
+            "the packed keys must actually collide, or this test proves nothing"
+        );
+
+        // The newcomer must not be handed the incumbent's rows.
+        assert!(!wrapped_column.is_cached(batch_id));
+        assert!(
+            wrapped_column
+                .get_arrow_array_with_filter(batch_id, &filter)
+                .await
+                .is_none(),
+            "a colliding key must read as a miss, not as the other file's data"
+        );
+
+        // And the incumbent still reads its own.
+        let got = first_column
+            .get_arrow_array_with_filter(batch_id, &filter)
+            .await
+            .expect("the owner's entry is still there");
+        assert_eq!(got.as_ref(), first_data.as_ref());
     }
 
     /// Issue #19: `NOT (s = s)` simplifies to `s IS NULL AND NULL`, so a conjunct

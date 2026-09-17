@@ -205,9 +205,15 @@ mod tests {
         let mut row_start_id_sum = 0;
         let mut row_count_sum = 0;
         let mut memory_size_sum = 0;
-        for file_no in 0..8 {
-            let file_name = format!("test_{file_no}.parquet");
-            let file = cache.register_or_get_file(file_name, schema.clone());
+        // Held for the whole loop, not per iteration: a file id is leased and
+        // comes back when its handle drops, so releasing each file before
+        // opening the next would hand them all the same id.
+        let files: Vec<_> = (0..8)
+            .map(|file_no| {
+                cache.register_or_get_file(format!("test_{file_no}.parquet"), schema.clone())
+            })
+            .collect();
+        for file in &files {
             for rg in 0..8 {
                 let row_group = file.create_row_group(rg, vec![]);
                 for col in 0..8 {

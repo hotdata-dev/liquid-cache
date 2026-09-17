@@ -142,6 +142,13 @@ pub struct CacheStats {
     pub memory_liquid_bytes: usize,
     /// Total size of in-memory Squeezed-Liquid entries in bytes.
     pub memory_squeezed_liquid_bytes: usize,
+    /// Lookups and inserts that found a key held by a different identity.
+    ///
+    /// Expected to stay at zero. A non-zero value means two sources compute
+    /// the same `EntryID` — each was served correctly, because the check
+    /// turns the collision into a miss, but the cache is not holding what
+    /// either of them could use.
+    pub identity_mismatches: u64,
     /// Total memory usage of the cache.
     pub memory_usage_bytes: usize,
     /// Total disk usage of the cache.

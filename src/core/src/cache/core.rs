@@ -91,10 +91,10 @@ impl DiskCopy {
 ///
 /// let entry_id = EntryID::from(0);
 /// let arrow_array = Arc::new(UInt64Array::from_iter_values(0..32));
-/// storage.insert(entry_id, arrow_array.clone()).await;
+/// storage.insert(entry_id, 0, arrow_array.clone()).await;
 ///
 /// // Get the arrow array back asynchronously
-/// let retrieved = storage.get(&entry_id).await.unwrap();
+/// let retrieved = storage.get(&entry_id, 0).await.unwrap();
 /// assert_eq!(retrieved.as_ref(), arrow_array.as_ref());
 /// });
 /// ```
@@ -161,6 +161,7 @@ impl LiquidCache {
             memory_arrow_bytes,
             memory_liquid_bytes,
             memory_squeezed_liquid_bytes,
+            identity_mismatches: self.index.identity_mismatches(),
             memory_usage_bytes,
             disk_usage_bytes,
             max_memory_bytes: self.config.max_memory_bytes(),
@@ -173,23 +174,25 @@ impl LiquidCache {
     pub fn insert<'a>(
         self: &'a Arc<Self>,
         entry_id: EntryID,
+        identity: u64,
         batch_to_cache: ArrayRef,
     ) -> Insert<'a> {
-        Insert::new(self, entry_id, batch_to_cache)
+        Insert::new(self, entry_id, identity, batch_to_cache)
     }
 
     /// Create a [`Get`] builder for the provided entry.
-    pub fn get<'a>(&'a self, entry_id: &'a EntryID) -> Get<'a> {
-        Get::new(self, entry_id)
+    pub fn get<'a>(&'a self, entry_id: &'a EntryID, identity: u64) -> Get<'a> {
+        Get::new(self, entry_id, identity)
     }
 
     /// Create an [`EvaluatePredicate`] builder for evaluating predicates on cached data.
     pub fn eval_predicate<'a>(
         &'a self,
         entry_id: &'a EntryID,
+        identity: u64,
         predicate: &'a LiquidExpr,
     ) -> EvaluatePredicate<'a> {
-        EvaluatePredicate::new(self, entry_id, predicate)
+        EvaluatePredicate::new(self, entry_id, identity, predicate)
     }
 
     /// Try to read a liquid array from the cache.
@@ -197,10 +200,11 @@ impl LiquidCache {
     pub async fn try_read_liquid(
         &self,
         entry_id: &EntryID,
+        identity: u64,
     ) -> Option<crate::liquid_array::LiquidArrayRef> {
         self.observer.on_try_read_liquid();
         self.trace(InternalEvent::TryReadLiquid { entry: *entry_id });
-        let batch = self.index.get(entry_id)?;
+        let batch = self.index.get_checked(entry_id, identity)?;
         self.cache_policy
             .notify_access(entry_id, CachedBatchType::from(batch.as_ref()));
 
@@ -238,8 +242,8 @@ impl LiquidCache {
     }
 
     /// Check if a batch is cached.
-    pub fn is_cached(&self, entry_id: &EntryID) -> bool {
-        self.index.is_cached(entry_id)
+    pub fn is_cached(&self, entry_id: &EntryID, identity: u64) -> bool {
+        self.index.is_cached(entry_id, identity)
     }
 
     /// Get the config of the cache.
@@ -287,6 +291,7 @@ impl LiquidCache {
                         Ok(()) => {
                             self.try_insert(
                                 entry_id,
+                                None,
                                 CacheEntry::disk_arrow(array.data_type().clone(), disk_bytes),
                             )
                             .expect("failed to insert disk arrow entry");
@@ -304,7 +309,7 @@ impl LiquidCache {
                         // Hydrated from disk and never modified since: the
                         // bytes are already there, flip the index rather
                         // than re-serialising and rewriting them.
-                        self.try_insert(entry_id, CacheEntry::disk_liquid(data_type, bytes))
+                        self.try_insert(entry_id, None, CacheEntry::disk_liquid(data_type, bytes))
                             .expect("failed to insert disk liquid entry");
                         continue;
                     }
@@ -317,6 +322,7 @@ impl LiquidCache {
                         Ok(()) => {
                             self.try_insert(
                                 entry_id,
+                                None,
                                 CacheEntry::disk_liquid(data_type, disk_bytes),
                             )
                             .expect("failed to insert disk liquid entry");
@@ -327,7 +333,7 @@ impl LiquidCache {
                 CacheEntry::MemorySqueezedLiquid(array) => {
                     // We don't have to do anything, because it's already on disk
                     let disk_entry = Self::disk_entry_from_squeezed(array);
-                    self.try_insert(entry_id, disk_entry)
+                    self.try_insert(entry_id, None, disk_entry)
                         .expect("failed to insert disk entry");
                 }
                 CacheEntry::DiskArrow { .. } | CacheEntry::DiskLiquid { .. } => {
@@ -406,10 +412,11 @@ impl LiquidCache {
     pub(crate) async fn insert_inner(
         &self,
         entry_id: EntryID,
+        identity: Option<u64>,
         mut batch_to_cache: CacheEntry,
     ) -> Result<(), CacheFull> {
         loop {
-            let Err(not_inserted) = self.try_insert(entry_id, batch_to_cache) else {
+            let Err(not_inserted) = self.try_insert(entry_id, identity, batch_to_cache) else {
                 return Ok(());
             };
             self.trace(InternalEvent::InsertFailed {
@@ -568,7 +575,18 @@ impl LiquidCache {
         }
     }
 
-    fn try_insert(&self, entry_id: EntryID, to_insert: CacheEntry) -> Result<(), CacheEntry> {
+    /// `identity` names whose data this is for a caller-originated insert, and
+    /// is `None` for maintenance rewriting a key in place — see
+    /// [`ArtIndex::insert`]. A declined write is not an error: the key belongs
+    /// to someone else, or the entry being rewritten has since been removed.
+    /// Neither is worth retrying, so the reservation is handed back and the
+    /// call reports success with nothing stored.
+    fn try_insert(
+        &self,
+        entry_id: EntryID,
+        identity: Option<u64>,
+        to_insert: CacheEntry,
+    ) -> Result<(), CacheEntry> {
         let new_memory_size = to_insert.memory_usage_bytes();
         let cached_batch_type = if let Some(entry) = self.index.get(&entry_id) {
             let old_memory_size = entry.memory_usage_bytes();
@@ -580,14 +598,24 @@ impl LiquidCache {
                 return Err(to_insert);
             }
             let batch_type = CachedBatchType::from(&to_insert);
-            self.index.insert(&entry_id, to_insert);
+            if !self.index.insert(&entry_id, identity, to_insert) {
+                self.budget
+                    .try_update_memory_usage(new_memory_size, old_memory_size)
+                    .expect("memory release cannot fail");
+                return Ok(());
+            }
             batch_type
         } else {
             if self.budget.try_reserve_memory(new_memory_size).is_err() {
                 return Err(to_insert);
             }
             let batch_type = CachedBatchType::from(&to_insert);
-            self.index.insert(&entry_id, to_insert);
+            if !self.index.insert(&entry_id, identity, to_insert) {
+                self.budget
+                    .try_update_memory_usage(new_memory_size, 0)
+                    .expect("memory release cannot fail");
+                return Ok(());
+            }
             batch_type
         };
 
@@ -718,7 +746,7 @@ impl LiquidCache {
                         self.write_batch_to_disk(to_squeeze, &new_batch, bytes_to_write)
                             .await?;
                     }
-                    match self.try_insert(to_squeeze, new_batch) {
+                    match self.try_insert(to_squeeze, None, new_batch) {
                         Ok(()) => {
                             break;
                         }
@@ -766,19 +794,20 @@ impl LiquidCache {
                 cached: cached_type,
                 new: new_type,
             });
-            let _ = self.insert_inner(*entry_id, new_entry).await;
+            let _ = self.insert_inner(*entry_id, None, new_entry).await;
         }
     }
 
     pub(crate) async fn read_arrow_array(
         &self,
         entry_id: &EntryID,
+        identity: u64,
         selection: Option<&BooleanBuffer>,
         expression: Option<&CacheExpression>,
     ) -> Option<ArrayRef> {
         use arrow::array::BooleanArray;
 
-        let batch = self.index.get(entry_id)?;
+        let batch = self.index.get_checked(entry_id, identity)?;
         self.cache_policy
             .notify_access(entry_id, CachedBatchType::from(batch.as_ref()));
         self.trace(InternalEvent::Read {
@@ -1060,13 +1089,14 @@ impl LiquidCache {
     pub(crate) async fn eval_predicate_internal(
         &self,
         entry_id: &EntryID,
+        identity: u64,
         selection_opt: Option<&BooleanBuffer>,
         predicate: &LiquidExpr,
     ) -> Option<BooleanArray> {
         use arrow::array::BooleanArray;
 
         self.observer.on_eval_predicate();
-        let batch = self.index.get(entry_id)?;
+        let batch = self.index.get_checked(entry_id, identity)?;
         self.cache_policy
             .notify_access(entry_id, CachedBatchType::from(batch.as_ref()));
         self.trace(InternalEvent::EvalPredicate {
@@ -1083,9 +1113,8 @@ impl LiquidCache {
                     owned.as_ref().unwrap()
                 });
                 let selection_array = BooleanArray::new(selection.clone(), None);
-                let filtered = arrow::compute::filter(array, &selection_array)
-                    .expect("selection must match array length");
-                Some(self.eval_predicate_on_array(filtered, predicate))
+                let filtered = arrow::compute::filter(array, &selection_array).ok()?;
+                self.eval_predicate_on_array(filtered, predicate)
             }
             entry @ CacheEntry::DiskArrow { .. } => {
                 let array = self.read_disk_arrow_array(entry_id).await;
@@ -1097,9 +1126,8 @@ impl LiquidCache {
                     owned.as_ref().unwrap()
                 });
                 let selection_array = BooleanArray::new(selection.clone(), None);
-                let filtered = arrow::compute::filter(&array, &selection_array)
-                    .expect("selection must match array length");
-                Some(self.eval_predicate_on_array(filtered, predicate))
+                let filtered = arrow::compute::filter(&array, &selection_array).ok()?;
+                self.eval_predicate_on_array(filtered, predicate)
             }
             CacheEntry::MemoryLiquid(array) => {
                 let mut owned = None;
@@ -1107,7 +1135,7 @@ impl LiquidCache {
                     owned = Some(BooleanBuffer::new_set(array.len()));
                     owned.as_ref().unwrap()
                 });
-                Some(array.try_eval_predicate(predicate, selection))
+                array.try_eval_predicate(predicate, selection)
             }
             entry @ CacheEntry::DiskLiquid { .. } => {
                 let liquid = self.read_disk_liquid_array(entry_id).await;
@@ -1118,7 +1146,7 @@ impl LiquidCache {
                     owned = Some(BooleanBuffer::new_set(liquid.len()));
                     owned.as_ref().unwrap()
                 });
-                Some(liquid.try_eval_predicate(predicate, selection))
+                liquid.try_eval_predicate(predicate, selection)
             }
             CacheEntry::MemorySqueezedLiquid(array) => {
                 self.eval_predicate_on_squeezed(array, selection_opt, predicate)
@@ -1138,25 +1166,25 @@ impl LiquidCache {
             owned = Some(BooleanBuffer::new_set(array.len()));
             owned.as_ref().unwrap()
         });
-        Some(array.try_eval_predicate(predicate, selection).await)
+        array.try_eval_predicate(predicate, selection).await
     }
 
-    fn eval_predicate_on_array(&self, array: ArrayRef, predicate: &LiquidExpr) -> BooleanArray {
+    /// `None` when the cached array cannot answer the predicate. See the
+    /// free function of the same name in `liquid_array`.
+    fn eval_predicate_on_array(
+        &self,
+        array: ArrayRef,
+        predicate: &LiquidExpr,
+    ) -> Option<BooleanArray> {
         let schema = Arc::new(Schema::new(vec![Field::new(
             "liquid_predicate_col",
             array.data_type().clone(),
             true,
         )]));
-        let record_batch =
-            RecordBatch::try_new(schema, vec![array]).expect("single-column predicate batch");
-        let result = predicate
-            .physical_expr()
-            .evaluate(&record_batch)
-            .expect("validated LiquidExpr must evaluate");
-        let boolean_array = result
-            .into_array(record_batch.num_rows())
-            .expect("predicate output must be an array");
-        boolean_array.as_boolean().clone()
+        let record_batch = RecordBatch::try_new(schema, vec![array]).ok()?;
+        let result = predicate.physical_expr().evaluate(&record_batch).ok()?;
+        let boolean_array = result.into_array(record_batch.num_rows()).ok()?;
+        Some(boolean_array.as_boolean().clone())
     }
 }
 
@@ -1218,7 +1246,10 @@ mod tests {
         let entry_id1: EntryID = EntryID::from(1);
         let array1 = create_test_array(100);
         let size1 = array1.memory_usage_bytes();
-        store.insert_inner(entry_id1, array1).await.unwrap();
+        store
+            .insert_inner(entry_id1, Some(0), array1)
+            .await
+            .unwrap();
 
         // Verify budget usage and data correctness
         assert_eq!(store.budget.memory_usage_bytes(), size1);
@@ -1231,13 +1262,19 @@ mod tests {
         let entry_id2: EntryID = EntryID::from(2);
         let array2 = create_test_array(200);
         let size2 = array2.memory_usage_bytes();
-        store.insert_inner(entry_id2, array2).await.unwrap();
+        store
+            .insert_inner(entry_id2, Some(0), array2)
+            .await
+            .unwrap();
 
         assert_eq!(store.budget.memory_usage_bytes(), size1 + size2);
 
         let array3 = create_test_array(150);
         let size3 = array3.memory_usage_bytes();
-        store.insert_inner(entry_id1, array3).await.unwrap();
+        store
+            .insert_inner(entry_id1, Some(0), array3)
+            .await
+            .unwrap();
 
         assert_eq!(store.budget.memory_usage_bytes(), size3 + size2);
         assert!(store.index().get(&EntryID::from(999)).is_none());
@@ -1256,6 +1293,7 @@ mod tests {
         store
             .insert_inner(
                 entry_id,
+                Some(0),
                 CacheEntry::memory_squeezed_liquid(squeezed.clone()),
             )
             .await
@@ -1263,7 +1301,7 @@ mod tests {
 
         let expr = Arc::new(CacheExpression::extract_date32(Date32Field::Year));
         let result = store
-            .get(&entry_id)
+            .get(&entry_id, 0)
             .with_expression_hint(expr)
             .read()
             .await
@@ -1294,7 +1332,7 @@ mod tests {
             let store = create_cache_store(8000, Box::new(advisor)).await; // Small budget to force advice
 
             store
-                .insert_inner(entry_id1, create_test_array(800))
+                .insert_inner(entry_id1, Some(0), create_test_array(800))
                 .await
                 .unwrap();
             match store.index().get(&entry_id1).unwrap().as_ref() {
@@ -1303,7 +1341,7 @@ mod tests {
             }
 
             store
-                .insert_inner(entry_id2, create_test_array(800))
+                .insert_inner(entry_id2, Some(0), create_test_array(800))
                 .await
                 .unwrap();
             match store.index().get(&entry_id1).unwrap().as_ref() {
@@ -1353,7 +1391,7 @@ mod tests {
                         let unique_id = thread_id * ops_per_thread + i;
                         let entry_id: EntryID = EntryID::from(unique_id);
                         let array = create_test_arrow_array(100);
-                        store.insert(entry_id, array).await.unwrap();
+                        store.insert(entry_id, 0, array).await.unwrap();
                     }
                 });
             }));
@@ -1387,8 +1425,14 @@ mod tests {
         // Insert two small batches
         let arr1: ArrayRef = Arc::new(Int32Array::from_iter_values(0..64));
         let arr2: ArrayRef = Arc::new(Int32Array::from_iter_values(0..128));
-        storage.insert(EntryID::from(1usize), arr1).await.unwrap();
-        storage.insert(EntryID::from(2usize), arr2).await.unwrap();
+        storage
+            .insert(EntryID::from(1usize), 0, arr1)
+            .await
+            .unwrap();
+        storage
+            .insert(EntryID::from(2usize), 0, arr2)
+            .await
+            .unwrap();
 
         // Stats after insert: 2 entries, memory usage > 0, disk usage == 0
         let s = storage.stats();
@@ -1412,14 +1456,14 @@ mod tests {
         let entry_id = EntryID::from(321usize);
         let array = create_test_arrow_array(8);
 
-        store.insert(entry_id, array.clone()).await.unwrap();
+        store.insert(entry_id, 0, array.clone()).await.unwrap();
         store.flush_all_to_disk().await.unwrap();
         {
             let entry = store.index().get(&entry_id).unwrap();
             assert!(matches!(entry.as_ref(), CacheEntry::DiskArrow { .. }));
         }
 
-        let result = store.get(&entry_id).await.expect("present");
+        let result = store.get(&entry_id, 0).await.expect("present");
         assert_eq!(result.as_ref(), array.as_ref());
         {
             let entry = store.index().get(&entry_id).unwrap();
@@ -1436,7 +1480,7 @@ mod tests {
         let liquid = transcode_liquid_inner(&arrow_array, &compressor).unwrap();
 
         store
-            .insert_inner(entry_id, CacheEntry::memory_liquid(liquid.clone()))
+            .insert_inner(entry_id, Some(0), CacheEntry::memory_liquid(liquid.clone()))
             .await
             .unwrap();
         store.flush_all_to_disk().await.unwrap();
@@ -1445,7 +1489,7 @@ mod tests {
             assert!(matches!(entry.as_ref(), CacheEntry::DiskLiquid { .. }));
         }
 
-        let result = store.get(&entry_id).await.expect("present");
+        let result = store.get(&entry_id, 0).await.expect("present");
         assert_eq!(result.as_ref(), arrow_array.as_ref());
         {
             let entry = store.index().get(&entry_id).unwrap();
@@ -1463,10 +1507,10 @@ mod tests {
             .await;
         let array: ArrayRef = Arc::new(Int32Array::from_iter_values(0..16));
 
-        let err = cache.insert(EntryID::from(900usize), array).await;
+        let err = cache.insert(EntryID::from(900usize), 0, array).await;
 
         assert_eq!(err, Err(CacheFull));
-        assert!(!cache.is_cached(&EntryID::from(900usize)));
+        assert!(!cache.is_cached(&EntryID::from(900usize), 0));
     }
 
     #[tokio::test]
@@ -1485,14 +1529,14 @@ mod tests {
 
         let first = EntryID::from(910usize);
         let second = EntryID::from(911usize);
-        cache.insert(first, first_array).await.unwrap();
+        cache.insert(first, 0, first_array).await.unwrap();
         cache.flush_all_to_disk().await.unwrap();
-        assert!(cache.is_cached(&first));
+        assert!(cache.is_cached(&first, 0));
 
-        cache.insert(second, second_array).await.unwrap();
+        cache.insert(second, 0, second_array).await.unwrap();
         cache.flush_all_to_disk().await.unwrap();
 
-        assert!(!cache.is_cached(&first));
+        assert!(!cache.is_cached(&first, 0));
         assert!(matches!(
             cache.index().get(&second).unwrap().as_ref(),
             CacheEntry::DiskArrow { .. }
@@ -1513,13 +1557,13 @@ mod tests {
             .await;
         let first = EntryID::from(912usize);
         let second = EntryID::from(913usize);
-        cache.insert(first, first_array).await.unwrap();
+        cache.insert(first, 0, first_array).await.unwrap();
         cache.flush_all_to_disk().await.unwrap();
-        cache.insert(second, second_array).await.unwrap();
+        cache.insert(second, 0, second_array).await.unwrap();
 
         cache.flush_all_to_disk().await.unwrap();
 
-        assert!(!cache.is_cached(&first) || !cache.is_cached(&second));
+        assert!(!cache.is_cached(&first, 0) || !cache.is_cached(&second, 0));
     }
 
     #[tokio::test]
@@ -1534,14 +1578,14 @@ mod tests {
             .build()
             .await;
         let entry = EntryID::from(914usize);
-        cache.insert(entry, array).await.unwrap();
+        cache.insert(entry, 0, array).await.unwrap();
         cache.flush_all_to_disk().await.unwrap();
         let before = cache.stats().disk_usage_bytes;
 
         cache.remove_disk_entry(entry).await;
 
         assert_eq!(cache.stats().disk_usage_bytes, before - disk_bytes);
-        assert!(!cache.is_cached(&entry));
+        assert!(!cache.is_cached(&entry, 0));
     }
 
     #[tokio::test]
@@ -1554,12 +1598,12 @@ mod tests {
             .await;
         let entry_id = EntryID::from(901usize);
         let array: ArrayRef = Arc::new(Int32Array::from_iter_values(0..16));
-        cache.insert(entry_id, array).await.unwrap();
+        cache.insert(entry_id, 0, array).await.unwrap();
 
         let result = cache.flush_all_to_disk().await;
 
         assert_eq!(result, Ok(()));
-        assert!(!cache.is_cached(&entry_id));
+        assert!(!cache.is_cached(&entry_id, 0));
     }
 
     async fn hydrating_cache() -> Arc<LiquidCache> {
@@ -1594,15 +1638,15 @@ mod tests {
         let v1: ArrayRef = Arc::new(Int32Array::from_iter_values(0..16));
         let v2: ArrayRef = Arc::new(Int32Array::from_iter_values(100..164));
 
-        cache.insert(id, v1).await.unwrap();
+        cache.insert(id, 0, v1).await.unwrap();
         let v1_disk_bytes = demote_to_disk(&cache, id).await;
         assert_eq!(cache.budget().disk_usage_bytes(), v1_disk_bytes);
 
-        cache.insert(id, v2.clone()).await.unwrap();
+        cache.insert(id, 0, v2.clone()).await.unwrap();
         let disk_after_overwrite = cache.budget().disk_usage_bytes();
 
         let v2_disk_bytes = demote_to_disk(&cache, id).await;
-        let read = cache.get(&id).await.expect("present");
+        let read = cache.get(&id, 0).await.expect("present");
         assert_eq!(read.as_ref(), v2.as_ref(), "read back the superseded value");
         assert_eq!(
             disk_after_overwrite, 0,
@@ -1621,9 +1665,9 @@ mod tests {
         let v1: ArrayRef = Arc::new(Int32Array::from_iter_values(0..16));
         let v2: ArrayRef = Arc::new(Int32Array::from_iter_values(100..164));
 
-        cache.insert(id, v1.clone()).await.unwrap();
+        cache.insert(id, 0, v1.clone()).await.unwrap();
         let v1_disk_bytes = demote_to_disk(&cache, id).await;
-        let read = cache.get(&id).await.expect("present");
+        let read = cache.get(&id, 0).await.expect("present");
         assert_eq!(read.as_ref(), v1.as_ref());
         assert!(matches!(
             cache.index().get(&id).unwrap().as_ref(),
@@ -1631,11 +1675,11 @@ mod tests {
         ));
         assert_eq!(cache.budget().disk_usage_bytes(), v1_disk_bytes);
 
-        cache.insert(id, v2.clone()).await.unwrap();
+        cache.insert(id, 0, v2.clone()).await.unwrap();
         let disk_after_overwrite = cache.budget().disk_usage_bytes();
 
         let v2_disk_bytes = demote_to_disk(&cache, id).await;
-        let read = cache.get(&id).await.expect("present");
+        let read = cache.get(&id, 0).await.expect("present");
         assert_eq!(read.as_ref(), v2.as_ref(), "read back the superseded value");
         assert_eq!(disk_after_overwrite, 0);
         assert_eq!(cache.budget().disk_usage_bytes(), v2_disk_bytes);
@@ -1651,13 +1695,13 @@ mod tests {
         let id = EntryID::from(922usize);
         let array: ArrayRef = Arc::new(Int32Array::from_iter_values(0..64));
 
-        cache.insert(id, array.clone()).await.unwrap();
+        cache.insert(id, 0, array.clone()).await.unwrap();
         cache.flush_all_to_disk().await.unwrap();
         assert!(matches!(
             cache.index().get(&id).unwrap().as_ref(),
             CacheEntry::DiskArrow { .. }
         ));
-        let read = cache.get(&id).await.expect("present");
+        let read = cache.get(&id, 0).await.expect("present");
         assert_eq!(read.as_ref(), array.as_ref());
         assert!(matches!(
             cache.index().get(&id).unwrap().as_ref(),
@@ -1666,7 +1710,7 @@ mod tests {
 
         let disk_bytes = demote_to_disk(&cache, id).await;
         assert_eq!(cache.budget().disk_usage_bytes(), disk_bytes);
-        let read = cache.get(&id).await.expect("present");
+        let read = cache.get(&id, 0).await.expect("present");
         assert_eq!(read.as_ref(), array.as_ref());
     }
 
@@ -1686,7 +1730,7 @@ mod tests {
         let expr = Arc::new(CacheExpression::extract_date32(Date32Field::Year));
 
         cache
-            .insert(id, dates.clone())
+            .insert(id, 0, dates.clone())
             .with_squeeze_hint(expr.clone())
             .await
             .unwrap();
@@ -1702,7 +1746,7 @@ mod tests {
         // Drain the IO counters so the count below covers only the re-eviction.
         let _ = cache.observer().runtime_snapshot();
 
-        let read = cache.get(&id).await.expect("present");
+        let read = cache.get(&id, 0).await.expect("present");
         assert_eq!(read.as_ref(), dates.as_ref());
         assert!(matches!(
             cache.index().get(&id).unwrap().as_ref(),
@@ -1725,7 +1769,7 @@ mod tests {
         assert_eq!(cache.budget().disk_usage_bytes(), disk_bytes);
 
         let years = cache
-            .get(&id)
+            .get(&id, 0)
             .with_expression_hint(expr)
             .read()
             .await
@@ -1766,7 +1810,7 @@ mod tests {
             let expr = expr.clone();
             async move {
                 cache
-                    .insert(id, dates)
+                    .insert(id, 0, dates)
                     .with_squeeze_hint(expr)
                     .await
                     .unwrap();
@@ -1797,11 +1841,11 @@ mod tests {
 
         // Too big for memory, and the disk tier is full with no victims.
         let too_big: ArrayRef = Arc::new(Int32Array::from_iter_values(0..(1 << 16)));
-        let result = cache.insert(id, too_big).await;
+        let result = cache.insert(id, 0, too_big).await;
         assert_eq!(result, Err(CacheFull));
 
-        assert!(!cache.is_cached(&id));
-        assert!(cache.get(&id).await.is_none());
+        assert!(!cache.is_cached(&id, 0));
+        assert!(cache.get(&id, 0).await.is_none());
         assert_eq!(cache.budget().disk_usage_bytes(), 0);
         assert_eq!(cache.budget().memory_usage_bytes(), 0);
     }
@@ -1823,9 +1867,9 @@ mod tests {
             .await;
         let id = EntryID::from(925usize);
 
-        cache.insert(id, array.clone()).await.unwrap();
+        cache.insert(id, 0, array.clone()).await.unwrap();
         cache.flush_all_to_disk().await.unwrap();
-        let read = cache.get(&id).await.expect("present");
+        let read = cache.get(&id, 0).await.expect("present");
         assert_eq!(read.as_ref(), array.as_ref());
         assert!(matches!(
             cache.index().get(&id).unwrap().as_ref(),
@@ -1837,7 +1881,7 @@ mod tests {
         // that is full with the entry's own copy, so the entry is dropped.
         cache.flush_all_to_disk().await.unwrap();
 
-        assert!(!cache.is_cached(&id));
+        assert!(!cache.is_cached(&id, 0));
         assert_eq!(
             cache.budget().disk_usage_bytes(),
             0,

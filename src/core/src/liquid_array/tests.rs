@@ -185,8 +185,9 @@ mod byte_view_tests {
         let expr: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(col, Operator::Eq, lit));
 
         let liquid = make_byte_view(&input);
-        let result =
-            liquid.try_eval_predicate(&crate::cache::LiquidExpr::new_unchecked(expr), &mask);
+        let result = liquid
+            .try_eval_predicate(&crate::cache::LiquidExpr::new_unchecked(expr), &mask)
+            .expect("predicate must evaluate in this test");
         let expected = BooleanArray::from(vec![
             Some(true),
             None,

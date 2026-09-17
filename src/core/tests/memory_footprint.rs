@@ -168,7 +168,7 @@ async fn heap_footprint_tracks_budget_for_oversized_working_set() {
     // column batch as arrow, dropping the caller's copy right after.
     for i in 0..ENTRIES {
         let arr = make_entry(i as u64, ROWS);
-        cache.insert(EntryID::from(i), arr).await.unwrap();
+        cache.insert(EntryID::from(i), 0, arr).await.unwrap();
     }
     report(&cache, "after fill", baseline);
     let idle_after_fill = live() - baseline;
@@ -189,7 +189,7 @@ async fn heap_footprint_tracks_budget_for_oversized_working_set() {
     reset_peak();
     for _pass in 0..2 {
         for i in 0..ENTRIES {
-            let arr = cache.get(&EntryID::from(i)).await.unwrap();
+            let arr = cache.get(&EntryID::from(i), 0).await.unwrap();
             assert_eq!(arr.len(), ROWS);
             drop(arr);
         }

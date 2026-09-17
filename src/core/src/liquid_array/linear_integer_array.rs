@@ -351,7 +351,11 @@ where
         filter::filter(&arr, &selection).unwrap()
     }
 
-    fn try_eval_predicate(&self, predicate: &LiquidExpr, filter: &BooleanBuffer) -> BooleanArray {
+    fn try_eval_predicate(
+        &self,
+        predicate: &LiquidExpr,
+        filter: &BooleanBuffer,
+    ) -> Option<BooleanArray> {
         let arr = self.filter(filter);
         eval_predicate_on_array(arr, predicate)
     }

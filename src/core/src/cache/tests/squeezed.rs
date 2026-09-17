@@ -41,7 +41,7 @@ async fn read_squeezed_date_time() {
     for i in 0..4 {
         let entry_id = EntryID::from(i);
         cache
-            .insert(entry_id, array.clone())
+            .insert(entry_id, 0, array.clone())
             .with_squeeze_hint(expression.clone())
             .await
             .unwrap();
@@ -50,14 +50,14 @@ async fn read_squeezed_date_time() {
     for i in 0..4 {
         let entry_id = EntryID::from(i);
         let array = cache
-            .get(&entry_id)
+            .get(&entry_id, 0)
             .with_expression_hint(expression.clone())
             .await
             .unwrap();
         assert_eq!(array.len(), array.len());
     }
     cache
-        .get(&EntryID::from(1))
+        .get(&EntryID::from(1), 0)
         .with_expression_hint(Arc::new(CacheExpression::extract_date32(
             Date32Field::Month,
         )))
@@ -111,14 +111,14 @@ async fn read_squeezed_variant_path() {
     for i in 0..3 {
         let entry_id = EntryID::from(i);
         cache
-            .insert(entry_id, variant_array.clone())
+            .insert(entry_id, 0, variant_array.clone())
             .with_squeeze_hint(name_expr.clone())
             .await
             .unwrap();
     }
 
     let squeezed = cache
-        .get(&EntryID::from(0))
+        .get(&EntryID::from(0), 0)
         .with_expression_hint(name_expr.clone())
         .read()
         .await
@@ -126,13 +126,13 @@ async fn read_squeezed_variant_path() {
     assert_eq!(squeezed.len(), variant_array.len());
 
     cache
-        .get(&EntryID::from(0))
+        .get(&EntryID::from(0), 0)
         .with_expression_hint(age_expr.clone())
         .read()
         .await
         .unwrap();
     cache
-        .get(&EntryID::from(1))
+        .get(&EntryID::from(1), 0)
         .with_expression_hint(zipcode_expr.clone())
         .read()
         .await
@@ -171,19 +171,22 @@ async fn read_squeezed_int64_array() {
         let entry_id = EntryID::from(i);
         if i % 2 == 0 {
             cache
-                .insert(entry_id, int64_array.clone())
+                .insert(entry_id, 0, int64_array.clone())
                 .with_squeeze_hint(expression.clone())
                 .await
                 .unwrap();
         } else {
-            cache.insert(entry_id, int64_array.clone()).await.unwrap();
+            cache
+                .insert(entry_id, 0, int64_array.clone())
+                .await
+                .unwrap();
         }
     }
 
     for i in 0..4 {
         let entry_id = EntryID::from(i);
         let array = cache
-            .get(&entry_id)
+            .get(&entry_id, 0)
             .with_expression_hint(expression.clone())
             .read()
             .await
