@@ -139,6 +139,13 @@ jobs:
               run: |
                   cd src/core
                   cargo test --features "shuttle" --release -- --test-threads=1 shuttle
+            # The parquet cache keeps its own concurrent state — the file id
+            # pool — in this package, and it has its own `shuttle` feature.
+            # Without this step the model checker never sees it.
+            - name: Run shuttle test (datafusion)
+              run: |
+                  cd src/datafusion
+                  cargo test --features "shuttle" --release -- --test-threads=1 shuttle
 
     address_san:
         name: Address Sanitizer

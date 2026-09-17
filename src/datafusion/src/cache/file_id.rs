@@ -131,14 +131,26 @@ impl FileIdPool {
         if let Some(existing) = inner.leases.get(path).and_then(Weak::upgrade) {
             return existing;
         }
-        let (id, reusable_identity) = match inner.free.pop_front() {
-            Some(released) if released.path == path => (released.id, Some(released.identity)),
-            Some(released) => (released.id, None),
-            None => {
-                let id = inner.next;
-                inner.next += 1;
-                (id, None)
+        // Prefer this path's own released record, wherever it sits in the
+        // queue. Matching only the front would restore an identity just when
+        // release order happens to match acquire order — release order is
+        // stream completion order and acquire order is partition open order,
+        // so for any scan over more than one file they diverge and every
+        // re-read would orphan the entries it cached last time.
+        let mine = inner.free.iter().position(|r| r.path == path);
+        let (id, reusable_identity) = match mine {
+            Some(at) => {
+                let released = inner.free.remove(at).expect("index came from the queue");
+                (released.id, Some(released.identity))
             }
+            None => match inner.free.pop_front() {
+                Some(released) => (released.id, None),
+                None => {
+                    let id = inner.next;
+                    inner.next += 1;
+                    (id, None)
+                }
+            },
         };
         if id > u16::MAX as u64 {
             self.over_key_width.fetch_add(1, Ordering::Relaxed);
@@ -214,6 +226,38 @@ impl FileIdPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A file re-opened after other files have come and gone must still find
+    /// its own record. Release order is stream completion order and acquire
+    /// order is partition open order, so the two rarely line up; matching only
+    /// the front of the queue would hand a re-read a fresh identity and orphan
+    /// everything it cached before.
+    #[test]
+    fn a_reopened_path_finds_its_record_anywhere_in_the_queue() {
+        let pool = FileIdPool::new();
+
+        let a = pool.acquire("a.parquet");
+        let b = pool.acquire("b.parquet");
+        let (a_id, a_identity) = (a.get(), a.identity());
+        let (b_id, b_identity) = (b.get(), b.identity());
+
+        // Released a-then-b, so b's record sits behind a's.
+        drop(a);
+        drop(b);
+
+        // Re-open b first: the queue front is a's record, not b's.
+        let b_again = pool.acquire("b.parquet");
+        assert_eq!(b_again.get(), b_id, "b should get its own id back");
+        assert_eq!(
+            b_again.identity(),
+            b_identity,
+            "b should keep its identity, or its cached entries are orphaned"
+        );
+
+        let a_again = pool.acquire("a.parquet");
+        assert_eq!(a_again.get(), a_id);
+        assert_eq!(a_again.identity(), a_identity);
+    }
 
     /// Two leases alive at the same time must never share an id, and never
     /// share an identity. That is the property the whole scheme rests on:
