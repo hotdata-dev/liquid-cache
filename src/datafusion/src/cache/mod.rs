@@ -561,6 +561,21 @@ mod tests {
                 .is_none(),
             "inheriting an id must not inherit the entries keyed from it"
         );
+
+        // It must also be able to cache. The predecessor's entries are keyed
+        // where this file's belong and nobody can read them any more, so they
+        // give way — otherwise a cache under its budget, where nothing is ever
+        // evicted, would leave this file permanently uncacheable.
+        let second_data: ArrayRef = Arc::new(Int32Array::from(vec![9, 9, 9, 9, 9, 9, 9, 9]));
+        column
+            .insert(batch_id, Arc::clone(&second_data))
+            .await
+            .expect("the inheriting file must be able to cache");
+        let got = column
+            .get_arrow_array_with_filter(batch_id, &filter)
+            .await
+            .expect("the new owner reads back its own rows");
+        assert_eq!(got.as_ref(), second_data.as_ref());
     }
 
     /// What part of the fix is actually for: a process that reads far more

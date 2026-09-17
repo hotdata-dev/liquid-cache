@@ -124,9 +124,13 @@ impl ArtIndex {
     /// Store `batch` under `entry_id`, returning whether it was stored.
     ///
     /// `identity` is `Some` for a caller-originated insert, naming whose data
-    /// this is. A key already held by a *different* identity is refused rather
-    /// than overwritten, so two sources colliding on one key do not evict each
-    /// other's data back and forth; the loser reads from its own source.
+    /// this is. A key held by a *different* identity is overwritten and the
+    /// collision counted. Refusing instead would be worse: whoever owns the
+    /// key now cannot read the incumbent's entry either, so refusing leaves
+    /// the key occupied by data nobody can use, and on a cache below its
+    /// budget nothing evicts it — the new owner would never cache that key
+    /// again. Overwriting costs the incumbent its entry, which it could not
+    /// have read anyway.
     ///
     /// `identity` is `None` for maintenance that rewrites a key in place —
     /// transcode, squeeze, hydrate, spill to disk — which keeps the identity
@@ -142,11 +146,13 @@ impl ArtIndex {
         let guard = self.art.pin();
         let existing_identity = self.art.get(*entry_id, &guard).map(|slot| slot.identity);
         let identity = match (identity, existing_identity) {
-            (Some(new), Some(old)) if new != old => {
-                self.identity_mismatches.fetch_add(1, Ordering::Relaxed);
-                return false;
+            (Some(new), Some(old)) => {
+                if new != old {
+                    self.identity_mismatches.fetch_add(1, Ordering::Relaxed);
+                }
+                new
             }
-            (Some(new), _) => new,
+            (Some(new), None) => new,
             (None, Some(old)) => old,
             (None, None) => return false,
         };
@@ -308,12 +314,16 @@ mod tests {
         // The owner still reads its own entry.
         assert!(store.get_checked(&key, 1).is_some());
 
-        // And the colliding file cannot displace it by writing over the key,
-        // so the two do not take turns evicting each other.
-        assert!(!store.insert(&key, Some(2), create_test_array(200)));
-        match store.get_checked(&key, 1).unwrap().as_ref() {
-            CacheEntry::MemoryArrow(array) => assert_eq!(array.len(), 100),
-            other => panic!("expected the owner's array, found {other}"),
+        // The colliding file takes the key over. It has to: it cannot read
+        // what is there, so leaving it would cost the key to both of them.
+        assert!(store.insert(&key, Some(2), create_test_array(200)));
+        assert!(
+            store.get_checked(&key, 1).is_none(),
+            "the displaced file reads a miss, never the other file's rows"
+        );
+        match store.get_checked(&key, 2).unwrap().as_ref() {
+            CacheEntry::MemoryArrow(array) => assert_eq!(array.len(), 200),
+            other => panic!("expected the new owner's array, found {other}"),
         }
     }
 

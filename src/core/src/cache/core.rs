@@ -599,9 +599,13 @@ impl LiquidCache {
             }
             let batch_type = CachedBatchType::from(&to_insert);
             if !self.index.insert(&entry_id, identity, to_insert) {
-                self.budget
-                    .try_update_memory_usage(new_memory_size, old_memory_size)
-                    .expect("memory release cannot fail");
+                // Restoring the reservation *grows* it again when the entry we
+                // were replacing was larger, so this can legitimately fail on
+                // a full cache. Nothing is stored either way; the budget is
+                // left under-counted rather than the process brought down.
+                let _ = self
+                    .budget
+                    .try_update_memory_usage(new_memory_size, old_memory_size);
                 return Ok(());
             }
             batch_type
