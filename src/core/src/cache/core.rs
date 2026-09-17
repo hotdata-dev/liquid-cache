@@ -307,7 +307,12 @@ impl LiquidCache {
                     let bytes = arrow_to_bytes(array).expect("failed to convert arrow to bytes");
                     let disk_bytes = bytes.len();
                     match self
-                        .write_batch_to_disk(entry_id, flush_identity, &batch, bytes)
+                        .write_batch_to_disk(
+                            entry_id,
+                            WriteIdentity::Rewrite(flush_identity),
+                            &batch,
+                            bytes,
+                        )
                         .await
                     {
                         Ok(()) => {
@@ -345,7 +350,7 @@ impl LiquidCache {
                     match self
                         .write_batch_to_disk(
                             entry_id,
-                            flush_identity,
+                            WriteIdentity::Rewrite(flush_identity),
                             &batch,
                             Bytes::from(liquid_bytes),
                         )
@@ -382,7 +387,7 @@ impl LiquidCache {
     async fn write_in_memory_batch_to_disk(
         &self,
         entry_id: EntryID,
-        identity: u64,
+        identity: WriteIdentity,
         batch: CacheEntry,
     ) -> Result<CacheEntry, CacheFull> {
         match &batch {
@@ -390,7 +395,7 @@ impl LiquidCache {
                 let squeeze_io: Arc<dyn SqueezeIoHandler> = Arc::new(DefaultSqueezeIo::new(
                     self.store.clone(),
                     entry_id,
-                    identity,
+                    identity.value(),
                     self.observer.clone(),
                 ));
                 let outcome = self.squeeze_policy.squeeze(
@@ -418,7 +423,7 @@ impl LiquidCache {
                     kind: DiskKind::Liquid,
                     bytes,
                     ..
-                }) = self.disk_copy(&entry_id, identity)
+                }) = self.disk_copy(&entry_id, identity.value())
                 {
                     return Ok(CacheEntry::disk_liquid(data_type, bytes));
                 }
@@ -465,7 +470,7 @@ impl LiquidCache {
                 // this can happen if the entry to be inserted is too large, in that case,
                 // we write it to disk
                 let on_disk_batch = self
-                    .write_in_memory_batch_to_disk(entry_id, identity.value(), not_inserted)
+                    .write_in_memory_batch_to_disk(entry_id, identity, not_inserted)
                     .await?;
                 batch_to_cache = on_disk_batch;
                 continue;
@@ -809,7 +814,7 @@ impl LiquidCache {
                     if let Some(bytes_to_write) = bytes_to_write {
                         self.write_batch_to_disk(
                             to_squeeze,
-                            squeezed_identity,
+                            WriteIdentity::Rewrite(squeezed_identity),
                             &new_batch,
                             bytes_to_write,
                         )
@@ -1079,7 +1084,7 @@ impl LiquidCache {
     async fn write_batch_to_disk(
         &self,
         entry_id: EntryID,
-        identity: u64,
+        identity: WriteIdentity,
         batch: &CacheEntry,
         bytes: Bytes,
     ) -> Result<(), CacheFull> {
@@ -1101,15 +1106,24 @@ impl LiquidCache {
             kind: CachedBatchType::from(batch),
             bytes: len,
         });
-        // Whoever the index says owns this key is the only writer whose bytes
-        // can still be read. A write built before a takeover is stale: writing
-        // it would leave an object nothing reaches, and superseding on its
-        // behalf below would delete the live owner's. Drop it instead.
-        if let Some((current, _)) = self.index.get_with_identity(&entry_id)
-            && current != identity
+        // A *rewrite* replays an entry read earlier, so a takeover in the
+        // meantime makes it stale: its object would be unreachable, and
+        // superseding on its behalf below would delete the live owner's. Drop
+        // it, and hand back the reservation taken above — nothing records
+        // those bytes, so nothing would ever release them.
+        //
+        // An *owned* write is the caller taking the key, and the index has not
+        // caught up yet by construction. Dropping it would leave the caller's
+        // own index entry pointing at bytes that were never written, and the
+        // next read of it panics.
+        if let WriteIdentity::Rewrite(rewriting) = identity
+            && let Some((current, _)) = self.index.get_with_identity(&entry_id)
+            && current != rewriting
         {
+            self.budget.release_disk(len);
             return Ok(());
         }
+        let identity = identity.value();
         self.store
             .put(entry_id_to_key(&entry_id, identity), bytes.to_vec())
             .await
@@ -1623,6 +1637,82 @@ mod tests {
         }
     }
 
+    /// An owned write is the caller taking the key, and the index has not
+    /// caught up yet by construction — the write happens first, the index
+    /// entry second. Dropping it as "stale" would leave the caller's own entry
+    /// pointing at bytes that were never written, and the next read panics.
+    #[tokio::test]
+    async fn an_owned_write_is_not_dropped_because_the_index_lags() {
+        let store = create_cache_store(1024 * 1024, Box::new(LiquidPolicy::new())).await;
+        let entry_id = EntryID::from(51usize);
+
+        // Identity 1 holds the key.
+        store
+            .insert_inner(entry_id, WriteIdentity::Owned(1), create_test_array(100))
+            .await
+            .unwrap();
+
+        // Identity 2 takes it over. Its bytes land before its index entry
+        // does, so the index still names 1 at write time.
+        let taking_over = create_test_array(200);
+        let CacheEntry::MemoryArrow(array) = &taking_over else {
+            unreachable!("create_test_array builds an arrow entry")
+        };
+        let bytes = arrow_to_bytes(array).unwrap();
+        store
+            .write_batch_to_disk(entry_id, WriteIdentity::Owned(2), &taking_over, bytes)
+            .await
+            .unwrap();
+
+        // The bytes must actually be there, or the entry installed next reads
+        // a missing object.
+        let read_back = store.read_disk_arrow_array(&entry_id, 2).await;
+        assert_eq!(
+            read_back.len(),
+            200,
+            "an owned write was dropped, so its entry would point at nothing"
+        );
+    }
+
+    /// A dropped write must hand back the disk it reserved. Nothing records
+    /// those bytes — no `DiskCopy` names them — so no later path would ever
+    /// release them, and repeated takeovers during squeezes would walk the
+    /// disk tally up to its limit while holding nothing.
+    #[tokio::test]
+    async fn a_dropped_stale_write_releases_its_reservation() {
+        let store = create_cache_store(1024 * 1024, Box::new(LiquidPolicy::new())).await;
+        let entry_id = EntryID::from(41usize);
+
+        // Identity 2 owns the key.
+        store
+            .insert_inner(entry_id, WriteIdentity::Owned(2), create_test_array(100))
+            .await
+            .unwrap();
+        let disk_before = store.budget.disk_usage_bytes();
+
+        // A rewrite for an identity that has since lost the key is dropped.
+        let stale_entry = create_test_array(50);
+        let CacheEntry::MemoryArrow(stale_array) = &stale_entry else {
+            unreachable!("create_test_array builds an arrow entry")
+        };
+        let stale_bytes = arrow_to_bytes(stale_array).unwrap();
+        store
+            .write_batch_to_disk(
+                entry_id,
+                WriteIdentity::Rewrite(1),
+                &stale_entry,
+                stale_bytes,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.budget.disk_usage_bytes(),
+            disk_before,
+            "a dropped write must not keep the disk it reserved"
+        );
+    }
+
     /// Taking a key over must not strand the previous owner's object.
     ///
     /// Once the identity is part of the store key, a new owner's write lands
@@ -1694,7 +1784,12 @@ mod tests {
         };
         let stale_bytes = arrow_to_bytes(stale_array).unwrap();
         store
-            .write_batch_to_disk(entry_id, 1, &stale_entry, stale_bytes)
+            .write_batch_to_disk(
+                entry_id,
+                WriteIdentity::Rewrite(1),
+                &stale_entry,
+                stale_bytes,
+            )
             .await
             .unwrap();
 
