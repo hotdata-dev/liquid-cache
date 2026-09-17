@@ -103,7 +103,7 @@ fn make_entry(seed: u64, rows: usize) -> ArrayRef {
 
 fn indexed_bytes(cache: &LiquidCache) -> usize {
     let mut sum = 0;
-    cache.for_each_entry(|_, e| sum += e.memory_usage_bytes());
+    cache.for_each_entry(|_, _, e| sum += e.memory_usage_bytes());
     sum
 }
 
@@ -111,7 +111,7 @@ fn indexed_bytes(cache: &LiquidCache) -> usize {
 /// index rather than the budget, so the budget can be checked against it.
 fn indexed_disk_bytes(cache: &LiquidCache) -> usize {
     let mut sum = 0;
-    cache.for_each_entry(|_, e| {
+    cache.for_each_entry(|_, _, e| {
         sum += match e {
             CacheEntry::DiskLiquid { disk_bytes, .. }
             | CacheEntry::DiskArrow { disk_bytes, .. } => *disk_bytes,

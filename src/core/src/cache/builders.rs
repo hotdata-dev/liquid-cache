@@ -11,6 +11,7 @@ use super::core::LiquidCache;
 use super::io_context::{DefaultCacheMetadata, EntryMetadata};
 use super::policies::{CachePolicy, HydrationPolicy, SqueezePolicy, TranscodeSqueezeEvict};
 use super::{CacheExpression, CacheFull, EntryID, LiquidExpr, LiquidPolicy};
+use crate::cache::index::WriteIdentity;
 use crate::sync::Arc;
 
 /// Builder for [LiquidCache].
@@ -222,7 +223,7 @@ impl<'a> Insert<'a> {
         let batch = CacheEntry::memory_arrow(batch);
         self.storage.supersede_disk_copy(self.entry_id).await;
         self.storage
-            .insert_inner(self.entry_id, Some(self.identity), batch)
+            .insert_inner(self.entry_id, WriteIdentity::Owned(self.identity), batch)
             .await
     }
 }

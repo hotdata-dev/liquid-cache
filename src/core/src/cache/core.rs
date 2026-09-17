@@ -18,7 +18,11 @@ use super::{
 use crate::cache::DefaultSqueezeIo;
 use crate::cache::policies::{SqueezeOutcome, SqueezePolicy};
 use crate::cache::utils::{LiquidCompressorStates, arrow_to_bytes};
-use crate::cache::{CacheExpression, LiquidExpr, index::ArtIndex, utils::EntryID};
+use crate::cache::{
+    CacheExpression, LiquidExpr,
+    index::{ArtIndex, WriteIdentity},
+    utils::EntryID,
+};
 use crate::cache::{CacheFull, CacheStats, EventTrace};
 use crate::liquid_array::{
     LiquidSqueezedArrayRef, SqueezeIoHandler, SqueezedBacking, SqueezedDate32Array,
@@ -130,7 +134,7 @@ impl LiquidCache {
         let mut memory_liquid_bytes = 0usize;
         let mut memory_squeezed_liquid_bytes = 0usize;
 
-        self.index.for_each(|_, batch| match batch {
+        self.index.for_each(|_, _, batch| match batch {
             CacheEntry::MemoryArrow(array) => {
                 memory_arrow_entries += 1;
                 memory_arrow_bytes += array.get_array_memory_size();
@@ -212,8 +216,14 @@ impl LiquidCache {
             CacheEntry::MemoryLiquid(array) => Some(array.clone()),
             entry @ CacheEntry::DiskLiquid { .. } => {
                 let liquid = self.read_disk_liquid_array(entry_id).await;
-                self.maybe_hydrate(entry_id, entry, MaterializedEntry::Liquid(&liquid), None)
-                    .await;
+                self.maybe_hydrate(
+                    entry_id,
+                    identity,
+                    entry,
+                    MaterializedEntry::Liquid(&liquid),
+                    None,
+                )
+                .await;
                 Some(liquid)
             }
             CacheEntry::MemorySqueezedLiquid(array) => match array.disk_backing() {
@@ -230,7 +240,7 @@ impl LiquidCache {
     /// Iterate over all entries in the cache.
     /// No guarantees are made about the order of the entries.
     /// Isolation level: read-committed
-    pub fn for_each_entry(&self, mut f: impl FnMut(&EntryID, &CacheEntry)) {
+    pub fn for_each_entry(&self, mut f: impl FnMut(&EntryID, u64, &CacheEntry)) {
         self.index.for_each(&mut f);
     }
 
@@ -279,10 +289,10 @@ impl LiquidCache {
     /// Flush all entries to disk.
     pub async fn flush_all_to_disk(&self) -> Result<(), CacheFull> {
         let mut entires = Vec::new();
-        self.for_each_entry(|entry_id, batch| {
-            entires.push((*entry_id, batch.clone()));
+        self.for_each_entry(|entry_id, identity, batch| {
+            entires.push((*entry_id, identity, batch.clone()));
         });
-        for (entry_id, batch) in entires {
+        for (entry_id, flush_identity, batch) in entires {
             match &batch {
                 CacheEntry::MemoryArrow(array) => {
                     let bytes = arrow_to_bytes(array).expect("failed to convert arrow to bytes");
@@ -291,7 +301,7 @@ impl LiquidCache {
                         Ok(()) => {
                             self.try_insert(
                                 entry_id,
-                                None,
+                                WriteIdentity::Rewrite(flush_identity),
                                 CacheEntry::disk_arrow(array.data_type().clone(), disk_bytes),
                             )
                             .expect("failed to insert disk arrow entry");
@@ -309,8 +319,12 @@ impl LiquidCache {
                         // Hydrated from disk and never modified since: the
                         // bytes are already there, flip the index rather
                         // than re-serialising and rewriting them.
-                        self.try_insert(entry_id, None, CacheEntry::disk_liquid(data_type, bytes))
-                            .expect("failed to insert disk liquid entry");
+                        self.try_insert(
+                            entry_id,
+                            WriteIdentity::Rewrite(flush_identity),
+                            CacheEntry::disk_liquid(data_type, bytes),
+                        )
+                        .expect("failed to insert disk liquid entry");
                         continue;
                     }
                     let liquid_bytes = liquid_array.to_bytes();
@@ -322,7 +336,7 @@ impl LiquidCache {
                         Ok(()) => {
                             self.try_insert(
                                 entry_id,
-                                None,
+                                WriteIdentity::Rewrite(flush_identity),
                                 CacheEntry::disk_liquid(data_type, disk_bytes),
                             )
                             .expect("failed to insert disk liquid entry");
@@ -333,7 +347,7 @@ impl LiquidCache {
                 CacheEntry::MemorySqueezedLiquid(array) => {
                     // We don't have to do anything, because it's already on disk
                     let disk_entry = Self::disk_entry_from_squeezed(array);
-                    self.try_insert(entry_id, None, disk_entry)
+                    self.try_insert(entry_id, WriteIdentity::Rewrite(flush_identity), disk_entry)
                         .expect("failed to insert disk entry");
                 }
                 CacheEntry::DiskArrow { .. } | CacheEntry::DiskLiquid { .. } => {
@@ -412,7 +426,7 @@ impl LiquidCache {
     pub(crate) async fn insert_inner(
         &self,
         entry_id: EntryID,
-        identity: Option<u64>,
+        identity: WriteIdentity,
         mut batch_to_cache: CacheEntry,
     ) -> Result<(), CacheFull> {
         loop {
@@ -575,16 +589,14 @@ impl LiquidCache {
         }
     }
 
-    /// `identity` names whose data this is for a caller-originated insert, and
-    /// is `None` for maintenance rewriting a key in place — see
-    /// [`ArtIndex::insert`]. A declined write is not an error: the key belongs
-    /// to someone else, or the entry being rewritten has since been removed.
-    /// Neither is worth retrying, so the reservation is handed back and the
-    /// call reports success with nothing stored.
+    /// A declined write is not an error: the entry being rewritten has since
+    /// been taken over or removed. Neither is worth retrying, so the
+    /// reservation is handed back and the call reports success with nothing
+    /// stored. See [`WriteIdentity`].
     fn try_insert(
         &self,
         entry_id: EntryID,
-        identity: Option<u64>,
+        identity: WriteIdentity,
         to_insert: CacheEntry,
     ) -> Result<(), CacheEntry> {
         let new_memory_size = to_insert.memory_usage_bytes();
@@ -714,7 +726,9 @@ impl LiquidCache {
     }
 
     async fn squeeze_victim_inner(&self, to_squeeze: EntryID) -> Result<(), CacheFull> {
-        let Some(mut to_squeeze_batch) = self.index.get(&to_squeeze) else {
+        let Some((squeezed_identity, mut to_squeeze_batch)) =
+            self.index.get_with_identity(&to_squeeze)
+        else {
             return Ok(());
         };
         self.trace(InternalEvent::SqueezeVictim { entry: to_squeeze });
@@ -750,7 +764,11 @@ impl LiquidCache {
                         self.write_batch_to_disk(to_squeeze, &new_batch, bytes_to_write)
                             .await?;
                     }
-                    match self.try_insert(to_squeeze, None, new_batch) {
+                    match self.try_insert(
+                        to_squeeze,
+                        WriteIdentity::Rewrite(squeezed_identity),
+                        new_batch,
+                    ) {
                         Ok(()) => {
                             break;
                         }
@@ -779,6 +797,7 @@ impl LiquidCache {
     async fn maybe_hydrate(
         &self,
         entry_id: &EntryID,
+        identity: u64,
         cached: &CacheEntry,
         materialized: MaterializedEntry<'_>,
         expression: Option<&CacheExpression>,
@@ -798,7 +817,9 @@ impl LiquidCache {
                 cached: cached_type,
                 new: new_type,
             });
-            let _ = self.insert_inner(*entry_id, None, new_entry).await;
+            let _ = self
+                .insert_inner(*entry_id, WriteIdentity::Rewrite(identity), new_entry)
+                .await;
         }
     }
 
@@ -834,11 +855,11 @@ impl LiquidCache {
                 None => Some(array.to_arrow_array()),
             },
             CacheEntry::DiskArrow { .. } | CacheEntry::DiskLiquid { .. } => {
-                self.read_disk_array(batch.as_ref(), entry_id, expression, selection)
+                self.read_disk_array(batch.as_ref(), entry_id, identity, expression, selection)
                     .await
             }
             CacheEntry::MemorySqueezedLiquid(array) => {
-                self.read_squeezed_array(array, entry_id, expression, selection)
+                self.read_squeezed_array(array, entry_id, identity, expression, selection)
                     .await
             }
         }
@@ -848,6 +869,7 @@ impl LiquidCache {
         &self,
         entry: &CacheEntry,
         entry_id: &EntryID,
+        identity: u64,
         expression: Option<&CacheExpression>,
         selection: Option<&BooleanBuffer>,
     ) -> Option<ArrayRef> {
@@ -861,6 +883,7 @@ impl LiquidCache {
                 let full_array = self.read_disk_arrow_array(entry_id).await;
                 self.maybe_hydrate(
                     entry_id,
+                    identity,
                     entry,
                     MaterializedEntry::Arrow(&full_array),
                     expression,
@@ -883,6 +906,7 @@ impl LiquidCache {
                 let liquid = self.read_disk_liquid_array(entry_id).await;
                 self.maybe_hydrate(
                     entry_id,
+                    identity,
                     entry,
                     MaterializedEntry::Liquid(&liquid),
                     expression,
@@ -901,6 +925,7 @@ impl LiquidCache {
         &self,
         array: &LiquidSqueezedArrayRef,
         entry_id: &EntryID,
+        identity: u64,
         expression: Option<&CacheExpression>,
         selection: Option<&BooleanBuffer>,
     ) -> Option<ArrayRef> {
@@ -914,7 +939,7 @@ impl LiquidCache {
         }
 
         if let Some(array) = self
-            .try_read_squeezed_variant_array(array, entry_id, expression, selection)
+            .try_read_squeezed_variant_array(array, entry_id, identity, expression, selection)
             .await
         {
             self.observer.on_get_squeezed_success();
@@ -959,6 +984,7 @@ impl LiquidCache {
         &self,
         array: &LiquidSqueezedArrayRef,
         entry_id: &EntryID,
+        identity: u64,
         expression: Option<&CacheExpression>,
         selection: Option<&BooleanBuffer>,
     ) -> Option<ArrayRef> {
@@ -976,6 +1002,7 @@ impl LiquidCache {
             let full_array = self.read_disk_arrow_array(entry_id).await;
             self.maybe_hydrate(
                 entry_id,
+                identity,
                 &batch,
                 MaterializedEntry::Arrow(&full_array),
                 expression,
@@ -1122,8 +1149,14 @@ impl LiquidCache {
             }
             entry @ CacheEntry::DiskArrow { .. } => {
                 let array = self.read_disk_arrow_array(entry_id).await;
-                self.maybe_hydrate(entry_id, entry, MaterializedEntry::Arrow(&array), None)
-                    .await;
+                self.maybe_hydrate(
+                    entry_id,
+                    identity,
+                    entry,
+                    MaterializedEntry::Arrow(&array),
+                    None,
+                )
+                .await;
                 let mut owned = None;
                 let selection = selection_opt.unwrap_or_else(|| {
                     owned = Some(BooleanBuffer::new_set(array.len()));
@@ -1143,8 +1176,14 @@ impl LiquidCache {
             }
             entry @ CacheEntry::DiskLiquid { .. } => {
                 let liquid = self.read_disk_liquid_array(entry_id).await;
-                self.maybe_hydrate(entry_id, entry, MaterializedEntry::Liquid(&liquid), None)
-                    .await;
+                self.maybe_hydrate(
+                    entry_id,
+                    identity,
+                    entry,
+                    MaterializedEntry::Liquid(&liquid),
+                    None,
+                )
+                .await;
                 let mut owned = None;
                 let selection = selection_opt.unwrap_or_else(|| {
                     owned = Some(BooleanBuffer::new_set(liquid.len()));
@@ -1251,7 +1290,7 @@ mod tests {
         let array1 = create_test_array(100);
         let size1 = array1.memory_usage_bytes();
         store
-            .insert_inner(entry_id1, Some(0), array1)
+            .insert_inner(entry_id1, WriteIdentity::Owned(0), array1)
             .await
             .unwrap();
 
@@ -1267,7 +1306,7 @@ mod tests {
         let array2 = create_test_array(200);
         let size2 = array2.memory_usage_bytes();
         store
-            .insert_inner(entry_id2, Some(0), array2)
+            .insert_inner(entry_id2, WriteIdentity::Owned(0), array2)
             .await
             .unwrap();
 
@@ -1276,7 +1315,7 @@ mod tests {
         let array3 = create_test_array(150);
         let size3 = array3.memory_usage_bytes();
         store
-            .insert_inner(entry_id1, Some(0), array3)
+            .insert_inner(entry_id1, WriteIdentity::Owned(0), array3)
             .await
             .unwrap();
 
@@ -1297,7 +1336,7 @@ mod tests {
         store
             .insert_inner(
                 entry_id,
-                Some(0),
+                WriteIdentity::Owned(0),
                 CacheEntry::memory_squeezed_liquid(squeezed.clone()),
             )
             .await
@@ -1336,7 +1375,7 @@ mod tests {
             let store = create_cache_store(8000, Box::new(advisor)).await; // Small budget to force advice
 
             store
-                .insert_inner(entry_id1, Some(0), create_test_array(800))
+                .insert_inner(entry_id1, WriteIdentity::Owned(0), create_test_array(800))
                 .await
                 .unwrap();
             match store.index().get(&entry_id1).unwrap().as_ref() {
@@ -1345,7 +1384,7 @@ mod tests {
             }
 
             store
-                .insert_inner(entry_id2, Some(0), create_test_array(800))
+                .insert_inner(entry_id2, WriteIdentity::Owned(0), create_test_array(800))
                 .await
                 .unwrap();
             match store.index().get(&entry_id1).unwrap().as_ref() {
@@ -1484,7 +1523,11 @@ mod tests {
         let liquid = transcode_liquid_inner(&arrow_array, &compressor).unwrap();
 
         store
-            .insert_inner(entry_id, Some(0), CacheEntry::memory_liquid(liquid.clone()))
+            .insert_inner(
+                entry_id,
+                WriteIdentity::Owned(0),
+                CacheEntry::memory_liquid(liquid.clone()),
+            )
             .await
             .unwrap();
         store.flush_all_to_disk().await.unwrap();
