@@ -89,9 +89,9 @@ impl CachedColumn {
         self.column_path.entry_id(batch_id)
     }
 
-    /// The unnarrowed file id this column belongs to.
+    /// The never-reused name of the file this column belongs to.
     pub(crate) fn identity(&self) -> u64 {
-        self.file_id.get()
+        self.file_id.identity()
     }
 
     pub(crate) fn is_cached(&self, batch_id: BatchID) -> bool {

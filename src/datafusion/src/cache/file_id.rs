@@ -29,23 +29,41 @@ use ahash::AHashMap;
 use std::sync::{Arc, Mutex, Weak};
 
 /// A leased file id. The id returns to its pool when this is dropped.
+///
+/// Two numbers, because they answer different questions and only one of them
+/// can be recycled:
+///
+/// * `id` goes into the cache key, whose file field is 16 bits wide. It has to
+///   be recycled or a long-lived process runs out.
+/// * `identity` names *which file* an entry came from, and is never reused.
+///   It cannot be the recycled id: a file that inherits id 0 from a file that
+///   has finished would otherwise be indistinguishable from it, and would read
+///   the entries it left behind — the exact aliasing the identity exists to
+///   catch.
 #[derive(Debug)]
 pub(crate) struct FileId {
     id: u64,
+    identity: u64,
     path: String,
     pool: Arc<FileIdPool>,
 }
 
 impl FileId {
-    /// The id itself, as the cache key and the entry identity use it.
+    /// The narrow, recycled id the cache key is built from.
     pub(crate) fn get(&self) -> u64 {
         self.id
+    }
+
+    /// The wide, never-reused name for this file, recorded alongside every
+    /// entry so a recycled key cannot serve one file another's data.
+    pub(crate) fn identity(&self) -> u64 {
+        self.identity
     }
 }
 
 impl Drop for FileId {
     fn drop(&mut self) {
-        self.pool.release(&self.path, self.id);
+        self.pool.release(&self.path, self.id, self.identity);
     }
 }
 
@@ -69,8 +87,24 @@ struct PoolInner {
     /// just-released id is the one whose entries are most likely still
     /// resident, and reusing it last gives them the longest window to be
     /// evicted before anything keys over them.
-    free: VecDeque<u64>,
+    ///
+    /// Each carries the path that released it and the identity it had. If the
+    /// same path comes back it keeps that identity, so its cached entries are
+    /// still its own and still readable — a file read twice is a cache hit,
+    /// not a collision. Any other path gets a fresh identity, so it cannot
+    /// read what the previous holder left behind.
+    free: VecDeque<Released>,
     next: u64,
+    /// Only ever climbs. A `u64` of these is not a resource worth reclaiming:
+    /// at one a microsecond it outlasts the hardware.
+    next_identity: u64,
+}
+
+#[derive(Debug)]
+struct Released {
+    id: u64,
+    path: String,
+    identity: u64,
 }
 
 impl FileIdPool {
@@ -84,19 +118,29 @@ impl FileIdPool {
         if let Some(existing) = inner.leases.get(path).and_then(Weak::upgrade) {
             return existing;
         }
-        let id = match inner.free.pop_front() {
-            Some(id) => id,
+        let (id, reusable_identity) = match inner.free.pop_front() {
+            Some(released) if released.path == path => (released.id, Some(released.identity)),
+            Some(released) => (released.id, None),
             None => {
                 let id = inner.next;
                 inner.next += 1;
-                id
+                (id, None)
             }
         };
         if id > u16::MAX as u64 {
             self.over_key_width.fetch_add(1, Ordering::Relaxed);
         }
+        let identity = match reusable_identity {
+            Some(identity) => identity,
+            None => {
+                let identity = inner.next_identity;
+                inner.next_identity += 1;
+                identity
+            }
+        };
         let lease = Arc::new(FileId {
             id,
+            identity,
             path: path.to_string(),
             pool: Arc::clone(self),
         });
@@ -106,7 +150,7 @@ impl FileIdPool {
         lease
     }
 
-    fn release(&self, path: &str, id: u64) {
+    fn release(&self, path: &str, id: u64, self_identity: u64) {
         let Ok(mut inner) = self.inner.lock() else {
             // A poisoned pool means some other thread panicked holding it.
             // Losing one id is better than panicking again inside a drop.
@@ -122,7 +166,11 @@ impl FileIdPool {
         {
             inner.leases.remove(path);
         }
-        inner.free.push_back(id);
+        inner.free.push_back(Released {
+            id,
+            path: path.to_string(),
+            identity: self_identity,
+        });
     }
 
     /// Ids currently leased. Bounded by what is being read, which is what
@@ -194,6 +242,39 @@ mod tests {
         drop(second);
         let recycled = pool.acquire("c.parquet");
         assert_eq!(recycled.get(), 0);
+    }
+
+    /// The two numbers have to move independently. Reusing an id is how the
+    /// key space stays bounded; reusing an *identity* for a different file is
+    /// how one file reads another's entries. Re-opening the same path must
+    /// keep its identity, or every lease boundary silently empties the cache.
+    #[test]
+    fn identity_follows_the_path_while_the_id_is_recycled() {
+        let pool = FileIdPool::new();
+
+        let first = pool.acquire("a.parquet");
+        let (a_id, a_identity) = (first.get(), first.identity());
+        drop(first);
+
+        // Same file again: same id and the same name, so its cached entries
+        // are still its own.
+        let reopened = pool.acquire("a.parquet");
+        assert_eq!(reopened.get(), a_id);
+        assert_eq!(
+            reopened.identity(),
+            a_identity,
+            "re-opening a file must keep its identity, or its cache is dead"
+        );
+        drop(reopened);
+
+        // A different file inherits the id but must not inherit the name.
+        let other = pool.acquire("b.parquet");
+        assert_eq!(other.get(), a_id, "the id is recycled");
+        assert_ne!(
+            other.identity(),
+            a_identity,
+            "a different file must not be able to read what the last one left"
+        );
     }
 
     #[test]

@@ -504,6 +504,65 @@ mod tests {
         file.create_row_group(0, vec![])
     }
 
+    /// Recycling a file id must not recycle a file's *name*.
+    ///
+    /// The id is narrow and reused so the key space cannot run out. If the
+    /// identity recorded against each entry were that same id, the next file
+    /// to inherit it would be indistinguishable from the one that gave it
+    /// back, and would read the entries it left behind — reintroducing the
+    /// aliasing the identity exists to catch, at every lease boundary rather
+    /// than only past 65,536 files.
+    #[tokio::test]
+    async fn a_file_inheriting_a_recycled_id_does_not_read_its_predecessors_data() {
+        let batch_size = 8;
+        let schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let store = crate::test_utils::mount_test_store(tmp_dir.path()).await;
+        let cache = LiquidCacheParquet::new(
+            batch_size,
+            usize::MAX,
+            usize::MAX,
+            store,
+            Box::new(LiquidPolicy::new()),
+            Box::new(TranscodeSqueezeEvict),
+            Box::new(AlwaysHydrate::new()),
+        )
+        .await;
+
+        let batch_id = BatchID::from_row_id(0, batch_size);
+        let filter = BooleanBuffer::new_set(batch_size);
+        let first_data: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6, 7, 8]));
+
+        let first_id = {
+            let first =
+                cache.register_or_get_file("first.parquet".to_string(), Arc::clone(&schema));
+            let column = first.create_row_group(0, vec![]).get_column(0).unwrap();
+            column
+                .insert(batch_id, Arc::clone(&first_data))
+                .await
+                .unwrap();
+            first.file_id()
+        }; // lease dropped here, so the id goes back to the pool
+
+        let second = cache.register_or_get_file("second.parquet".to_string(), schema);
+        assert_eq!(
+            second.file_id(),
+            first_id,
+            "the id must actually be recycled, or this test proves nothing"
+        );
+
+        let column = second.create_row_group(0, vec![]).get_column(0).unwrap();
+        assert!(!column.is_cached(batch_id));
+        assert!(
+            column
+                .get_arrow_array_with_filter(batch_id, &filter)
+                .await
+                .is_none(),
+            "inheriting an id must not inherit the entries keyed from it"
+        );
+    }
+
     /// What part of the fix is actually for: a process that reads far more
     /// files than it holds open at once must not exhaust the key's 16-bit file
     /// field. Before ids were leased this counter only ever climbed, so a
