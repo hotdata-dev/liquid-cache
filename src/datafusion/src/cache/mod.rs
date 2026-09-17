@@ -152,7 +152,15 @@ impl CachedRowGroup {
                         }
                         Some(array) => array,
                     };
-                    let buffer = liquid_array.try_eval_predicate(&liquid_expr, selection)?;
+                    // Leave the loop rather than the function, as the two
+                    // arms above do: an array that cannot answer the predicate
+                    // does not mean the column is unreadable, and the arrow
+                    // fallback below may still serve it from the cache.
+                    let Some(buffer) = liquid_array.try_eval_predicate(&liquid_expr, selection)
+                    else {
+                        combined_buffer = None;
+                        break;
+                    };
 
                     combined_buffer = Some(match combined_buffer {
                         None => buffer,
