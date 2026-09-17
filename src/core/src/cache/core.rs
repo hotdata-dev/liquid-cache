@@ -1101,6 +1101,15 @@ impl LiquidCache {
             kind: CachedBatchType::from(batch),
             bytes: len,
         });
+        // Whoever the index says owns this key is the only writer whose bytes
+        // can still be read. A write built before a takeover is stale: writing
+        // it would leave an object nothing reaches, and superseding on its
+        // behalf below would delete the live owner's. Drop it instead.
+        if let Some((current, _)) = self.index.get_with_identity(&entry_id)
+            && current != identity
+        {
+            return Ok(());
+        }
         self.store
             .put(entry_id_to_key(&entry_id, identity), bytes.to_vec())
             .await
@@ -1124,8 +1133,22 @@ impl LiquidCache {
             },
         );
         if let Some(previous) = previous {
-            // The put replaced the object under this key, so the previous
-            // copy's reservation goes with it.
+            // Same owner: the put replaced that object, so its reservation
+            // goes with it and there is nothing left to delete.
+            //
+            // Different owner: this is the current owner superseding one that
+            // has let the key go (a stale writer never reaches here). The key
+            // carries the identity, so the put landed somewhere else and the
+            // previous object is still there — with no record naming it and
+            // nothing that would ever reach it. Releasing its reservation
+            // without removing it would leave disk held by a blob the budget
+            // has stopped counting.
+            if previous.identity != identity {
+                self.store
+                    .remove(&entry_id_to_key(&entry_id, previous.identity))
+                    .await
+                    .expect("disk remove failed");
+            }
             self.budget.release_disk(previous.bytes);
         }
         Ok(())
@@ -1598,6 +1621,48 @@ mod tests {
             let entry = store.index().get(&entry_id).unwrap();
             assert!(matches!(entry.as_ref(), CacheEntry::MemoryLiquid(_)));
         }
+    }
+
+    /// Taking a key over must not strand the previous owner's object.
+    ///
+    /// Once the identity is part of the store key, a new owner's write lands
+    /// somewhere else rather than on top — so the old object survives its own
+    /// record. Releasing its reservation without deleting it leaves disk held
+    /// by a blob nothing can reach and the budget has stopped counting.
+    #[tokio::test]
+    async fn taking_a_key_over_removes_the_previous_owner_s_object() {
+        let store = create_cache_store(1024 * 1024, Box::new(LiquidPolicy::new())).await;
+        let entry_id = EntryID::from(31usize);
+
+        store
+            .insert_inner(entry_id, WriteIdentity::Owned(1), create_test_array(100))
+            .await
+            .unwrap();
+        store.flush_all_to_disk().await.unwrap();
+        let disk_after_first = store.budget.disk_usage_bytes();
+        assert!(disk_after_first > 0, "the first owner spilled to disk");
+
+        // A different owner takes the key and spills too.
+        store
+            .insert_inner(entry_id, WriteIdentity::Owned(2), create_test_array(100))
+            .await
+            .unwrap();
+        store.flush_all_to_disk().await.unwrap();
+
+        // The first owner's object is gone, not merely unaccounted.
+        assert!(
+            store
+                .store
+                .get(&crate::cache::io_context::entry_id_to_key(&entry_id, 1))
+                .await
+                .is_err(),
+            "the previous owner's object outlived its record"
+        );
+        assert_eq!(
+            store.budget.disk_usage_bytes(),
+            disk_after_first,
+            "disk accounting should track one object, not two"
+        );
     }
 
     /// The store object has to be owned too, not just the record naming it.
