@@ -11,6 +11,7 @@ use super::core::LiquidCache;
 use super::io_context::{DefaultCacheMetadata, EntryMetadata};
 use super::policies::{CachePolicy, HydrationPolicy, SqueezePolicy, TranscodeSqueezeEvict};
 use super::{CacheExpression, CacheFull, EntryID, LiquidExpr, LiquidPolicy};
+use crate::cache::index::WriteIdentity;
 use crate::sync::Arc;
 
 /// Builder for [LiquidCache].
@@ -175,16 +176,23 @@ pub fn default_max_memory_bytes() -> usize {
 pub struct Insert<'a> {
     pub(super) storage: &'a Arc<LiquidCache>,
     pub(super) entry_id: EntryID,
+    pub(super) identity: u64,
     pub(super) batch: ArrayRef,
     pub(super) skip_gc: bool,
     pub(super) squeeze_hint: Option<Arc<CacheExpression>>,
 }
 
 impl<'a> Insert<'a> {
-    pub(super) fn new(storage: &'a Arc<LiquidCache>, entry_id: EntryID, batch: ArrayRef) -> Self {
+    pub(super) fn new(
+        storage: &'a Arc<LiquidCache>,
+        entry_id: EntryID,
+        identity: u64,
+        batch: ArrayRef,
+    ) -> Self {
         Self {
             storage,
             entry_id,
+            identity,
             batch,
             skip_gc: false,
             squeeze_hint: None,
@@ -214,7 +222,9 @@ impl<'a> Insert<'a> {
         }
         let batch = CacheEntry::memory_arrow(batch);
         self.storage.supersede_disk_copy(self.entry_id).await;
-        self.storage.insert_inner(self.entry_id, batch).await
+        self.storage
+            .insert_inner(self.entry_id, WriteIdentity::Owned(self.identity), batch)
+            .await
     }
 }
 
@@ -232,15 +242,17 @@ impl<'a> IntoFuture for Insert<'a> {
 pub struct Get<'a> {
     pub(super) storage: &'a LiquidCache,
     pub(super) entry_id: &'a EntryID,
+    pub(super) identity: u64,
     pub(super) selection: Option<&'a BooleanBuffer>,
     pub(super) expression_hint: Option<Arc<CacheExpression>>,
 }
 
 impl<'a> Get<'a> {
-    pub(super) fn new(storage: &'a LiquidCache, entry_id: &'a EntryID) -> Self {
+    pub(super) fn new(storage: &'a LiquidCache, entry_id: &'a EntryID, identity: u64) -> Self {
         Self {
             storage,
             entry_id,
+            identity,
             selection: None,
             expression_hint: None,
         }
@@ -273,6 +285,7 @@ impl<'a> Get<'a> {
         self.storage
             .read_arrow_array(
                 self.entry_id,
+                self.identity,
                 self.selection,
                 self.expression_hint.as_deref(),
             )
@@ -328,6 +341,7 @@ fn maybe_gc_view_arrays(array: &ArrayRef) -> Option<ArrayRef> {
 pub struct EvaluatePredicate<'a> {
     pub(super) storage: &'a LiquidCache,
     pub(super) entry_id: &'a EntryID,
+    pub(super) identity: u64,
     pub(super) predicate: &'a LiquidExpr,
     pub(super) selection: Option<&'a BooleanBuffer>,
 }
@@ -336,11 +350,13 @@ impl<'a> EvaluatePredicate<'a> {
     pub(super) fn new(
         storage: &'a LiquidCache,
         entry_id: &'a EntryID,
+        identity: u64,
         predicate: &'a LiquidExpr,
     ) -> Self {
         Self {
             storage,
             entry_id,
+            identity,
             predicate,
             selection: None,
         }
@@ -355,7 +371,7 @@ impl<'a> EvaluatePredicate<'a> {
     /// Evaluate the predicate against the cached data.
     pub async fn read(self) -> Option<BooleanArray> {
         self.storage
-            .eval_predicate_internal(self.entry_id, self.selection, self.predicate)
+            .eval_predicate_internal(self.entry_id, self.identity, self.selection, self.predicate)
             .await
     }
 }
@@ -453,9 +469,9 @@ mod tests {
 
         let cache = LiquidCacheBuilder::new().build().await;
         let entry_id = EntryID::from(123usize);
-        cache.insert(entry_id, root.clone()).await.unwrap();
+        cache.insert(entry_id, 0, root.clone()).await.unwrap();
 
-        let stored = cache.get(&entry_id).await.expect("array present");
+        let stored = cache.get(&entry_id, 0).await.expect("array present");
         let post_size = stored.get_array_memory_size();
 
         // GC should have compacted the view arrays, reducing memory footprint.

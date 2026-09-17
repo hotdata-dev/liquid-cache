@@ -354,11 +354,15 @@ impl LiquidArray for LiquidByteViewArray<FsstArray> {
         Arc::new(dict)
     }
 
-    fn try_eval_predicate(&self, expr: &LiquidExpr, filter: &BooleanBuffer) -> BooleanArray {
+    fn try_eval_predicate(
+        &self,
+        expr: &LiquidExpr,
+        filter: &BooleanBuffer,
+    ) -> Option<BooleanArray> {
         let filtered = helpers::filter_inner(self, filter);
 
         helpers::try_eval_predicate_in_memory(expr.physical_expr(), &filtered)
-            .unwrap_or_else(|| eval_predicate_on_array(filtered.to_arrow_array(), expr))
+            .or_else(|| eval_predicate_on_array(filtered.to_arrow_array(), expr))
     }
 
     fn to_bytes(&self) -> Vec<u8> {
@@ -487,13 +491,17 @@ impl LiquidSqueezedArray for LiquidByteViewArray<DiskBuffer> {
     ///
     /// Note that the filter is a boolean buffer, not a boolean array, i.e., filter can't be nullable.
     /// The returned boolean mask is nullable if the the original array is nullable.
-    async fn try_eval_predicate(&self, expr: &LiquidExpr, filter: &BooleanBuffer) -> BooleanArray {
+    async fn try_eval_predicate(
+        &self,
+        expr: &LiquidExpr,
+        filter: &BooleanBuffer,
+    ) -> Option<BooleanArray> {
         // Reuse generic filter path first to reduce input rows if any
         let filtered = helpers::filter_inner(self, filter);
         if let Some(mask) =
             helpers::try_eval_predicate_on_disk(expr.physical_expr(), &filtered).await
         {
-            mask
+            Some(mask)
         } else {
             eval_predicate_on_array(filtered.to_arrow_array().await, expr)
         }

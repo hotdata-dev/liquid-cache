@@ -51,7 +51,7 @@ pub(crate) async fn reset_cache_handler(State(state): State<Arc<AppState>>) -> J
     info!("Resetting cache...");
     let cache = state.liquid_cache.cache();
     unsafe {
-        cache.reset();
+        cache.reset().await;
     }
 
     Json(ApiResponse {

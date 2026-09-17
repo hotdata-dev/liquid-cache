@@ -103,7 +103,7 @@ fn make_entry(seed: u64, rows: usize) -> ArrayRef {
 
 fn indexed_bytes(cache: &LiquidCache) -> usize {
     let mut sum = 0;
-    cache.for_each_entry(|_, e| sum += e.memory_usage_bytes());
+    cache.for_each_entry(|_, _, e| sum += e.memory_usage_bytes());
     sum
 }
 
@@ -111,7 +111,7 @@ fn indexed_bytes(cache: &LiquidCache) -> usize {
 /// index rather than the budget, so the budget can be checked against it.
 fn indexed_disk_bytes(cache: &LiquidCache) -> usize {
     let mut sum = 0;
-    cache.for_each_entry(|_, e| {
+    cache.for_each_entry(|_, _, e| {
         sum += match e {
             CacheEntry::DiskLiquid { disk_bytes, .. }
             | CacheEntry::DiskArrow { disk_bytes, .. } => *disk_bytes,
@@ -168,7 +168,7 @@ async fn heap_footprint_tracks_budget_for_oversized_working_set() {
     // column batch as arrow, dropping the caller's copy right after.
     for i in 0..ENTRIES {
         let arr = make_entry(i as u64, ROWS);
-        cache.insert(EntryID::from(i), arr).await.unwrap();
+        cache.insert(EntryID::from(i), 0, arr).await.unwrap();
     }
     report(&cache, "after fill", baseline);
     let idle_after_fill = live() - baseline;
@@ -189,7 +189,7 @@ async fn heap_footprint_tracks_budget_for_oversized_working_set() {
     reset_peak();
     for _pass in 0..2 {
         for i in 0..ENTRIES {
-            let arr = cache.get(&EntryID::from(i)).await.unwrap();
+            let arr = cache.get(&EntryID::from(i), 0).await.unwrap();
             assert_eq!(arr.len(), ROWS);
             drop(arr);
         }
@@ -249,7 +249,7 @@ async fn heap_footprint_tracks_budget_for_oversized_working_set() {
 
     // What survives once the index is emptied is held by the store, the
     // policy, or the compressor state — not by indexed entries.
-    cache.reset();
+    cache.reset().await;
     report(&cache, "after reset", baseline);
     let idle_after_reset = live() - baseline;
     assert!(

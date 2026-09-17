@@ -10,7 +10,7 @@ use parquet::arrow::arrow_reader::ArrowPredicate;
 
 use crate::{
     LiquidPredicate,
-    cache::{BatchID, ColumnAccessPath, ParquetArrayID},
+    cache::{BatchID, ColumnAccessPath, ParquetArrayID, file_id::FileId},
 };
 use std::sync::Arc;
 
@@ -20,6 +20,15 @@ pub struct CachedColumn {
     cache_store: Arc<LiquidCache>,
     field: Arc<Field>,
     column_path: ColumnAccessPath,
+    /// The file id before it is narrowed into `column_path`. Two files whose
+    /// ids differ only in the bits `ColumnAccessPath` drops share every
+    /// `EntryID` this column computes; the cache compares this value to tell
+    /// them apart and treat the other file's data as a miss.
+    ///
+    /// Held as a lease rather than copied: a row group outlives the
+    /// `CachedFile` it came from, and the id must stay allocated for as long
+    /// as anything can still compute a key from it.
+    file_id: Arc<FileId>,
     expression: Option<Arc<CacheExpression>>,
 }
 
@@ -46,6 +55,7 @@ impl CachedColumn {
         field: Arc<Field>,
         cache_store: Arc<LiquidCache>,
         column_access_path: ColumnAccessPath,
+        file_id: Arc<FileId>,
         expression: Option<Arc<CacheExpression>>,
         is_predicate_column: bool,
     ) -> Self {
@@ -69,6 +79,7 @@ impl CachedColumn {
             field,
             cache_store,
             column_path: column_access_path,
+            file_id,
             expression,
         }
     }
@@ -78,8 +89,14 @@ impl CachedColumn {
         self.column_path.entry_id(batch_id)
     }
 
+    /// The never-reused name of the file this column belongs to.
+    pub(crate) fn identity(&self) -> u64 {
+        self.file_id.identity()
+    }
+
     pub(crate) fn is_cached(&self, batch_id: BatchID) -> bool {
-        self.cache_store.is_cached(&self.entry_id(batch_id).into())
+        self.cache_store
+            .is_cached(&self.entry_id(batch_id).into(), self.identity())
     }
 
     /// Returns the Arrow field metadata for this cached column.
@@ -92,9 +109,12 @@ impl CachedColumn {
         self.expression.clone()
     }
 
-    fn array_to_record_batch(&self, array: ArrayRef) -> RecordBatch {
+    /// `None` when the array does not match this column's field — the cache
+    /// returned something built for a different column. The caller treats that
+    /// as "cannot answer from cache" and reads the source instead.
+    fn array_to_record_batch(&self, array: ArrayRef) -> Option<RecordBatch> {
         let schema = Arc::new(Schema::new(vec![self.field.clone()]));
-        RecordBatch::try_new(schema, vec![array]).unwrap()
+        RecordBatch::try_new(schema, vec![array]).ok()
     }
 
     /// Evaluates a predicate on a cached column.
@@ -114,7 +134,7 @@ impl CachedColumn {
         if let Some(liquid_expr) = liquid_expr
             && let Some(boolean_array) = self
                 .cache_store
-                .eval_predicate(&entry_id, &liquid_expr)
+                .eval_predicate(&entry_id, self.identity(), &liquid_expr)
                 .with_selection(filter)
                 .await
         {
@@ -126,7 +146,7 @@ impl CachedColumn {
         }
 
         let array = self.get_arrow_array_with_filter(batch_id, filter).await?;
-        let record_batch = self.array_to_record_batch(array);
+        let record_batch = self.array_to_record_batch(array)?;
         let boolean_array = match predicate.evaluate(record_batch) {
             Ok(arr) => arr,
             Err(err) => return Some(Err(err)),
@@ -160,7 +180,7 @@ impl CachedColumn {
     ) -> Option<ArrayRef> {
         let entry_id = self.entry_id(batch_id).into();
         self.cache_store
-            .get(&entry_id)
+            .get(&entry_id, self.identity())
             .with_selection(filter)
             .with_optional_expression_hint(self.expression())
             .read()
@@ -170,7 +190,7 @@ impl CachedColumn {
     #[cfg(test)]
     pub(crate) async fn get_arrow_array_test_only(&self, batch_id: BatchID) -> Option<ArrayRef> {
         let entry_id = self.entry_id(batch_id).into();
-        self.cache_store.get(&entry_id).await
+        self.cache_store.get(&entry_id, self.identity()).await
     }
 
     /// Insert an array into the cache.
@@ -184,7 +204,7 @@ impl CachedColumn {
         }
 
         self.cache_store
-            .insert(self.entry_id(batch_id).into(), array)
+            .insert(self.entry_id(batch_id).into(), self.identity(), array)
             .await?;
         Ok(())
     }

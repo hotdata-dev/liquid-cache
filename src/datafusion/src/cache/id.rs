@@ -51,8 +51,19 @@ const _: () = assert!(std::mem::align_of::<ParquetArrayID>() == 8);
 
 impl ParquetArrayID {
     /// Creates a new CacheEntryID.
+    ///
+    /// `file_id` is narrowed to the width the packed key gives it, and that is
+    /// deliberately not an assertion: a process that outlives 65,536 distinct
+    /// files goes on working, because the cache compares each entry's recorded
+    /// identity and treats an aliased key as a miss. Asserting would panic in
+    /// debug builds on a case release builds handle, leaving the shipped
+    /// behaviour untestable. `LiquidCacheParquet` counts ids that will not fit.
+    ///
+    /// The other two keep their assertion, because that identity is the file
+    /// id *alone*: it cannot tell row group 0 from row group 65,536, or column
+    /// 0 from column 65,536, within one file. Narrowing those is unguarded and
+    /// silently wrong, so it stays an assertion rather than a handled case.
     pub fn new(file_id: u64, row_group_id: u64, column_id: u64, batch_id: BatchID) -> Self {
-        debug_assert!(file_id <= u16::MAX as u64);
         debug_assert!(row_group_id <= u16::MAX as u64);
         debug_assert!(column_id <= u16::MAX as u64);
         Self {
@@ -146,8 +157,11 @@ pub struct ColumnAccessPath {
 
 impl ColumnAccessPath {
     /// Create a new instance of ColumnAccessPath.
+    ///
+    /// `file_id` narrows unguarded and is handled by the identity check; the
+    /// other two assert, because the identity cannot distinguish them — see
+    /// [`ParquetArrayID::new`].
     pub fn new(file_id: u64, row_group_id: u64, column_id: u64) -> Self {
-        debug_assert!(file_id <= u16::MAX as u64);
         debug_assert!(row_group_id <= u16::MAX as u64);
         debug_assert!(column_id <= u16::MAX as u64);
         Self {
@@ -225,21 +239,34 @@ mod tests {
         assert_eq!(entry_id.batch_id_inner(), *batch_id as u64);
     }
 
+    /// `file_id` wraps rather than panicking, in every build. The consequence
+    /// — two sources computing one key — is caught by the identity the cache
+    /// records alongside each entry, not here. This pins the wrap down so the
+    /// aliasing it produces stays a known, reproducible condition rather than
+    /// a debug-only assertion the shipped binary never evaluates.
     #[test]
-    #[should_panic]
-    fn test_cache_entry_id_new_panic_file_id() {
-        ParquetArrayID::new((u16::MAX as u64) + 1, 0, 0, BatchID::from_raw(0));
+    fn a_file_id_wraps_rather_than_panicking_above_its_width() {
+        let wrapped = ParquetArrayID::new((u16::MAX as u64) + 1, 1, 2, BatchID::from_raw(0));
+        assert_eq!(wrapped.file_id_inner(), 0);
+
+        // Which is exactly the aliasing the identity check exists to absorb.
+        let first = ParquetArrayID::new(0, 1, 2, BatchID::from_raw(0));
+        assert_eq!(usize::from(wrapped), usize::from(first));
     }
 
+    /// The other two fields keep their assertion. The identity recorded
+    /// against an entry is the file id alone, so it cannot tell row group 0
+    /// from row group 65,536 within one file — narrowing those is unguarded
+    /// and silently wrong, not absorbed.
     #[test]
-    #[should_panic]
-    fn test_cache_entry_id_new_panic_row_group_id() {
+    #[should_panic(expected = "row_group_id")]
+    fn an_over_width_row_group_still_asserts() {
         ParquetArrayID::new(0, (u16::MAX as u64) + 1, 0, BatchID::from_raw(0));
     }
 
     #[test]
-    #[should_panic]
-    fn test_cache_entry_id_new_panic_column_id() {
+    #[should_panic(expected = "column_id")]
+    fn an_over_width_column_still_asserts() {
         ParquetArrayID::new(0, 0, (u16::MAX as u64) + 1, BatchID::from_raw(0));
     }
 

@@ -338,7 +338,7 @@ where
         &self,
         liquid_expr: &LiquidExpr,
         filter: &BooleanBuffer,
-    ) -> BooleanArray {
+    ) -> Option<BooleanArray> {
         // Apply selection first to reduce input rows
         let filtered = self.filter_inner(filter);
 
@@ -374,7 +374,7 @@ where
             match filtered.try_eval_predicate_inner(&supported_op, literal) {
                 Ok(Some(mask)) => {
                     self.io.trace_io_saved();
-                    return mask;
+                    return Some(mask);
                 }
                 Ok(None) => {
                     let fallback = self.filter(filter).await;
@@ -389,8 +389,7 @@ where
 
         let full = self.hydrate_full_arrow().await;
         let selection_array = BooleanArray::new(filter.clone(), None);
-        let filtered_arr = arrow::compute::filter(&full, &selection_array)
-            .expect("selection must match array length");
+        let filtered_arr = arrow::compute::filter(&full, &selection_array).ok()?;
         let filtered_len = filtered_arr.len();
         let lhs_array = match lhs_kind {
             PredicateLhs::Plain => filtered_arr,
@@ -415,12 +414,11 @@ where
                 return eval_predicate_on_array(fallback, liquid_expr);
             }
         };
-        let result = result.expect("validated LiquidExpr comparison must evaluate");
-        result
-            .into_array(filtered_len)
-            .expect("comparison output must be an array")
-            .as_boolean()
-            .clone()
+        // A comparison that cannot evaluate means this array is not what the
+        // predicate was built for. Report it as unanswerable rather than
+        // asserting: the caller falls back to the source.
+        let result = result.ok()?;
+        Some(result.into_array(filtered_len).ok()?.as_boolean().clone())
     }
 }
 
@@ -701,7 +699,7 @@ where
         &self,
         liquid_expr: &LiquidExpr,
         filter: &BooleanBuffer,
-    ) -> BooleanArray {
+    ) -> Option<BooleanArray> {
         // Apply selection first to reduce input rows
         let filtered = self.filter_inner(filter);
 
@@ -737,7 +735,7 @@ where
             match filtered.try_eval_predicate_inner(&supported_op, literal) {
                 Ok(Some(mask)) => {
                     self.io.trace_io_saved();
-                    return mask;
+                    return Some(mask);
                 }
                 Ok(None) => {
                     let fallback = self.filter(filter).await;
@@ -752,8 +750,7 @@ where
 
         let full = self.hydrate_full_arrow().await;
         let selection_array = BooleanArray::new(filter.clone(), None);
-        let filtered_arr = arrow::compute::filter(&full, &selection_array)
-            .expect("selection must match array length");
+        let filtered_arr = arrow::compute::filter(&full, &selection_array).ok()?;
         let filtered_len = filtered_arr.len();
         let lhs_array = match lhs_kind {
             PredicateLhs::Plain => filtered_arr,
@@ -778,12 +775,11 @@ where
                 return eval_predicate_on_array(fallback, liquid_expr);
             }
         };
-        let result = result.expect("validated LiquidExpr comparison must evaluate");
-        result
-            .into_array(filtered_len)
-            .expect("comparison output must be an array")
-            .as_boolean()
-            .clone()
+        // A comparison that cannot evaluate means this array is not what the
+        // predicate was built for. Report it as unanswerable rather than
+        // asserting: the caller falls back to the source.
+        let result = result.ok()?;
+        Some(result.into_array(filtered_len).ok()?.as_boolean().clone())
     }
 }
 
@@ -994,7 +990,8 @@ mod tests {
             let got = block_on(hybrid.try_eval_predicate(
                 &crate::cache::LiquidExpr::new_unchecked(expr.clone()),
                 &mask,
-            ));
+            ))
+            .expect("predicate must evaluate in this test");
             let expected = expected_for(op, k);
             assert_eq!(io.reads(), 0);
             assert_eq!(got, expected);
@@ -1015,7 +1012,8 @@ mod tests {
             let got = block_on(hybrid.try_eval_predicate(
                 &crate::cache::LiquidExpr::new_unchecked(expr.clone()),
                 &mask,
-            ));
+            ))
+            .expect("predicate must evaluate in this test");
             let expected = expected_for(op, k);
             assert!(io.reads() > 0);
             assert_eq!(got, expected);
@@ -1081,7 +1079,8 @@ mod tests {
             let got = block_on(hybrid.try_eval_predicate(
                 &crate::cache::LiquidExpr::new_unchecked(expr.clone()),
                 &mask,
-            ));
+            ))
+            .expect("predicate must evaluate in this test");
             let expected = expected_for(op, k);
             assert_eq!(io.reads(), 0);
             assert_eq!(got, expected);
@@ -1101,7 +1100,8 @@ mod tests {
             let got = block_on(hybrid.try_eval_predicate(
                 &crate::cache::LiquidExpr::new_unchecked(expr.clone()),
                 &mask,
-            ));
+            ))
+            .expect("predicate must evaluate in this test");
             let expected = expected_for(op, k);
             assert!(io.reads() > 0);
             assert_eq!(got, expected);
@@ -1143,7 +1143,8 @@ mod tests {
             let got = block_on(hybrid.try_eval_predicate(
                 &crate::cache::LiquidExpr::new_unchecked(expr.clone()),
                 &mask,
-            ));
+            ))
+            .expect("predicate must evaluate in this test");
             let expected = {
                 let vals: Vec<Option<bool>> = (0..arr.len())
                     .map(|i| {
@@ -1175,7 +1176,8 @@ mod tests {
         let got = block_on(hybrid.try_eval_predicate(
             &crate::cache::LiquidExpr::new_unchecked(expr_eq_present.clone()),
             &mask,
-        ));
+        ))
+        .expect("predicate must evaluate in this test");
         let expected = {
             let vals: Vec<Option<bool>> = (0..arr.len())
                 .map(|i| {
@@ -1225,7 +1227,8 @@ mod tests {
             let got = block_on(hybrid.try_eval_predicate(
                 &crate::cache::LiquidExpr::new_unchecked(expr.clone()),
                 &mask,
-            ));
+            ))
+            .expect("predicate must evaluate in this test");
             let expected = {
                 let vals: Vec<Option<bool>> = (0..arr.len())
                     .map(|i| {
@@ -1257,7 +1260,8 @@ mod tests {
         let got = block_on(hybrid.try_eval_predicate(
             &crate::cache::LiquidExpr::new_unchecked(expr_eq_present.clone()),
             &mask,
-        ));
+        ))
+        .expect("predicate must evaluate in this test");
         let expected = {
             let vals: Vec<Option<bool>> = (0..arr.len())
                 .map(|i| {

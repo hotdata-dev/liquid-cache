@@ -22,12 +22,16 @@ tokio_test::block_on(async {
 let storage = LiquidCacheBuilder::new().build().await;
 
 let entry_id = EntryID::from(42);
+// Names whose data this is. Entry ids are packed and can alias between
+// sources, so the cache compares this on every read and treats a mismatch as
+// a miss — a caller only ever reads back what it put in.
+let identity = 1;
 let arrow_array = Arc::new(UInt64Array::from_iter_values(0..1000));
 
 // Insert once; replacement/placement is handled by the cache policy
-storage.insert(entry_id, arrow_array.clone()).await;
+storage.insert(entry_id, identity, arrow_array.clone()).await;
 
-assert!(storage.is_cached(&entry_id));
+assert!(storage.is_cached(&entry_id, identity));
 });
 ```
 
@@ -42,14 +46,15 @@ tokio_test::block_on(async {
 let storage = LiquidCacheBuilder::new().build().await;
 
 let entry_id = EntryID::from(7);
+let identity = 1;
 let arrow_array = Arc::new(UInt64Array::from_iter_values(0..16));
-storage.insert(entry_id, arrow_array.clone()).await;
+storage.insert(entry_id, identity, arrow_array.clone()).await;
 
 // Move data to disk so the read will demonstrate async I/O
 storage.flush_all_to_disk().await;
 
 // Read asynchronously
-let retrieved = storage.get(&entry_id).await.unwrap();
+let retrieved = storage.get(&entry_id, identity).await.unwrap();
 assert_eq!(retrieved.as_ref(), arrow_array.as_ref());
 });
 ```
@@ -71,10 +76,11 @@ tokio_test::block_on(async {
 let storage = LiquidCacheBuilder::new().build().await;
 
 let entry_id = EntryID::from(8);
+let identity = 1;
 let data = Arc::new(StringArray::from(vec![
     Some("apple"), Some("banana"), None, Some("apple"), Some("cherry"),
 ]));
-storage.insert(entry_id, data.clone()).await;
+storage.insert(entry_id, identity, data.clone()).await;
 
 // Move data to disk so the read will demonstrate async I/O
 storage.flush_all_to_disk().await;
@@ -94,7 +100,7 @@ let liquid_expr = liquid_cache::cache::LiquidExpr::try_new(
 
 // Read with predicate pushdown
 let mask = storage
-    .eval_predicate(&entry_id, &liquid_expr)
+    .eval_predicate(&entry_id, identity, &liquid_expr)
     .with_selection(&selection)
     .await
     .unwrap();

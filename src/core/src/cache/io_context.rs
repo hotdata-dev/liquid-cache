@@ -38,9 +38,21 @@ pub trait EntryMetadata: Debug + Send + Sync {
     fn get_compressor(&self, entry_id: &EntryID) -> Arc<LiquidCompressorStates>;
 }
 
-/// Convert an [`EntryID`] to a t4 key (8-byte little-endian representation).
-pub(crate) fn entry_id_to_key(entry_id: &EntryID) -> Vec<u8> {
-    usize::from(*entry_id).to_le_bytes().to_vec()
+/// Convert an [`EntryID`] and the identity that owns it to a t4 key.
+///
+/// Both halves, not just the entry id. `EntryID` is a packed integer whose
+/// fields are narrower than the values they encode, so two sources can compute
+/// one id — and a store object addressed by that id alone is *shared*. Scoping
+/// only the `DiskCopy` record is not enough: a write in flight for one owner
+/// can land after another has taken the key over and installed its own disk
+/// entry, overwriting bytes the new owner's index entry and record both agree
+/// are its own. With the identity in the key the two address different
+/// objects, so a late write cannot reach the other's bytes at all.
+pub(crate) fn entry_id_to_key(entry_id: &EntryID, identity: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(16);
+    key.extend_from_slice(&usize::from(*entry_id).to_le_bytes());
+    key.extend_from_slice(&identity.to_le_bytes());
+    key
 }
 
 /// A default implementation of [`EntryMetadata`].
@@ -84,15 +96,23 @@ impl EntryMetadata for DefaultCacheMetadata {
 pub struct DefaultSqueezeIo {
     store: t4::Store,
     entry_id: EntryID,
+    /// The owner whose object this reads. See [`entry_id_to_key`].
+    identity: u64,
     observer: Arc<Observer>,
 }
 
 impl DefaultSqueezeIo {
     /// Create a new instance of [DefaultSqueezeIo].
-    pub fn new(store: t4::Store, entry_id: EntryID, observer: Arc<Observer>) -> Self {
+    pub fn new(
+        store: t4::Store,
+        entry_id: EntryID,
+        identity: u64,
+        observer: Arc<Observer>,
+    ) -> Self {
         Self {
             store,
             entry_id,
+            identity,
             observer,
         }
     }
@@ -101,7 +121,7 @@ impl DefaultSqueezeIo {
 #[async_trait::async_trait]
 impl SqueezeIoHandler for DefaultSqueezeIo {
     async fn read(&self, range: Option<Range<u64>>) -> std::io::Result<Bytes> {
-        let key = entry_id_to_key(&self.entry_id);
+        let key = entry_id_to_key(&self.entry_id, self.identity);
         let bytes = match range {
             Some(range) => {
                 let len = range.end - range.start;

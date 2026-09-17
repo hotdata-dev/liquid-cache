@@ -385,9 +385,10 @@ impl LiquidCacheReaderInner {
             arrays.push(array);
         }
 
-        Ok(Some(
-            RecordBatch::try_new(self.schema.clone(), arrays).unwrap(),
-        ))
+        // A batch that does not match the declared schema is a cache that
+        // handed back something other than what was asked for. Report it;
+        // unwinding here aborts the stream mid-flight with no error to show.
+        Ok(Some(RecordBatch::try_new(self.schema.clone(), arrays)?))
     }
 
     async fn read_parquet_batch_and_fill_cache(
