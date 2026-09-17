@@ -66,6 +66,15 @@ pub(crate) enum WriteIdentity {
     Rewrite(u64),
 }
 
+impl WriteIdentity {
+    /// The identity this write carries, whichever kind it is.
+    pub(crate) fn value(&self) -> u64 {
+        match self {
+            Self::Owned(id) | Self::Rewrite(id) => *id,
+        }
+    }
+}
+
 pub(crate) struct ArtIndex {
     art: CongeeArc<EntryID, Slot>,
     entry_count: AtomicUsize,

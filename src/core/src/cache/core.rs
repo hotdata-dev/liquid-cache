@@ -44,6 +44,11 @@ use std::collections::HashMap;
 /// (liquid-cache#43).
 #[derive(Debug, Clone, Copy)]
 struct DiskCopy {
+    /// Whose bytes these are. A key can change hands while a write to it is
+    /// in flight, and a declined rewrite leaves the object behind; without
+    /// this the next owner adopts it on kind and length alone and reads the
+    /// previous owner's rows as its own.
+    identity: u64,
     kind: DiskKind,
     bytes: usize,
 }
@@ -57,22 +62,26 @@ enum DiskKind {
 impl DiskCopy {
     /// The store object an entry refers to: a disk stub's bytes, or the
     /// full serialisation a squeezed entry reads back through.
-    fn referenced_by(entry: &CacheEntry) -> Option<Self> {
+    fn referenced_by(identity: u64, entry: &CacheEntry) -> Option<Self> {
         match entry {
             CacheEntry::DiskLiquid { disk_bytes, .. } => Some(Self {
+                identity,
                 kind: DiskKind::Liquid,
                 bytes: *disk_bytes,
             }),
             CacheEntry::DiskArrow { disk_bytes, .. } => Some(Self {
+                identity,
                 kind: DiskKind::Arrow,
                 bytes: *disk_bytes,
             }),
             CacheEntry::MemorySqueezedLiquid(squeezed) => Some(match squeezed.disk_backing() {
                 SqueezedBacking::Liquid(bytes) => Self {
+                    identity,
                     kind: DiskKind::Liquid,
                     bytes,
                 },
                 SqueezedBacking::Arrow(bytes) => Self {
+                    identity,
                     kind: DiskKind::Arrow,
                     bytes,
                 },
@@ -297,7 +306,10 @@ impl LiquidCache {
                 CacheEntry::MemoryArrow(array) => {
                     let bytes = arrow_to_bytes(array).expect("failed to convert arrow to bytes");
                     let disk_bytes = bytes.len();
-                    match self.write_batch_to_disk(entry_id, &batch, bytes).await {
+                    match self
+                        .write_batch_to_disk(entry_id, flush_identity, &batch, bytes)
+                        .await
+                    {
                         Ok(()) => {
                             self.try_insert(
                                 entry_id,
@@ -314,7 +326,8 @@ impl LiquidCache {
                     if let Some(DiskCopy {
                         kind: DiskKind::Liquid,
                         bytes,
-                    }) = self.disk_copy(&entry_id)
+                        ..
+                    }) = self.disk_copy(&entry_id, flush_identity)
                     {
                         // Hydrated from disk and never modified since: the
                         // bytes are already there, flip the index rather
@@ -330,7 +343,12 @@ impl LiquidCache {
                     let liquid_bytes = liquid_array.to_bytes();
                     let disk_bytes = liquid_bytes.len();
                     match self
-                        .write_batch_to_disk(entry_id, &batch, Bytes::from(liquid_bytes))
+                        .write_batch_to_disk(
+                            entry_id,
+                            flush_identity,
+                            &batch,
+                            Bytes::from(liquid_bytes),
+                        )
                         .await
                     {
                         Ok(()) => {
@@ -364,6 +382,7 @@ impl LiquidCache {
     async fn write_in_memory_batch_to_disk(
         &self,
         entry_id: EntryID,
+        identity: u64,
         batch: CacheEntry,
     ) -> Result<CacheEntry, CacheFull> {
         match &batch {
@@ -387,7 +406,7 @@ impl LiquidCache {
                     unreachable!("memory arrow squeeze cannot remove entry");
                 };
                 if let Some(bytes_to_write) = bytes_to_write {
-                    self.write_batch_to_disk(entry_id, &new_batch, bytes_to_write)
+                    self.write_batch_to_disk(entry_id, identity, &new_batch, bytes_to_write)
                         .await?;
                 }
                 Ok(new_batch)
@@ -397,13 +416,14 @@ impl LiquidCache {
                 if let Some(DiskCopy {
                     kind: DiskKind::Liquid,
                     bytes,
-                }) = self.disk_copy(&entry_id)
+                    ..
+                }) = self.disk_copy(&entry_id, identity)
                 {
                     return Ok(CacheEntry::disk_liquid(data_type, bytes));
                 }
                 let liquid_bytes = Bytes::from(liquid_array.to_bytes());
                 let disk_bytes = liquid_bytes.len();
-                self.write_batch_to_disk(entry_id, &batch, liquid_bytes)
+                self.write_batch_to_disk(entry_id, identity, &batch, liquid_bytes)
                     .await?;
                 Ok(CacheEntry::disk_liquid(data_type, disk_bytes))
             }
@@ -444,7 +464,7 @@ impl LiquidCache {
                 // this can happen if the entry to be inserted is too large, in that case,
                 // we write it to disk
                 let on_disk_batch = self
-                    .write_in_memory_batch_to_disk(entry_id, not_inserted)
+                    .write_in_memory_batch_to_disk(entry_id, identity.value(), not_inserted)
                     .await?;
                 batch_to_cache = on_disk_batch;
                 continue;
@@ -490,7 +510,21 @@ impl LiquidCache {
         }
     }
 
-    fn disk_copy(&self, entry_id: &EntryID) -> Option<DiskCopy> {
+    /// The store object recorded for `entry_id`, but only if it belongs to
+    /// `identity`. A copy left by a previous owner reads as absent, so it is
+    /// never adopted by whoever holds the key now.
+    fn disk_copy(&self, entry_id: &EntryID, identity: u64) -> Option<DiskCopy> {
+        self.disk_copies
+            .lock()
+            .unwrap()
+            .get(entry_id)
+            .copied()
+            .filter(|copy| copy.identity == identity)
+    }
+
+    /// The record regardless of owner, for paths that act on whatever object
+    /// is there — superseding it, discarding it, releasing its reservation.
+    fn any_disk_copy(&self, entry_id: &EntryID) -> Option<DiskCopy> {
         self.disk_copies.lock().unwrap().get(entry_id).copied()
     }
 
@@ -505,7 +539,7 @@ impl LiquidCache {
     /// still land its result after the new one), so this covers the
     /// sequential case only.
     pub(crate) async fn supersede_disk_copy(&self, entry_id: EntryID) {
-        if self.disk_copy(&entry_id).is_none() {
+        if self.any_disk_copy(&entry_id).is_none() {
             return;
         }
         match self.index.get(&entry_id).as_deref() {
@@ -542,7 +576,12 @@ impl LiquidCache {
     /// If `outcome` demotes an entry to a form backed by a store object whose
     /// bytes are already there, drop the write and point the entry at the
     /// existing copy.
-    fn reuse_disk_copy(&self, entry_id: &EntryID, outcome: SqueezeOutcome) -> SqueezeOutcome {
+    fn reuse_disk_copy(
+        &self,
+        entry_id: &EntryID,
+        identity: u64,
+        outcome: SqueezeOutcome,
+    ) -> SqueezeOutcome {
         let (entry, bytes) = match outcome {
             SqueezeOutcome::Replace {
                 entry,
@@ -554,9 +593,10 @@ impl LiquidCache {
             entry,
             bytes_to_write: Some(bytes),
         };
-        let (Some(copy), Some(wanted)) =
-            (self.disk_copy(entry_id), DiskCopy::referenced_by(&entry))
-        else {
+        let (Some(copy), Some(wanted)) = (
+            self.disk_copy(entry_id, identity),
+            DiskCopy::referenced_by(identity, &entry),
+        ) else {
             return keep_write(entry);
         };
         if copy.kind != wanted.kind {
@@ -753,7 +793,7 @@ impl LiquidCache {
                 squeeze_hint,
                 &squeeze_io,
             );
-            let outcome = self.reuse_disk_copy(&to_squeeze, outcome);
+            let outcome = self.reuse_disk_copy(&to_squeeze, squeezed_identity, outcome);
 
             match outcome {
                 SqueezeOutcome::Replace {
@@ -761,8 +801,13 @@ impl LiquidCache {
                     bytes_to_write,
                 } => {
                     if let Some(bytes_to_write) = bytes_to_write {
-                        self.write_batch_to_disk(to_squeeze, &new_batch, bytes_to_write)
-                            .await?;
+                        self.write_batch_to_disk(
+                            to_squeeze,
+                            squeezed_identity,
+                            &new_batch,
+                            bytes_to_write,
+                        )
+                        .await?;
                     }
                     match self.try_insert(
                         to_squeeze,
@@ -1028,6 +1073,7 @@ impl LiquidCache {
     async fn write_batch_to_disk(
         &self,
         entry_id: EntryID,
+        identity: u64,
         batch: &CacheEntry,
         bytes: Bytes,
     ) -> Result<(), CacheFull> {
@@ -1063,11 +1109,14 @@ impl LiquidCache {
             },
             CacheEntry::DiskLiquid { .. } | CacheEntry::MemoryLiquid(_) => DiskKind::Liquid,
         };
-        let previous = self
-            .disk_copies
-            .lock()
-            .unwrap()
-            .insert(entry_id, DiskCopy { kind, bytes: len });
+        let previous = self.disk_copies.lock().unwrap().insert(
+            entry_id,
+            DiskCopy {
+                identity,
+                kind,
+                bytes: len,
+            },
+        );
         if let Some(previous) = previous {
             // The put replaced the object under this key, so the previous
             // copy's reservation goes with it.
@@ -1542,6 +1591,43 @@ mod tests {
             let entry = store.index().get(&entry_id).unwrap();
             assert!(matches!(entry.as_ref(), CacheEntry::MemoryLiquid(_)));
         }
+    }
+
+    /// A rewrite that is declined has already written its bytes, so the store
+    /// object and its record outlive the entry they were built for. If the
+    /// next owner of the key could see that record it would adopt the object
+    /// on kind and length alone and read the previous owner's rows as its own.
+    #[tokio::test]
+    async fn a_disk_copy_is_invisible_to_whoever_holds_the_key_next() {
+        let store = create_cache_store(1024 * 1024, Box::new(LiquidPolicy::new())).await;
+        let entry_id = EntryID::from(5usize);
+
+        // Identity 1 caches and spills, recording a store object for this key.
+        store
+            .insert_inner(entry_id, WriteIdentity::Owned(1), create_test_array(100))
+            .await
+            .unwrap();
+        store.flush_all_to_disk().await.unwrap();
+        assert!(
+            store.disk_copy(&entry_id, 1).is_some(),
+            "the owner sees the object it wrote"
+        );
+
+        // Identity 2 takes the key over. The object is still on disk, and the
+        // record still names identity 1.
+        store
+            .insert_inner(entry_id, WriteIdentity::Owned(2), create_test_array(200))
+            .await
+            .unwrap();
+
+        assert!(
+            store.disk_copy(&entry_id, 2).is_none(),
+            "the new owner must not adopt the object the previous one left"
+        );
+        assert!(
+            store.any_disk_copy(&entry_id).is_some(),
+            "the record is still there for the paths that reclaim it"
+        );
     }
 
     #[tokio::test]
