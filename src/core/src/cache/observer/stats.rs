@@ -110,6 +110,12 @@ define_runtime_stats! {
 pub struct CacheStats {
     /// Total number of entries in the cache.
     pub total_entries: usize,
+    /// How many lookups or writes found a key held by a different file.
+    ///
+    /// Expected to stay at zero. A non-zero value means two sources computed
+    /// the same `EntryID`, and each was served correctly only because the
+    /// identity check turned the collision into a miss.
+    pub identity_mismatches: u64,
     /// Number of in-memory Arrow entries.
     pub memory_arrow_entries: usize,
     /// Number of in-memory Liquid entries.

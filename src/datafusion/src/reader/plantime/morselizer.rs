@@ -182,7 +182,6 @@ impl Morselizer for LiquidMorselizer {
                 metrics,
                 file_pruner,
                 reader_factory,
-                batch_size: self.batch_size,
                 logical_file_schema,
                 output_schema,
                 projection,
@@ -232,7 +231,6 @@ struct PreparedLiquidOpen {
     metrics: LiquidFileMetrics,
     file_pruner: Option<FilePruner>,
     reader_factory: Arc<LiquidFileReaderFactory>,
-    batch_size: usize,
     logical_file_schema: SchemaRef,
     output_schema: SchemaRef,
     projection: ProjectionExprs,
@@ -599,7 +597,6 @@ fn plan_row_group_morsels(planned: PlannedRowGroups) -> Result<Option<MorselPlan
         row_filter: context.row_filter,
         cached_file,
         projection: context.projection_mask,
-        batch_size: context.prepared.batch_size,
         stream_schema,
         output_schema: Arc::clone(&context.prepared.output_schema),
         projector,
@@ -1369,7 +1366,7 @@ mod tests {
 
     fn kind_of(cache: &LiquidCache, id: &EntryID) -> Option<CachedBatchType> {
         let mut kind = None;
-        cache.for_each_entry(|entry_id, entry| {
+        cache.for_each_entry(|entry_id, _, entry| {
             if entry_id == id {
                 kind = Some(CachedBatchType::from(entry));
             }

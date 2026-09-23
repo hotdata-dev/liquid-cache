@@ -26,8 +26,21 @@ pub trait EntryMetadata: Debug + Send + Sync {
 }
 
 /// Convert an [`EntryID`] to a t4 key (8-byte little-endian representation).
-pub(crate) fn entry_id_to_key(entry_id: &EntryID) -> Vec<u8> {
-    usize::from(*entry_id).to_le_bytes().to_vec()
+/// Convert an [`EntryID`] and the identity that owns it to a t4 key.
+///
+/// Both halves, not just the entry id. `EntryID` is a packed integer whose
+/// fields are narrower than the values they encode, so two sources can compute
+/// one id — and a store object addressed by that id alone is *shared*. Scoping
+/// only the index entry is not enough: a write in flight for one owner can land
+/// after another has taken the key over and installed its own disk entry,
+/// overwriting bytes the new owner's index entry agrees are its own. With the
+/// identity in the key the two address different objects, so a late write
+/// cannot reach the other's bytes at all.
+pub(crate) fn entry_id_to_key(entry_id: &EntryID, identity: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(16);
+    key.extend_from_slice(&usize::from(*entry_id).to_le_bytes());
+    key.extend_from_slice(&identity.to_le_bytes());
+    key
 }
 
 /// A default implementation of [`EntryMetadata`].

@@ -58,7 +58,6 @@ struct LiquidCacheReaderInner {
 }
 
 pub(crate) struct LiquidCacheReaderConfig {
-    pub(crate) batch_size: usize,
     pub(crate) selection: RowSelection,
     pub(crate) row_filter: Option<LiquidRowFilter>,
     pub(crate) cached_row_group: CachedRowGroupRef,
@@ -530,7 +529,6 @@ mod tests {
     use std::sync::Arc;
 
     struct TestRowGroup {
-        batch_size: usize,
         row_group: CachedRowGroupRef,
         schema: SchemaRef,
         fallback: ParquetFallbackConfig,
@@ -547,7 +545,6 @@ mod tests {
     impl TestRowGroup {
         fn reader(&self, request: ReaderRequest) -> LiquidCacheReader {
             LiquidCacheReader::new(LiquidCacheReaderConfig {
-                batch_size: self.batch_size,
                 selection: request.selection,
                 row_filter: request.row_filter,
                 cached_row_group: Arc::clone(&self.row_group),
@@ -626,7 +623,6 @@ mod tests {
         }
 
         TestRowGroup {
-            batch_size,
             row_group,
             schema,
             fallback: ParquetFallbackConfig {

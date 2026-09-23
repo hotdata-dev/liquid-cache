@@ -123,35 +123,36 @@ impl LiquidCacheParquet {
     /// Write the stats of the cache to a parquet file.
     pub fn write_stats(&self, parquet_file_path: impl AsRef<Path>) -> Result<(), ParquetError> {
         let mut writer = StatsWriter::new(parquet_file_path)?;
-        self.cache_store.for_each_entry(|entry_id, cached_batch| {
-            let memory_size = cached_batch.memory_usage_bytes();
-            let row_count = match cached_batch {
-                CacheEntry::MemoryArrow(array) => Some(array.len() as u64),
-                CacheEntry::MemoryLiquid(array) => Some(array.len() as u64),
-                CacheEntry::DiskLiquid { .. } => None,
-                CacheEntry::DiskArrow { .. } => None, // We'd need to read it to get the count
-            };
-            let cache_type = match cached_batch {
-                CacheEntry::MemoryArrow(_) => "InMemory",
-                CacheEntry::MemoryLiquid(_) => "LiquidMemory",
-                CacheEntry::DiskLiquid { .. } => "OnDiskLiquid",
-                CacheEntry::DiskArrow { .. } => "OnDiskArrow",
-            };
-            let reference_count = cached_batch.reference_count();
-            let entry_id = ParquetArrayID::from(*entry_id);
-            writer
-                .append_entry(
-                    &entry_id.display_path(),
-                    entry_id.row_group_id_inner(),
-                    entry_id.column_id_inner(),
-                    entry_id.batch_id_inner() * self.batch_size() as u64,
-                    row_count,
-                    memory_size as u64,
-                    cache_type,
-                    reference_count as u64,
-                )
-                .unwrap();
-        });
+        self.cache_store
+            .for_each_entry(|entry_id, _, cached_batch| {
+                let memory_size = cached_batch.memory_usage_bytes();
+                let row_count = match cached_batch {
+                    CacheEntry::MemoryArrow(array) => Some(array.len() as u64),
+                    CacheEntry::MemoryLiquid(array) => Some(array.len() as u64),
+                    CacheEntry::DiskLiquid { .. } => None,
+                    CacheEntry::DiskArrow { .. } => None, // We'd need to read it to get the count
+                };
+                let cache_type = match cached_batch {
+                    CacheEntry::MemoryArrow(_) => "InMemory",
+                    CacheEntry::MemoryLiquid(_) => "LiquidMemory",
+                    CacheEntry::DiskLiquid { .. } => "OnDiskLiquid",
+                    CacheEntry::DiskArrow { .. } => "OnDiskArrow",
+                };
+                let reference_count = cached_batch.reference_count();
+                let entry_id = ParquetArrayID::from(*entry_id);
+                writer
+                    .append_entry(
+                        &entry_id.display_path(),
+                        entry_id.row_group_id_inner(),
+                        entry_id.column_id_inner(),
+                        entry_id.batch_id_inner() * self.batch_size() as u64,
+                        row_count,
+                        memory_size as u64,
+                        cache_type,
+                        reference_count as u64,
+                    )
+                    .unwrap();
+            });
 
         writer.finish()?;
         Ok(())
@@ -204,15 +205,21 @@ mod tests {
         let mut row_start_id_sum = 0;
         let mut row_count_sum = 0;
         let mut memory_size_sum = 0;
-        for file_no in 0..8 {
-            let file_name = format!("test_{file_no}.parquet");
-            let file = cache.register_or_get_file(
-                ParquetFileIdentity::new(
-                    datafusion::execution::object_store::ObjectStoreUrl::local_filesystem(),
-                    file_name,
-                ),
-                schema.clone(),
-            );
+        // Held for the whole loop, not per iteration: a file id is leased and
+        // comes back when its handle drops, so releasing each file before
+        // opening the next would hand them all the same id.
+        let files: Vec<_> = (0..8)
+            .map(|file_no| {
+                cache.register_or_get_file(
+                    ParquetFileIdentity::new(
+                        datafusion::execution::object_store::ObjectStoreUrl::local_filesystem(),
+                        format!("test_{file_no}.parquet"),
+                    ),
+                    schema.clone(),
+                )
+            })
+            .collect();
+        for file in &files {
             for rg in 0..8 {
                 let row_group = file.create_row_group(rg, vec![]);
                 for col in 0..8 {
