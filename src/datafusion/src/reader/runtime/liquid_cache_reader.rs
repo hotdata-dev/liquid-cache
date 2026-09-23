@@ -92,13 +92,17 @@ pub(crate) struct ParquetFallback {
 
 impl LiquidCacheReader {
     pub(crate) fn new(config: LiquidCacheReaderConfig) -> Self {
-        debug_assert_eq!(
-            config.batch_size,
-            config.cached_row_group.batch_size(),
-            "DataFusion and LiquidCache batch sizes must agree"
-        );
+        // The selection is walked in cache-sized windows, not session-sized
+        // ones. `current_batch_id` indexes stored chunks, and both the cache
+        // read and the parquet fallback turn that id back into rows with the
+        // cache batch size; windowing at `datafusion.execution.batch_size`
+        // would address different rows than the id names whenever a caller
+        // sets it to anything other than the cache's own size. The caller is
+        // unaffected either way: `DataSourceExec` re-splits every source
+        // stream to the session batch size.
+        let batch_size = config.cached_row_group.batch_size();
         let inner = LiquidCacheReaderInner::new(
-            config.batch_size,
+            batch_size,
             config.selection,
             config.cached_row_group,
             config.projection_columns,
