@@ -75,6 +75,30 @@ impl WriteIdentity {
     }
 }
 
+/// What an [`ArtIndex::insert`] did.
+///
+/// `displaced` is the entry this write replaced, with the identity that was
+/// recorded against it. It is handed back rather than dropped here because a
+/// store object is addressed by entry id *and* identity
+/// (`entry_id_to_key`): once another identity holds the key, nothing reachable
+/// through the index names the old object any more, so the caller has to delete
+/// it and give its disk bytes back or both leak for the life of the process.
+pub(crate) struct InsertOutcome {
+    /// Whether the batch was stored. False only for a stale rewrite.
+    pub(crate) stored: bool,
+    /// The entry this write replaced, and the identity that held it.
+    pub(crate) displaced: Option<(u64, Arc<CacheEntry>)>,
+}
+
+impl InsertOutcome {
+    fn dropped() -> Self {
+        Self {
+            stored: false,
+            displaced: None,
+        }
+    }
+}
+
 pub(crate) struct ArtIndex {
     art: CongeeArc<EntryID, Slot>,
     entry_count: AtomicUsize,
@@ -160,15 +184,17 @@ impl ArtIndex {
         self.get_checked(entry_id, identity).is_some()
     }
 
-    /// Store `batch` under `entry_id`, returning whether it was stored.
+    /// Store `batch` under `entry_id`, reporting what the write did.
     ///
-    /// See [`WriteIdentity`] for the two kinds of write and why they differ.
+    /// See [`WriteIdentity`] for the two kinds of write and why they differ, and
+    /// [`InsertOutcome`] for why a displaced entry has to be handed back rather
+    /// than dropped here.
     pub(crate) fn insert(
         &self,
         entry_id: &EntryID,
         identity: WriteIdentity,
         batch: CacheEntry,
-    ) -> bool {
+    ) -> InsertOutcome {
         let guard = self.art.pin();
         let existing_identity = self.art.get(*entry_id, &guard).map(|slot| slot.identity);
         let identity = match (identity, existing_identity) {
@@ -184,19 +210,65 @@ impl ArtIndex {
             // It does not: the entry was taken over or removed while this
             // rewrite was in flight, so the payload belongs to a source that
             // no longer owns the key. Drop it.
-            (WriteIdentity::Rewrite(_), _) => return false,
+            (WriteIdentity::Rewrite(_), _) => return InsertOutcome::dropped(),
         };
         let existing = self
             .art
             .insert(*entry_id, Slot::new(identity, batch), &guard)
             .expect("Insertion failed");
-        match existing {
-            Some(replaced) => drop(replaced.take()),
+        let displaced = match existing {
+            Some(replaced) => {
+                let was = replaced.identity;
+                replaced.take().map(|entry| (was, entry))
+            }
             None => {
                 self.entry_count.fetch_add(1, Ordering::Relaxed);
+                None
             }
+        };
+        InsertOutcome {
+            stored: true,
+            displaced,
         }
-        true
+    }
+
+    /// Remove an entry only if `identity` is the one that holds it.
+    ///
+    /// The unchecked [`Self::remove`] is for maintenance acting on whatever
+    /// occupies a key. A caller that read an entry earlier and then removes it
+    /// must come through here: between its read and its removal the key can
+    /// change hands, and removing the new owner's record would strand that
+    /// owner's store object while releasing a byte count taken from the record
+    /// it just destroyed.
+    pub(crate) fn remove_checked(
+        &self,
+        entry_id: &EntryID,
+        identity: u64,
+    ) -> Option<Arc<CacheEntry>> {
+        let guard = self.art.pin();
+        let slot = self.art.get(*entry_id, &guard)?;
+        if slot.identity != identity {
+            self.identity_mismatches.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        let removed = self.art.remove(*entry_id, &guard)?;
+        if removed.identity != identity {
+            // Lost the race between the check and the removal: put it back
+            // rather than destroying a record this caller has no claim on.
+            if let Some(entry) = removed.take() {
+                self.art
+                    .insert(
+                        *entry_id,
+                        Slot::new(removed.identity, (*entry).clone()),
+                        &guard,
+                    )
+                    .expect("Insertion failed");
+            }
+            self.identity_mismatches.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        self.entry_count.fetch_sub(1, Ordering::Relaxed);
+        removed.take()
     }
 
     pub(crate) fn remove(&self, entry_id: &EntryID) -> Option<Arc<CacheEntry>> {
@@ -334,7 +406,11 @@ mod tests {
         let store = ArtIndex::new();
         let key: EntryID = EntryID::from(7);
 
-        assert!(store.insert(&key, WriteIdentity::Owned(1), create_test_array(100)));
+        assert!(
+            store
+                .insert(&key, WriteIdentity::Owned(1), create_test_array(100))
+                .stored
+        );
 
         // The colliding file asks for the same key and is told nothing is there.
         assert!(store.get_checked(&key, 2).is_none());
@@ -346,7 +422,11 @@ mod tests {
 
         // The colliding file takes the key over. It has to: it cannot read
         // what is there, so leaving it would cost the key to both of them.
-        assert!(store.insert(&key, WriteIdentity::Owned(2), create_test_array(200)));
+        assert!(
+            store
+                .insert(&key, WriteIdentity::Owned(2), create_test_array(200))
+                .stored
+        );
         assert!(
             store.get_checked(&key, 1).is_none(),
             "the displaced file reads a miss, never the other file's rows"
@@ -369,19 +449,31 @@ mod tests {
         let key: EntryID = EntryID::from(11);
 
         // File A caches, and something begins rewriting that entry.
-        assert!(store.insert(&key, WriteIdentity::Owned(1), create_test_array(100)));
+        assert!(
+            store
+                .insert(&key, WriteIdentity::Owned(1), create_test_array(100))
+                .stored
+        );
         let (observed, _read) = store.get_with_identity(&key).unwrap();
         assert_eq!(observed, 1);
 
         // File B takes the key over while that rewrite is in flight.
-        assert!(store.insert(&key, WriteIdentity::Owned(2), create_test_array(200)));
+        assert!(
+            store
+                .insert(&key, WriteIdentity::Owned(2), create_test_array(200))
+                .stored
+        );
 
         // The rewrite lands too late and must be dropped, not relabelled.
-        assert!(!store.insert(
-            &key,
-            WriteIdentity::Rewrite(observed),
-            create_test_array(100)
-        ));
+        assert!(
+            !store
+                .insert(
+                    &key,
+                    WriteIdentity::Rewrite(observed),
+                    create_test_array(100)
+                )
+                .stored
+        );
 
         match store.get_checked(&key, 2).unwrap().as_ref() {
             CacheEntry::MemoryArrow(array) => assert_eq!(
@@ -402,15 +494,27 @@ mod tests {
         let store = ArtIndex::new();
         let key: EntryID = EntryID::from(9);
 
-        assert!(store.insert(&key, WriteIdentity::Owned(5), create_test_array(10)));
-        assert!(store.insert(&key, WriteIdentity::Rewrite(5), create_test_array(20)));
+        assert!(
+            store
+                .insert(&key, WriteIdentity::Owned(5), create_test_array(10))
+                .stored
+        );
+        assert!(
+            store
+                .insert(&key, WriteIdentity::Rewrite(5), create_test_array(20))
+                .stored
+        );
         assert!(
             store.get_checked(&key, 5).is_some(),
             "rewriting in place kept the identity"
         );
 
         store.remove(&key);
-        assert!(!store.insert(&key, WriteIdentity::Rewrite(5), create_test_array(30)));
+        assert!(
+            !store
+                .insert(&key, WriteIdentity::Rewrite(5), create_test_array(30))
+                .stored
+        );
         assert!(store.get(&key).is_none());
         assert_eq!(store.entry_count(), 0);
     }

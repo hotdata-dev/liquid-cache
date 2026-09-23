@@ -73,6 +73,51 @@ pub enum PrefetchResult {
 }
 
 /// Builder returned by [`LiquidCache::insert`] for configuring cache writes.
+/// Disk an insert left for its caller to reclaim.
+///
+/// A store object is addressed by entry id *and* the identity that wrote it, so
+/// an object stops being reachable through the index the moment the key changes
+/// hands or the write that produced it is dropped. Nothing else will ever delete
+/// it or release its bytes: `release_disk` is driven by an index entry, and by
+/// then no index entry names it.
+#[derive(Default)]
+struct DiskResidue {
+    /// `(identity, disk_bytes)` of a disk-resident entry this write displaced.
+    displaced: Option<(u64, usize)>,
+    /// The write itself did not land, so whatever the caller already wrote to
+    /// the store under its own identity is unreachable too.
+    dropped: bool,
+}
+
+impl DiskResidue {
+    fn dropped() -> Self {
+        Self {
+            displaced: None,
+            dropped: true,
+        }
+    }
+
+    /// Only a displacement by a *different* identity strands anything.
+    ///
+    /// The store key is `(entry id, identity)`, so a write under the identity
+    /// that already held the key addresses the very same object: the put
+    /// overwrote it, and reclaiming here would delete the bytes just written.
+    /// Across identities the two keys differ, and the old object becomes
+    /// unreachable the moment the index stops naming it.
+    fn displacing(displaced: Option<&(u64, Arc<CacheEntry>)>, writer: u64) -> Self {
+        Self {
+            displaced: displaced
+                .filter(|(identity, _)| *identity != writer)
+                .and_then(|(identity, entry)| match entry.as_ref() {
+                    CacheEntry::DiskLiquid { disk_bytes, .. }
+                    | CacheEntry::DiskArrow { disk_bytes, .. } => Some((*identity, *disk_bytes)),
+                    CacheEntry::MemoryArrow(_) | CacheEntry::MemoryLiquid(_) => None,
+                }),
+            dropped: false,
+        }
+    }
+}
+
 impl LiquidCache {
     /// Return current cache statistics: counts and resource usage.
     pub fn stats(&self) -> CacheStats {
@@ -282,12 +327,15 @@ impl LiquidCache {
                         .await
                     {
                         Ok(()) => {
-                            self.try_insert(
-                                entry_id,
-                                WriteIdentity::Rewrite(flush_identity),
-                                CacheEntry::disk_arrow(array.data_type().clone(), disk_bytes),
-                            )
-                            .expect("failed to insert disk arrow entry");
+                            let residue = self
+                                .try_insert(
+                                    entry_id,
+                                    WriteIdentity::Rewrite(flush_identity),
+                                    CacheEntry::disk_arrow(array.data_type().clone(), disk_bytes),
+                                )
+                                .expect("failed to insert disk arrow entry");
+                            self.settle(entry_id, residue, Some((flush_identity, disk_bytes)))
+                                .await;
                         }
                         Err(CacheFull) => self.drop_memory_entry(entry_id, &batch),
                     }
@@ -305,15 +353,18 @@ impl LiquidCache {
                         .await
                     {
                         Ok(()) => {
-                            self.try_insert(
-                                entry_id,
-                                WriteIdentity::Rewrite(flush_identity),
-                                CacheEntry::disk_liquid(
-                                    liquid_array.original_arrow_data_type(),
-                                    disk_bytes,
-                                ),
-                            )
-                            .expect("failed to insert disk liquid entry");
+                            let residue = self
+                                .try_insert(
+                                    entry_id,
+                                    WriteIdentity::Rewrite(flush_identity),
+                                    CacheEntry::disk_liquid(
+                                        liquid_array.original_arrow_data_type(),
+                                        disk_bytes,
+                                    ),
+                                )
+                                .expect("failed to insert disk liquid entry");
+                            self.settle(entry_id, residue, Some((flush_identity, disk_bytes)))
+                                .await;
                         }
                         Err(CacheFull) => self.drop_memory_entry(entry_id, &batch),
                     }
@@ -376,9 +427,16 @@ impl LiquidCache {
         identity: WriteIdentity,
         mut batch_to_cache: CacheEntry,
     ) -> Result<(), CacheFull> {
+        // Set once this loop spills the entry to disk itself: those bytes are the
+        // caller's own write, so a rewrite dropped as stale has to reclaim them.
+        let mut wrote = None;
         loop {
-            let Err(not_inserted) = self.try_insert(entry_id, identity, batch_to_cache) else {
-                return Ok(());
+            let not_inserted = match self.try_insert(entry_id, identity, batch_to_cache) {
+                Ok(residue) => {
+                    self.settle(entry_id, residue, wrote).await;
+                    return Ok(());
+                }
+                Err(not_inserted) => not_inserted,
             };
             self.trace(InternalEvent::InsertFailed {
                 entry: entry_id,
@@ -393,6 +451,11 @@ impl LiquidCache {
                 let on_disk_batch = self
                     .write_in_memory_batch_to_disk(entry_id, identity.value(), not_inserted)
                     .await?;
+                if let CacheEntry::DiskLiquid { disk_bytes, .. }
+                | CacheEntry::DiskArrow { disk_bytes, .. } = &on_disk_batch
+                {
+                    wrote = Some((identity.value(), *disk_bytes));
+                }
                 batch_to_cache = on_disk_batch;
                 continue;
             }
@@ -441,9 +504,9 @@ impl LiquidCache {
         entry_id: EntryID,
         identity: WriteIdentity,
         to_insert: CacheEntry,
-    ) -> Result<(), CacheEntry> {
+    ) -> Result<DiskResidue, CacheEntry> {
         let new_memory_size = to_insert.memory_usage_bytes();
-        let cached_batch_type = if let Some(entry) = self.index.get(&entry_id) {
+        let (cached_batch_type, outcome) = if let Some(entry) = self.index.get(&entry_id) {
             let old_memory_size = entry.memory_usage_bytes();
             if self
                 .budget
@@ -453,26 +516,29 @@ impl LiquidCache {
                 return Err(to_insert);
             }
             let batch_type = CachedBatchType::from(&to_insert);
-            // A rewrite whose key changed hands since it was read is dropped by
-            // the index. Give the reservation back rather than counting memory
-            // for an entry that was never stored.
-            if !self.index.insert(&entry_id, identity, to_insert) {
+            let outcome = self.index.insert(&entry_id, identity, to_insert);
+            if !outcome.stored {
+                // A rewrite whose key changed hands since it was read. Give the
+                // reservation back rather than counting memory for an entry that
+                // was never stored, and tell the caller its disk write is now
+                // unreachable.
                 self.budget
                     .try_update_memory_usage(new_memory_size, old_memory_size)
                     .ok();
-                return Ok(());
+                return Ok(DiskResidue::dropped());
             }
-            batch_type
+            (batch_type, outcome)
         } else {
             if self.budget.try_reserve_memory(new_memory_size).is_err() {
                 return Err(to_insert);
             }
             let batch_type = CachedBatchType::from(&to_insert);
-            if !self.index.insert(&entry_id, identity, to_insert) {
+            let outcome = self.index.insert(&entry_id, identity, to_insert);
+            if !outcome.stored {
                 self.budget.try_update_memory_usage(new_memory_size, 0).ok();
-                return Ok(());
+                return Ok(DiskResidue::dropped());
             }
-            batch_type
+            (batch_type, outcome)
         };
 
         self.trace(InternalEvent::InsertSuccess {
@@ -482,7 +548,51 @@ impl LiquidCache {
         self.cache_policy
             .notify_insert(&entry_id, cached_batch_type);
 
-        Ok(())
+        Ok(DiskResidue::displacing(
+            outcome.displaced.as_ref(),
+            identity.value(),
+        ))
+    }
+
+    /// Delete a store object nothing can reach any more and give its bytes back.
+    ///
+    /// Reached on the two paths where an object outlives the index entry that
+    /// named it: a write dropped as stale after its bytes were already written,
+    /// and an entry displaced by a write under a different identity. Both are
+    /// consequences of the store key carrying the identity — under a shared key
+    /// the next write simply overwrote the same object.
+    async fn reclaim_orphaned_disk(&self, entry_id: EntryID, identity: u64, disk_bytes: usize) {
+        match self
+            .store
+            .remove(&entry_id_to_key(&entry_id, identity))
+            .await
+        {
+            // `false` means the object was already gone, which is fine: the
+            // bytes still have to be given back either way.
+            Ok(_) | Err(t4::Error::NotFound) => {}
+            Err(error) => panic!("orphan remove failed: {error}"),
+        }
+        self.budget.release_disk(disk_bytes);
+        self.trace(InternalEvent::DiskEvict {
+            entry: entry_id,
+            bytes: disk_bytes,
+        });
+    }
+
+    /// Reclaim whatever an insert left unreachable, including the caller's own
+    /// write when it was dropped as stale.
+    ///
+    /// `wrote` is the (identity, bytes) the caller put in the store before the
+    /// insert, if any.
+    async fn settle(&self, entry_id: EntryID, residue: DiskResidue, wrote: Option<(u64, usize)>) {
+        if let Some((identity, bytes)) = residue.displaced {
+            self.reclaim_orphaned_disk(entry_id, identity, bytes).await;
+        }
+        if residue.dropped
+            && let Some((identity, bytes)) = wrote
+        {
+            self.reclaim_orphaned_disk(entry_id, identity, bytes).await;
+        }
     }
 
     fn drop_memory_entry(&self, entry_id: EntryID, _expected: &CacheEntry) {
@@ -503,7 +613,11 @@ impl LiquidCache {
     }
 
     async fn remove_disk_entry(&self, entry_id: EntryID, removed_identity: u64) {
-        let Some(removed) = self.index.remove(&entry_id) else {
+        // Checked: the caller read this entry earlier, and between then and now
+        // the key can change hands. Removing the new owner's record would strand
+        // its store object while releasing a byte count taken from the record
+        // just destroyed.
+        let Some(removed) = self.index.remove_checked(&entry_id, removed_identity) else {
             return;
         };
         let disk_bytes = match removed.as_ref() {
@@ -577,12 +691,19 @@ impl LiquidCache {
                     entry: new_batch,
                     bytes_to_write,
                 } => {
+                    // Remember what went to the store: if the rewrite is then
+                    // dropped as stale, these bytes are unreachable and have to
+                    // be reclaimed here.
+                    let mut wrote = None;
                     if let Some(bytes_to_write) = bytes_to_write {
+                        let len = bytes_to_write.len();
                         self.write_batch_to_disk(victim, identity, &new_batch, bytes_to_write)
                             .await?;
+                        wrote = Some((identity, len));
                     }
                     match self.try_insert(victim, WriteIdentity::Rewrite(identity), new_batch) {
-                        Ok(()) => {
+                        Ok(residue) => {
+                            self.settle(victim, residue, wrote).await;
                             break;
                         }
                         Err(batch) => {
@@ -984,6 +1105,69 @@ mod tests {
             let id_to_use = self.target_id.unwrap();
             vec![id_to_use]
         }
+    }
+
+    /// A rewrite that loses its key must not leave its disk write behind.
+    ///
+    /// The bytes were already in the store when the index refused the write, and
+    /// the store key carries the identity that wrote them, so nothing reachable
+    /// through the index names them afterwards: neither the object nor its share
+    /// of `used_disk_bytes` would ever come back.
+    #[tokio::test]
+    async fn a_dropped_rewrite_reclaims_the_disk_it_already_wrote() {
+        let store = create_cache_store(10 * 1024, Box::new(LiquidPolicy::new())).await;
+        let entry_id = EntryID::from(1usize);
+
+        // The owner caches an entry and flushes it, so a disk object exists.
+        store
+            .insert(entry_id, 7, create_test_arrow_array(64))
+            .await
+            .unwrap();
+        store.flush_all_to_disk().await.unwrap();
+        let after_flush = store.budget.disk_usage_bytes();
+        assert!(after_flush > 0, "flush must have written bytes");
+
+        // Another identity takes the key over, so the earlier owner's rewrite is
+        // now stale. Its disk object is unreachable and must be reclaimed.
+        store
+            .insert(entry_id, 9, create_test_arrow_array(64))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.budget.disk_usage_bytes(),
+            0,
+            "the displaced owner's disk bytes must be released, not stranded"
+        );
+        assert!(
+            store.get(&entry_id, 9).await.is_some(),
+            "the new owner must still read its own entry"
+        );
+        assert!(
+            store.get(&entry_id, 7).await.is_none(),
+            "the displaced owner must not read the new owner's rows"
+        );
+    }
+
+    /// The removal path is identity-checked: a caller that read an entry earlier
+    /// must not destroy the record of whoever holds the key now.
+    #[tokio::test]
+    async fn removing_a_disk_entry_under_a_stale_identity_is_refused() {
+        let store = create_cache_store(10 * 1024, Box::new(LiquidPolicy::new())).await;
+        let entry_id = EntryID::from(2usize);
+
+        store
+            .insert(entry_id, 3, create_test_arrow_array(64))
+            .await
+            .unwrap();
+        store.flush_all_to_disk().await.unwrap();
+
+        // A stale identity tries to evict it. Nothing of the current owner's may
+        // be touched.
+        store.remove_disk_entry(entry_id, 999).await;
+        assert!(
+            store.get(&entry_id, 3).await.is_some(),
+            "a stale remove must leave the current owner's entry readable"
+        );
     }
 
     #[tokio::test]
