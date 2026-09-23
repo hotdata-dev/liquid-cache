@@ -35,14 +35,17 @@ event=read entry=0 selection=false expr=None cached=DiskLiquid
 event=io_read_liquid entry=0 bytes=[bytes]
 event=hydrate entry=0 cached=DiskLiquid new=MemoryLiquid
 event=insert_success entry=0 kind=MemoryLiquid
+event=disk_evict entry=0 bytes=[bytes]
 event=read entry=1 selection=false expr=None cached=DiskLiquid
 event=io_read_liquid entry=1 bytes=[bytes]
 event=hydrate entry=1 cached=DiskLiquid new=MemoryLiquid
 event=insert_success entry=1 kind=MemoryLiquid
+event=disk_evict entry=1 bytes=[bytes]
 event=read entry=2 selection=false expr=None cached=DiskLiquid
 event=io_read_liquid entry=2 bytes=[bytes]
 event=hydrate entry=2 cached=DiskLiquid new=MemoryLiquid
 event=insert_success entry=2 kind=MemoryLiquid
+event=disk_evict entry=2 bytes=[bytes]
 event=read entry=3 selection=false expr=None cached=MemoryLiquid
 event=read entry=4 selection=false expr=None cached=MemoryArrow
 ]

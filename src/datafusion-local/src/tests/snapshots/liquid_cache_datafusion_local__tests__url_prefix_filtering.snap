@@ -64,6 +64,6 @@ RuntimeStatsSnapshot:
   try_read_liquid_calls: 0
   read_io_count: 1
   write_io_count: 0
-  disk_evictions: 0
+  disk_evictions: 1
   disk_reservation_failures: 0
   eval_predicate_on_liquid_failed: 0

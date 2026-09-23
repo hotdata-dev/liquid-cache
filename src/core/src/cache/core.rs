@@ -97,17 +97,28 @@ impl DiskResidue {
         }
     }
 
-    /// Only a displacement by a *different* identity strands anything.
+    /// A displaced disk entry's object survives this insert unless the insert
+    /// put its own bytes over it.
     ///
-    /// The store key is `(entry id, identity)`, so a write under the identity
-    /// that already held the key addresses the very same object: the put
-    /// overwrote it, and reclaiming here would delete the bytes just written.
-    /// Across identities the two keys differ, and the old object becomes
-    /// unreachable the moment the index stops naming it.
-    fn displacing(displaced: Option<&(u64, Arc<CacheEntry>)>, writer: u64) -> Self {
+    /// The store key is `(entry id, identity)`, so only a disk-resident entry
+    /// written under the identity that already held the key addresses the very
+    /// same object: there the put overwrote it, and reclaiming would delete the
+    /// bytes just written. Otherwise the object is left behind — a different
+    /// identity addresses a different key, and an entry that lives in memory
+    /// wrote nothing at all — and it becomes unreachable the moment the index
+    /// stops naming it.
+    fn displacing(
+        displaced: Option<&(u64, Arc<CacheEntry>)>,
+        writer: u64,
+        written: CachedBatchType,
+    ) -> Self {
+        let overwrites_in_place = matches!(
+            written,
+            CachedBatchType::DiskLiquid | CachedBatchType::DiskArrow
+        );
         Self {
             displaced: displaced
-                .filter(|(identity, _)| *identity != writer)
+                .filter(|(identity, _)| !(overwrites_in_place && *identity == writer))
                 .and_then(|(identity, entry)| match entry.as_ref() {
                     CacheEntry::DiskLiquid { disk_bytes, .. }
                     | CacheEntry::DiskArrow { disk_bytes, .. } => Some((*identity, *disk_bytes)),
@@ -551,16 +562,17 @@ impl LiquidCache {
         Ok(DiskResidue::displacing(
             outcome.displaced.as_ref(),
             identity.value(),
+            cached_batch_type,
         ))
     }
 
     /// Delete a store object nothing can reach any more and give its bytes back.
     ///
-    /// Reached on the two paths where an object outlives the index entry that
-    /// named it: a write dropped as stale after its bytes were already written,
-    /// and an entry displaced by a write under a different identity. Both are
-    /// consequences of the store key carrying the identity — under a shared key
-    /// the next write simply overwrote the same object.
+    /// Reached on the paths where an object outlives the index entry that named
+    /// it: a write dropped as stale after its bytes were already written, an
+    /// entry displaced by a write under a different identity, and a disk entry
+    /// replaced by a memory one — hydration, or a caller overwriting the value
+    /// — which puts nothing in the store and so leaves the old object whole.
     async fn reclaim_orphaned_disk(&self, entry_id: EntryID, identity: u64, disk_bytes: usize) {
         match self
             .store
@@ -1105,6 +1117,299 @@ mod tests {
             let id_to_use = self.target_id.unwrap();
             vec![id_to_use]
         }
+    }
+
+    /// Hydrating a disk entry must not charge its bytes to the disk budget
+    /// twice.
+    ///
+    /// The read that materializes a `DiskArrow`/`DiskLiquid` entry replaces it
+    /// with a memory entry. The store object under `(entry id, identity)` and
+    /// its share of `used_disk_bytes` outlive that replacement, so the next
+    /// spill reserves the same byte count again for an object the put simply
+    /// overwrites. Over a fixed working set, repeated read/spill rounds make
+    /// `disk_usage_bytes` climb without a byte more being written.
+    #[tokio::test]
+    async fn hydrating_a_disk_entry_does_not_recharge_its_disk_bytes() {
+        let store = create_cache_store(1 << 20, Box::new(LiquidPolicy::new())).await;
+        let entry_id = EntryID::from(500usize);
+        let array = create_test_arrow_array(1024);
+
+        store.insert(entry_id, 0, array.clone()).await.unwrap();
+        store.flush_all_to_disk().await.unwrap();
+        let charged = store.budget.disk_usage_bytes();
+        assert!(charged > 0, "flush must have written bytes");
+
+        let mut usage = vec![charged];
+        for _ in 0..3 {
+            // Reading a disk entry hydrates it back into memory ...
+            let read = store.get(&entry_id, 0).await.expect("present");
+            assert_eq!(read.as_ref(), array.as_ref());
+            assert!(matches!(
+                store.index().get(&entry_id).unwrap().as_ref(),
+                CacheEntry::MemoryArrow(_)
+            ));
+            // ... and the next flush spills the very same bytes again.
+            store.flush_all_to_disk().await.unwrap();
+            usage.push(store.budget.disk_usage_bytes());
+        }
+
+        assert_eq!(
+            usage,
+            vec![charged; 4],
+            "one entry of a fixed size occupies the same disk across read/spill rounds"
+        );
+    }
+
+    /// Every byte counted against the disk budget must belong to an index
+    /// entry that is on disk. Anything else can never be released:
+    /// `release_disk` is only ever reached from an index entry.
+    fn charged_disk_bytes_match_the_index(cache: &LiquidCache) -> (usize, usize) {
+        let mut named = 0usize;
+        cache.for_each_entry(|_, _, entry| match entry {
+            CacheEntry::DiskLiquid { disk_bytes, .. }
+            | CacheEntry::DiskArrow { disk_bytes, .. } => named += *disk_bytes,
+            CacheEntry::MemoryArrow(_) | CacheEntry::MemoryLiquid(_) => {}
+        });
+        (named, cache.budget.disk_usage_bytes())
+    }
+
+    /// Overwriting a disk-resident entry under the identity that already holds
+    /// the key must not leave the superseded copy charged.
+    ///
+    /// The store key is `(entry id, identity)`, so the object the old entry
+    /// named is still there — but this insert wrote nothing to the store, so
+    /// it did not overwrite it, and the index no longer names it.
+    #[tokio::test]
+    async fn overwriting_a_disk_entry_releases_the_superseded_copy() {
+        let store = create_cache_store(1 << 20, Box::new(LiquidPolicy::new())).await;
+        let entry_id = EntryID::from(501usize);
+
+        store
+            .insert(entry_id, 5, create_test_arrow_array(1024))
+            .await
+            .unwrap();
+        store.flush_all_to_disk().await.unwrap();
+        assert!(
+            store.budget.disk_usage_bytes() > 0,
+            "flush must have written"
+        );
+
+        // Same identity, new value: the index entry becomes a memory one.
+        store
+            .insert(entry_id, 5, create_test_arrow_array(2048))
+            .await
+            .unwrap();
+
+        let (named, charged) = charged_disk_bytes_match_the_index(&store);
+        assert_eq!(
+            charged, named,
+            "the superseded copy is still charged but no index entry names it"
+        );
+    }
+
+    /// An overwrite must never be readable as the value it replaced, and the
+    /// form recorded in the index must be the form the store actually holds.
+    #[tokio::test]
+    async fn an_overwritten_entry_never_reads_back_the_superseded_bytes() {
+        let store = create_cache_store(1 << 20, Box::new(LiquidPolicy::new())).await;
+        let entry_id = EntryID::from(502usize);
+        let first = create_test_arrow_array(1024);
+        let second: ArrayRef = Arc::new(arrow::array::Int64Array::from_iter_values(
+            (0..2048).map(|v| v + 1_000_000),
+        ));
+
+        store.insert(entry_id, 5, first.clone()).await.unwrap();
+        store.flush_all_to_disk().await.unwrap();
+        assert!(matches!(
+            store.index().get(&entry_id).unwrap().as_ref(),
+            CacheEntry::DiskArrow { .. }
+        ));
+
+        store.insert(entry_id, 5, second.clone()).await.unwrap();
+        assert_eq!(
+            store.get(&entry_id, 5).await.expect("present").as_ref(),
+            second.as_ref(),
+            "the overwrite must be what a read returns"
+        );
+
+        // Spill again: whatever form the index records has to match the bytes
+        // the store now holds, or the next read decodes one as the other.
+        store.flush_all_to_disk().await.unwrap();
+        assert!(
+            matches!(
+                store.index().get(&entry_id).unwrap().as_ref(),
+                CacheEntry::DiskArrow { .. }
+            ),
+            "an Arrow flush must be recorded as an Arrow copy"
+        );
+        assert_eq!(
+            store.get(&entry_id, 5).await.expect("present").as_ref(),
+            second.as_ref(),
+            "reading the spilled copy must not return the superseded value"
+        );
+    }
+
+    /// A hydrated entry that is then transcoded and spilled must be recorded
+    /// as the form it was written in, not the form it was hydrated from.
+    #[tokio::test]
+    async fn a_hydrated_then_transcoded_entry_is_recorded_as_what_was_written() {
+        let store = create_cache_store(1 << 20, Box::new(LiquidPolicy::new())).await;
+        let entry_id = EntryID::from(503usize);
+        let array = create_test_arrow_array(1024);
+
+        store.insert(entry_id, 5, array.clone()).await.unwrap();
+        store.flush_all_to_disk().await.unwrap();
+
+        // Hydrate the Arrow copy back into memory ...
+        store.get(&entry_id, 5).await.expect("present");
+        // ... transcode it to liquid, then spill it as liquid.
+        store
+            .evict_victim_inner(entry_id)
+            .await
+            .expect("transcode must fit");
+        assert!(matches!(
+            store.index().get(&entry_id).unwrap().as_ref(),
+            CacheEntry::MemoryLiquid(_)
+        ));
+        store.flush_all_to_disk().await.unwrap();
+        assert!(
+            matches!(
+                store.index().get(&entry_id).unwrap().as_ref(),
+                CacheEntry::DiskLiquid { .. }
+            ),
+            "a liquid flush must be recorded as a liquid copy"
+        );
+
+        assert_eq!(
+            store.get(&entry_id, 5).await.expect("present").as_ref(),
+            array.as_ref(),
+            "a liquid stub must not be decoded over Arrow IPC bytes"
+        );
+        let (named, charged) = charged_disk_bytes_match_the_index(&store);
+        assert_eq!(
+            charged, named,
+            "the Arrow copy it was hydrated from is still charged"
+        );
+    }
+
+    /// A flush that cannot place an entry on disk drops it. Nothing of that
+    /// entry may stay charged against the disk budget afterwards.
+    #[tokio::test]
+    async fn a_flush_that_drops_an_entry_leaves_no_disk_charged_to_it() {
+        let array = create_test_arrow_array(1024);
+        let one_copy = arrow_to_bytes(&array).unwrap().len();
+        let cache = LiquidCacheBuilder::new()
+            .with_max_memory_bytes(1 << 20)
+            .with_max_disk_bytes(one_copy)
+            .with_eviction_policy(Box::new(TranscodeEvict))
+            .with_hydration_policy(Box::new(crate::cache::AlwaysHydrate::new()))
+            .with_cache_policy(Box::new(LiquidPolicy::new()))
+            .build()
+            .await;
+        let first = EntryID::from(504usize);
+        let second = EntryID::from(505usize);
+
+        cache.insert(first, 0, array.clone()).await.unwrap();
+        cache.flush_all_to_disk().await.unwrap();
+        // Reading it brings it back into memory; the disk tier should now be
+        // empty, so the next flush has room for both entries.
+        cache.get(&first, 0).await.expect("present");
+
+        cache.insert(second, 0, array.clone()).await.unwrap();
+        cache.flush_all_to_disk().await.unwrap();
+
+        let (named, charged) = charged_disk_bytes_match_the_index(&cache);
+        assert_eq!(
+            charged, named,
+            "disk charged to entries the flush dropped can never be released"
+        );
+    }
+
+    /// A takeover landing *during* a rewrite's `store.put` must leave the new
+    /// owner whole: its bytes, its record, and its share of the budget.
+    ///
+    /// The steps below are what `evict_victim_inner` does — read the entry with
+    /// the identity it holds, write it to the store, then swap the record — with
+    /// the takeover injected between the read and the write, which is the one
+    /// interleaving that ordering cannot be produced by calling it once.
+    ///
+    /// Three things hold it together, and the first is the decisive one:
+    /// `entry_id_to_key` puts the writer's identity in the store key, so the
+    /// stale put addresses its own object and can never reach the new owner's;
+    /// `WriteIdentity::Rewrite` makes the index refuse the record swap; and
+    /// `settle` reclaims the object the refused write had already put there.
+    #[tokio::test]
+    async fn a_takeover_during_a_rewrites_disk_write_leaves_the_new_owner_whole() {
+        let cache = create_cache_store(1 << 20, Box::new(LiquidPolicy::new())).await;
+        let entry_id = EntryID::from(600usize);
+        let theirs = create_test_arrow_array(1024);
+        let ours: ArrayRef = Arc::new(arrow::array::Int64Array::from_iter_values(
+            (0..512).map(|v| v + 7_000_000),
+        ));
+
+        // Identity 7 caches an entry, and eviction picks it up.
+        cache.insert(entry_id, 7, theirs.clone()).await.unwrap();
+        let (observed, _read) = cache.index().get_with_identity(&entry_id).unwrap();
+        assert_eq!(observed, 7);
+        let stale_bytes = arrow_to_bytes(&theirs).unwrap();
+        let stale_len = stale_bytes.len();
+        let stale_rewrite = CacheEntry::disk_arrow(theirs.data_type().clone(), stale_len);
+
+        // Identity 9 takes the key over and puts its own copy on disk.
+        cache.insert(entry_id, 9, ours.clone()).await.unwrap();
+        cache.flush_all_to_disk().await.unwrap();
+        let owner_bytes = match cache.index().get(&entry_id).unwrap().as_ref() {
+            CacheEntry::DiskArrow { disk_bytes, .. } => *disk_bytes,
+            other => panic!("expected the new owner on disk, found {other}"),
+        };
+
+        // Only now does the stale rewrite's write complete ...
+        cache
+            .write_batch_to_disk(entry_id, observed, &stale_rewrite, stale_bytes)
+            .await
+            .unwrap();
+        // ... and reach the record swap.
+        let residue = cache
+            .try_insert(entry_id, WriteIdentity::Rewrite(observed), stale_rewrite)
+            .expect("a refused rewrite is not a failure to insert");
+        cache
+            .settle(entry_id, residue, Some((observed, stale_len)))
+            .await;
+
+        // The stale writer's object is gone; the new owner's is not.
+        assert!(
+            matches!(
+                cache.store.get(&entry_id_to_key(&entry_id, observed)).await,
+                Err(t4::Error::NotFound)
+            ),
+            "the refused rewrite must take its own write back"
+        );
+        assert!(
+            cache
+                .store
+                .get(&entry_id_to_key(&entry_id, 9))
+                .await
+                .is_ok(),
+            "the new owner's object must survive a stale writer"
+        );
+        let (named, charged) = charged_disk_bytes_match_the_index(&cache);
+        assert_eq!(charged, named);
+        assert_eq!(charged, owner_bytes, "only the new owner's copy is charged");
+
+        // And the new owner's record still names bytes that decode to its rows.
+        assert!(matches!(
+            cache.index().get(&entry_id).unwrap().as_ref(),
+            CacheEntry::DiskArrow { .. }
+        ));
+        assert_eq!(
+            cache.get(&entry_id, 9).await.expect("present").as_ref(),
+            ours.as_ref(),
+            "the new owner must read its own rows, never the stale writer's"
+        );
+        assert!(
+            cache.get(&entry_id, 7).await.is_none(),
+            "the displaced identity reads a miss"
+        );
     }
 
     /// A rewrite that loses its key must not leave its disk write behind.
