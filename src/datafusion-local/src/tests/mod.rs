@@ -22,6 +22,7 @@ use crate::LiquidCacheLocalBuilder;
 mod date_optimizer;
 mod filter_limit;
 mod nested_filter;
+mod unevaluable_conjunct;
 mod variants;
 
 const TEST_FILE: &str = "../../examples/nano_hits.parquet";
