@@ -240,35 +240,65 @@ impl ArtIndex {
     /// change hands, and removing the new owner's record would strand that
     /// owner's store object while releasing a byte count taken from the record
     /// it just destroyed.
+    ///
+    /// Deciding and removing are one operation, not a check followed by a
+    /// remove: `compute_if_present` decides against the value the tree
+    /// publishes, so a key that has changed hands is left alone rather than
+    /// destroyed, and no record is ever put back over a writer that arrived
+    /// meanwhile.
+    ///
+    /// The closure runs under an optimistic read and the tree upgrades to a
+    /// write only afterwards, so a failed upgrade runs it again — against
+    /// whatever the key holds on that attempt. Only the last run is the one
+    /// the tree acts on, so the verdict is recomputed on every run rather
+    /// than latched on the first: a run that found the record ours followed
+    /// by a retry that finds it someone else's must report a mismatch, not a
+    /// removal that never happened.
     pub(crate) fn remove_checked(
         &self,
         entry_id: &EntryID,
         identity: u64,
     ) -> Option<Arc<CacheEntry>> {
         let guard = self.art.pin();
-        let slot = self.art.get(*entry_id, &guard)?;
-        if slot.identity != identity {
-            self.identity_mismatches.fetch_add(1, Ordering::Relaxed);
-            return None;
-        }
-        let removed = self.art.remove(*entry_id, &guard)?;
-        if removed.identity != identity {
-            // Lost the race between the check and the removal: put it back
-            // rather than destroying a record this caller has no claim on.
-            if let Some(entry) = removed.take() {
-                self.art
-                    .insert(
-                        *entry_id,
-                        Slot::new(removed.identity, (*entry).clone()),
-                        &guard,
-                    )
-                    .expect("Insertion failed");
-            }
+        let mut was_ours = false;
+        let previous = self.art.compute_if_present(
+            *entry_id,
+            |slot| {
+                was_ours = slot.identity == identity;
+                if was_ours {
+                    None
+                } else {
+                    // Unchanged, and the tree short-circuits on an unchanged
+                    // value, so nothing is republished over the holder.
+                    Some(slot)
+                }
+            },
+            &guard,
+        )?;
+        if !was_ours {
             self.identity_mismatches.fetch_add(1, Ordering::Relaxed);
             return None;
         }
         self.entry_count.fetch_sub(1, Ordering::Relaxed);
-        removed.take()
+        previous.take()
+    }
+
+    /// Does a live record still name the store object at `(entry_id, identity)`?
+    ///
+    /// A store key is `(entry id, identity)` (`entry_id_to_key`), so this is
+    /// what a caller about to delete such an object has to ask: an identity
+    /// comes back — the file-id pool hands a re-opened path its previous
+    /// record — and a write under it can occupy the key again between the
+    /// moment a deletion was decided and the moment it runs.
+    pub(crate) fn holds_disk_entry(&self, entry_id: &EntryID, identity: u64) -> bool {
+        let Some((held, entry)) = self.get_with_identity(entry_id) else {
+            return false;
+        };
+        held == identity
+            && matches!(
+                entry.as_ref(),
+                CacheEntry::DiskLiquid { .. } | CacheEntry::DiskArrow { .. }
+            )
     }
 
     pub(crate) fn remove(&self, entry_id: &EntryID) -> Option<Arc<CacheEntry>> {
@@ -316,6 +346,7 @@ impl ArtIndex {
 mod tests {
     use crate::cache::cached_batch::CacheEntry;
     use crate::cache::utils::create_test_array;
+    use crate::sync::thread;
 
     use super::*;
 
@@ -483,6 +514,107 @@ mod tests {
             ),
             other => panic!("expected the new owner's array, found {other}"),
         }
+    }
+
+    /// A checked removal must not overwrite or strand a record that arrived
+    /// while it ran.
+    ///
+    /// Three writers to one key, which is the shape the reviewer named A-B-C:
+    /// A removes under the identity it read, B takes the key over, and C takes
+    /// it over after B. Whatever order they land in, the index has to stay
+    /// self-consistent — every key it holds is counted, every record it holds
+    /// is one a writer installed paired with that writer's array, and a
+    /// removal only ever hands back the record it was entitled to.
+    ///
+    /// Deciding and removing as one operation is what makes that hold. A
+    /// removal that tested the identity, removed, then put back what it found
+    /// could publish its restore over C and lose C's record: the key would
+    /// hold B while `entry_count` counted C too.
+    ///
+    /// `takeovers` names the identities that race the removal, so a caller can
+    /// widen the race without restating the setup.
+    fn checked_removal_against_takeovers(takeovers: &[u64]) {
+        let index = Arc::new(ArtIndex::new());
+        let key = EntryID::from(21);
+        index.insert(&key, WriteIdentity::Owned(1), create_test_array(10));
+
+        let remover = {
+            let index = Arc::clone(&index);
+            thread::spawn(move || index.remove_checked(&key, 1))
+        };
+        let takeovers: Vec<_> = takeovers
+            .iter()
+            .copied()
+            .map(|who| {
+                let index = Arc::clone(&index);
+                thread::spawn(move || {
+                    index.insert(
+                        &key,
+                        WriteIdentity::Owned(who),
+                        create_test_array(who as usize * 10),
+                    );
+                })
+            })
+            .collect();
+        let removed = remover.join().unwrap();
+        for takeover in takeovers {
+            takeover.join().unwrap();
+        }
+
+        if let Some(removed) = removed {
+            let CacheEntry::MemoryArrow(array) = removed.as_ref() else {
+                panic!("only memory entries were written")
+            };
+            assert_eq!(
+                array.len(),
+                10,
+                "a checked removal handed back a record it did not name"
+            );
+        }
+        if let Some((identity, entry)) = index.get_with_identity(&key) {
+            let CacheEntry::MemoryArrow(array) = entry.as_ref() else {
+                panic!("only memory entries were written")
+            };
+            assert_eq!(
+                array.len(),
+                identity as usize * 10,
+                "the key holds identity {identity} against another writer's array"
+            );
+        }
+        assert_eq!(
+            index.entry_count(),
+            index.keys().len(),
+            "every key the index holds must be counted: an uncounted one is a \
+             record nothing will ever release"
+        );
+    }
+
+    #[test]
+    fn concurrent_checked_removal_against_takeovers() {
+        checked_removal_against_takeovers(&[2, 3]);
+    }
+
+    /// The same race as above, run until the tree makes a checked removal
+    /// retry.
+    ///
+    /// `compute_if_present` decides under an optimistic read and upgrades to a
+    /// write afterwards, so a removal whose upgrade loses runs its closure
+    /// again — and the key can belong to someone else by then. A single round
+    /// almost never reaches that interleaving, so the round above can hold a
+    /// verdict latched on the first run and still pass. More writers on the
+    /// key and enough rounds is what finds it.
+    #[test]
+    fn a_checked_removal_that_retries_reports_the_verdict_it_acted_on() {
+        for _ in 0..20_000 {
+            checked_removal_against_takeovers(&[2, 3, 4, 5]);
+        }
+    }
+
+    /// The same three writers, every interleaving the model checker can reach.
+    #[cfg(feature = "shuttle")]
+    #[test]
+    fn shuttle_checked_removal_against_takeovers() {
+        crate::utils::shuttle_test(|| checked_removal_against_takeovers(&[2, 3]));
     }
 
     /// Maintenance rewrites a key in place and must neither change whose the
