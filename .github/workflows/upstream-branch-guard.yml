@@ -1,0 +1,102 @@
+# An `upstream/**` branch exists to become a pull request against
+# datafusion-contrib/liquid-cache. Our `main` is upstream plus this fork's
+# patches, so a branch cut from `main` carries every one of those patches into
+# the upstream diff. This fails that on push, before a PR exists, and explains
+# why.
+name: upstream branch guard
+
+on:
+  push:
+    branches: ['upstream/**']
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    name: branch is based on upstream, not on our main
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check where this branch diverged
+        run: |
+          set -euo pipefail
+
+          git fetch --quiet origin main:refs/remotes/origin/main
+          git fetch --quiet https://github.com/datafusion-contrib/liquid-cache main
+          upstream=$(git rev-parse FETCH_HEAD)
+
+          # Where this branch and our main last shared history. A branch cut
+          # from upstream shares only upstream history with our main, so that
+          # point is a commit upstream has. A branch cut from our main shares a
+          # fork commit, and upstream never contains one.
+          #
+          # Testing the merge base rather than our main's tip matters: `main`
+          # moves with every merge, so a branch cut from `main` last week has
+          # today's tip nowhere in its history and would look clean.
+          base=$(git merge-base HEAD refs/remotes/origin/main)
+
+          if git merge-base --is-ancestor "$base" "$upstream"; then
+            own=$(git rev-list --count "$upstream"..HEAD)
+            echo "OK: this branch diverged from upstream history, not from our fork's."
+            echo "It adds $own commit(s) on top of upstream, which is what an upstream branch should look like."
+            exit 0
+          fi
+
+          carried=$(git rev-list --count "$upstream".."$base")
+          cat <<MSG
+
+          ============================================================
+          This branch is named upstream/** but is based on our main.
+          ============================================================
+
+          WHAT THIS MEANS
+            Our main is upstream's history plus this fork's patches. This
+            branch last shared history with our main at a commit upstream does
+            not have, so it is built on top of our patches:
+
+              branch point : $(git log --oneline -1 "$base")
+              upstream tip : $(git log --oneline -1 "$upstream")
+
+            That puts $carried fork commit(s) in this branch that upstream
+            does not have. The first few:
+
+          $(git log --oneline "$upstream".."$base" | head -5 | sed 's/^/    /')
+
+          WHY IT MATTERS
+            A pull request against datafusion-contrib/liquid-cache diffs this
+            branch against THEIR main. Every one of those commits shows up in
+            the diff. The reviewer sees a change far larger than the one being
+            proposed, mixed with work that was never meant for them, and
+            cannot review it.
+
+            Some of our patches also repair machinery upstream does not have
+            at all -- DiskResidue, reclaim_orphaned_disk, settle. Those cannot
+            apply to their tree even in principle.
+
+          HOW TO FIX IT
+            Start from upstream's commit rather than from ours, and move your
+            change across:
+
+              git fetch https://github.com/datafusion-contrib/liquid-cache main
+              git checkout -b upstream/<topic> FETCH_HEAD
+              git cherry-pick <your commits>
+
+          HOW TO CHECK BEFORE PUSHING
+            This must list only the commits you wrote. Anything else in it is
+            a fork patch that would land in the upstream diff:
+
+              git fetch https://github.com/datafusion-contrib/liquid-cache main
+              git log --oneline FETCH_HEAD..HEAD
+
+          ONE MORE THING
+            Reproduce the bug on upstream's tree before opening the PR: apply
+            your test alone, watch it fail there, then apply the fix. A fix
+            whose code still exists upstream is not evidence the bug does.
+
+          MSG
+          echo "::error::Branch is based on our main and carries $carried fork commit(s); an upstream PR from it would include them. See the log above."
+          exit 1
