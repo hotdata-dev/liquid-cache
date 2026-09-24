@@ -82,8 +82,13 @@ pub enum PrefetchResult {
 /// then no index entry names it.
 #[derive(Default)]
 struct DiskResidue {
-    /// `(identity, disk_bytes)` of a disk-resident entry this write displaced.
+    /// `(identity, disk_bytes)` of a disk-resident entry this write displaced,
+    /// whose object is now unreachable and has to be deleted.
     displaced: Option<(u64, usize)>,
+    /// Bytes of a displaced disk entry whose object this write *overwrote in
+    /// place*. The object is current and must be kept; only the superseded
+    /// entry's reservation is given back, or one object is charged twice.
+    superseded: Option<usize>,
     /// The write itself did not land, so whatever the caller already wrote to
     /// the store under its own identity is unreachable too.
     dropped: bool,
@@ -93,6 +98,7 @@ impl DiskResidue {
     fn dropped() -> Self {
         Self {
             displaced: None,
+            superseded: None,
             dropped: true,
         }
     }
@@ -116,15 +122,25 @@ impl DiskResidue {
             written,
             CachedBatchType::DiskLiquid | CachedBatchType::DiskArrow
         );
-        Self {
-            displaced: displaced
-                .filter(|(identity, _)| !(overwrites_in_place && *identity == writer))
-                .and_then(|(identity, entry)| match entry.as_ref() {
-                    CacheEntry::DiskLiquid { disk_bytes, .. }
-                    | CacheEntry::DiskArrow { disk_bytes, .. } => Some((*identity, *disk_bytes)),
-                    CacheEntry::MemoryArrow(_) | CacheEntry::MemoryLiquid(_) => None,
-                }),
-            dropped: false,
+        let disk_bytes = displaced.and_then(|(identity, entry)| match entry.as_ref() {
+            CacheEntry::DiskLiquid { disk_bytes, .. }
+            | CacheEntry::DiskArrow { disk_bytes, .. } => Some((*identity, *disk_bytes)),
+            CacheEntry::MemoryArrow(_) | CacheEntry::MemoryLiquid(_) => None,
+        });
+        // Same identity and a disk-resident write means this put landed on the
+        // very object the displaced entry named: keep the object, give back only
+        // its reservation. Anything else leaves an object nothing can reach.
+        match disk_bytes {
+            Some((identity, bytes)) if overwrites_in_place && identity == writer => Self {
+                displaced: None,
+                superseded: Some(bytes),
+                dropped: false,
+            },
+            other => Self {
+                displaced: other,
+                superseded: None,
+                dropped: false,
+            },
         }
     }
 }
@@ -599,6 +615,11 @@ impl LiquidCache {
     async fn settle(&self, entry_id: EntryID, residue: DiskResidue, wrote: Option<(u64, usize)>) {
         if let Some((identity, bytes)) = residue.displaced {
             self.reclaim_orphaned_disk(entry_id, identity, bytes).await;
+        }
+        if let Some(bytes) = residue.superseded {
+            // The object stays — this write overwrote it — so only the byte
+            // count the superseded entry held is returned.
+            self.budget.release_disk(bytes);
         }
         if residue.dropped
             && let Some((identity, bytes)) = wrote
@@ -1157,6 +1178,53 @@ mod tests {
             usage,
             vec![charged; 4],
             "one entry of a fixed size occupies the same disk across read/spill rounds"
+        );
+    }
+
+    /// A spill that overwrites an entry's own disk object in place must release
+    /// the copy it superseded.
+    ///
+    /// Reported by review. The store key is `(entry id, identity)`, so this
+    /// insert's put landed on the very object the old entry named — deleting it
+    /// would destroy the bytes just written. But the old entry's reservation is
+    /// still counted, so one object ends up charged twice.
+    #[tokio::test]
+    async fn an_in_place_disk_overwrite_releases_the_copy_it_supersedes() {
+        // Tiny, so the second insert cannot stay in memory and — with only a
+        // disk entry present — has no memory victim to evict. `insert_inner`
+        // then spills the batch itself and re-inserts it over its own object.
+        let store = create_cache_store(64, Box::new(LiquidPolicy::new())).await;
+        let entry_id = EntryID::from(1usize);
+
+        // Get the key onto disk first, so the next insert displaces a disk entry.
+        store
+            .insert(entry_id, 7, create_test_arrow_array(512))
+            .await
+            .unwrap();
+        store.flush_all_to_disk().await.unwrap();
+        let (named_once, charged_once) = charged_disk_bytes_match_the_index(&store);
+        assert!(
+            named_once > 0,
+            "the entry must be on disk for this to test anything"
+        );
+        assert_eq!(named_once, charged_once, "baseline must be consistent");
+
+        // Same key, same identity, written to disk again over its own object.
+        store
+            .insert(entry_id, 7, create_test_arrow_array(4096))
+            .await
+            .unwrap();
+
+        let (named, charged) = charged_disk_bytes_match_the_index(&store);
+        let mut kinds = Vec::new();
+        store.for_each_entry(|_, _, e| kinds.push(CachedBatchType::from(e)));
+        println!(
+            "PROBE first: named={named_once} charged={charged_once}; \
+             second: named={named} charged={charged}; entries={kinds:?}"
+        );
+        assert_eq!(
+            charged, named,
+            "the superseded copy must be released: one object, one reservation"
         );
     }
 
