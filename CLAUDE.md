@@ -11,8 +11,10 @@ on every sync. Add a file upstream does not have instead.
 
 ## Branches
 
-- Work off `main`. `git fetch fork` first — a local `main` goes stale with no
-  signal, and branching off a stale one silently drops everything merged since.
+- Work off `main`. Fetch first — a local `main` goes stale with no signal, and
+  branching off a stale one silently drops everything merged since. The remote
+  is `origin` in a fresh clone; if you cloned upstream and added this fork as a
+  second remote, use that name instead.
 - **Upstream PRs branch from upstream, not from `main`**, and are named
   `upstream/<topic>`. A branch cut from `main` carries our whole patch stack
   into the PR diff.
@@ -22,8 +24,17 @@ on every sync. Add a file upstream does not have instead.
   git checkout -b upstream/<topic> FETCH_HEAD
   ```
 
-  `.github/workflows/upstream-branch-guard.yml` fails any `upstream/**` branch
-  that descends from `main`, on push, before a PR exists.
+  Before pushing, this must list only the commits you wrote — anything else is
+  a fork patch that would land in the upstream diff:
+
+  ```
+  git log --oneline FETCH_HEAD..HEAD
+  ```
+
+  `.github/workflows/upstream-branch-guard.yml` checks the same property on
+  push, before a PR exists. It tests where the branch diverged rather than
+  whether it contains `main`'s current tip, because `main` moves with every
+  merge and a branch cut from it last week contains today's tip nowhere.
 
 - Before raising an upstream PR, reproduce the bug **on upstream's tree** —
   apply the test alone, watch it fail, then apply the fix. A fix whose code
