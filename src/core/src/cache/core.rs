@@ -72,7 +72,6 @@ pub enum PrefetchResult {
     Absent,
 }
 
-/// Builder returned by [`LiquidCache::insert`] for configuring cache writes.
 /// Disk an insert left for its caller to reclaim.
 ///
 /// A store object is addressed by entry id *and* the identity that wrote it, so
@@ -1216,12 +1215,6 @@ mod tests {
             .unwrap();
 
         let (named, charged) = charged_disk_bytes_match_the_index(&store);
-        let mut kinds = Vec::new();
-        store.for_each_entry(|_, _, e| kinds.push(CachedBatchType::from(e)));
-        println!(
-            "PROBE first: named={named_once} charged={charged_once}; \
-             second: named={named} charged={charged}; entries={kinds:?}"
-        );
         assert_eq!(
             charged, named,
             "the superseded copy must be released: one object, one reservation"
