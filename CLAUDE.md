@@ -25,9 +25,12 @@ on every sync. Add a file upstream does not have instead.
   ```
 
   Before pushing, this must list only the commits you wrote — anything else is
-  a fork patch that would land in the upstream diff:
+  a fork patch that would land in the upstream diff. Re-fetch upstream on the
+  line above it: `FETCH_HEAD` holds whatever the last fetch wrote, so after a
+  `git fetch origin` it is *our* `main` and the check hides every fork patch.
 
   ```
+  git fetch https://github.com/datafusion-contrib/liquid-cache main
   git log --oneline FETCH_HEAD..HEAD
   ```
 
