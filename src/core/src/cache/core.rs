@@ -588,17 +588,35 @@ impl LiquidCache {
     /// entry displaced by a write under a different identity, and a disk entry
     /// replaced by a memory one — hydration, or a caller overwriting the value
     /// — which puts nothing in the store and so leaves the old object whole.
+    ///
+    /// The deletion is conditional because a store key is
+    /// `(entry id, identity)` and an identity comes back: the file-id pool
+    /// hands a re-opened path its previous record, so a fresh write can occupy
+    /// this key between the moment a reclaim was decided and the moment it
+    /// runs. `holds_disk_entry` asks the index whether a live record names the
+    /// object right now; if one does, that record's write put the bytes that
+    /// are there and deleting them would leave it pointing at nothing.
+    ///
+    /// The check is a read, and the deletion that follows it is an await, so it
+    /// narrows the window rather than closing it: a put that has landed but
+    /// whose record has not yet been installed is still invisible here. Closing
+    /// it needs the store key to name the write, not just the writer.
     async fn reclaim_orphaned_disk(&self, entry_id: EntryID, identity: u64, disk_bytes: usize) {
-        match self
-            .store
-            .remove(&entry_id_to_key(&entry_id, identity))
-            .await
-        {
-            // `false` means the object was already gone, which is fine: the
-            // bytes still have to be given back either way.
-            Ok(_) | Err(t4::Error::NotFound) => {}
-            Err(error) => panic!("orphan remove failed: {error}"),
+        if !self.index.holds_disk_entry(&entry_id, identity) {
+            match self
+                .store
+                .remove(&entry_id_to_key(&entry_id, identity))
+                .await
+            {
+                // `false` means the object was already gone, which is fine: the
+                // bytes still have to be given back either way.
+                Ok(_) | Err(t4::Error::NotFound) => {}
+                Err(error) => panic!("orphan remove failed: {error}"),
+            }
         }
+        // The reservation belonged to the record that is gone, so it comes back
+        // whether or not the object did: an object left standing is one a newer
+        // record overwrote, and that record reserved its own bytes for it.
         self.budget.release_disk(disk_bytes);
         self.trace(InternalEvent::DiskEvict {
             entry: entry_id,
@@ -657,16 +675,12 @@ impl LiquidCache {
             | CacheEntry::DiskArrow { disk_bytes, .. } => *disk_bytes,
             _ => panic!("remove_disk_entry called for non-disk entry"),
         };
-        self.store
-            .remove(&entry_id_to_key(&entry_id, removed_identity))
-            .await
-            .expect("disk remove failed");
-        self.budget.release_disk(disk_bytes);
+        // Through the same reclaim as every other orphan: the record is gone,
+        // so the object is unreachable, and the gap before the delete is the
+        // gap a re-used identity can write into.
+        self.reclaim_orphaned_disk(entry_id, removed_identity, disk_bytes)
+            .await;
         self.cache_policy.notify_remove(&entry_id);
-        self.trace(InternalEvent::DiskEvict {
-            entry: entry_id,
-            bytes: disk_bytes,
-        });
     }
 
     /// Consume the trace of the cache, for testing only.
@@ -1184,18 +1198,23 @@ mod tests {
     /// the copy it superseded.
     ///
     /// Reported by review. The store key is `(entry id, identity)`, so this
-    /// insert's put landed on the very object the old entry named — deleting it
+    /// write's put landed on the very object the old entry named — deleting it
     /// would destroy the bytes just written. But the old entry's reservation is
     /// still counted, so one object ends up charged twice.
+    ///
+    /// The two steps are written out rather than reached through `insert`.
+    /// Which write displaces the disk entry is a consequence of budget
+    /// arithmetic — an Arrow batch is transcoded and kept in memory long
+    /// before it is spilled — so an `insert` that lands here today lands
+    /// somewhere else after any change to a policy or a size. Driving the two
+    /// steps a spill performs, bytes to the store and then the record, pins
+    /// the displacement this test is named for.
     #[tokio::test]
     async fn an_in_place_disk_overwrite_releases_the_copy_it_supersedes() {
-        // Tiny, so the second insert cannot stay in memory and — with only a
-        // disk entry present — has no memory victim to evict. `insert_inner`
-        // then spills the batch itself and re-inserts it over its own object.
-        let store = create_cache_store(64, Box::new(LiquidPolicy::new())).await;
+        let store = create_cache_store(1 << 20, Box::new(LiquidPolicy::new())).await;
         let entry_id = EntryID::from(1usize);
 
-        // Get the key onto disk first, so the next insert displaces a disk entry.
+        // Get the key onto disk first, so the next write displaces a disk entry.
         store
             .insert(entry_id, 7, create_test_arrow_array(512))
             .await
@@ -1209,16 +1228,97 @@ mod tests {
         assert_eq!(named_once, charged_once, "baseline must be consistent");
 
         // Same key, same identity, written to disk again over its own object.
+        let replacement = create_test_arrow_array(4096);
+        let bytes = arrow_to_bytes(&replacement).unwrap();
+        let disk_bytes = bytes.len();
+        let on_disk = CacheEntry::disk_arrow(replacement.data_type().clone(), disk_bytes);
         store
-            .insert(entry_id, 7, create_test_arrow_array(4096))
+            .write_batch_to_disk(entry_id, 7, &on_disk, bytes)
             .await
             .unwrap();
+        let residue = store
+            .try_insert(entry_id, WriteIdentity::Rewrite(7), on_disk)
+            .expect("the record swap must land: the key still holds identity 7");
+        assert!(
+            residue.superseded.is_some(),
+            "this is the displacement the test exists to cover"
+        );
+        store.settle(entry_id, residue, Some((7, disk_bytes))).await;
 
         let (named, charged) = charged_disk_bytes_match_the_index(&store);
         assert_eq!(
             charged, named,
             "the superseded copy must be released: one object, one reservation"
         );
+        assert_eq!(
+            store
+                .get(&entry_id, 7)
+                .await
+                .expect("the overwrite must still be readable")
+                .as_ref(),
+            replacement.as_ref(),
+            "settling must keep the object this write put there"
+        );
+    }
+
+    /// `DiskResidue::displacing` decides whether a displaced entry's store
+    /// object survives the write that displaced it, and only one combination
+    /// means it did not: a disk-resident write under the identity that already
+    /// held the key addresses the very object the old record named, so the put
+    /// landed on it. Every other combination leaves an object behind that
+    /// nothing can reach. Getting it wrong either deletes bytes just written or
+    /// charges one object twice.
+    #[test]
+    fn only_a_same_identity_disk_write_lands_on_the_object_it_displaces() {
+        let on_disk = (
+            7u64,
+            Arc::new(CacheEntry::disk_arrow(
+                arrow::datatypes::DataType::Int64,
+                512,
+            )),
+        );
+        let in_memory = (7u64, Arc::new(create_test_array(8)));
+        let another = (
+            9u64,
+            Arc::new(CacheEntry::disk_arrow(
+                arrow::datatypes::DataType::Int64,
+                512,
+            )),
+        );
+
+        for written in [CachedBatchType::DiskArrow, CachedBatchType::DiskLiquid] {
+            // The key records the identity, not the form, so a liquid write
+            // over an Arrow copy lands on the same object as an Arrow one.
+            let residue = DiskResidue::displacing(Some(&on_disk), 7, written);
+            assert_eq!(
+                residue.superseded,
+                Some(512),
+                "a {written:?} write under identity 7 overwrote 7's own object"
+            );
+            assert_eq!(residue.displaced, None);
+            assert!(!residue.dropped);
+
+            // A different identity is a different store key.
+            let residue = DiskResidue::displacing(Some(&another), 7, written);
+            assert_eq!(residue.displaced, Some((9, 512)));
+            assert_eq!(residue.superseded, None);
+        }
+
+        // A memory write puts nothing in the store, so it cannot have
+        // overwritten anything.
+        let residue = DiskResidue::displacing(Some(&on_disk), 7, CachedBatchType::MemoryArrow);
+        assert_eq!(residue.displaced, Some((7, 512)));
+        assert_eq!(residue.superseded, None);
+
+        // A displaced memory entry never had an object.
+        let residue = DiskResidue::displacing(Some(&in_memory), 7, CachedBatchType::DiskArrow);
+        assert_eq!(residue.displaced, None);
+        assert_eq!(residue.superseded, None);
+
+        // Nothing displaced at all.
+        let residue = DiskResidue::displacing(None, 7, CachedBatchType::DiskArrow);
+        assert_eq!(residue.displaced, None);
+        assert_eq!(residue.superseded, None);
     }
 
     /// Every byte counted against the disk budget must belong to an index
@@ -1471,6 +1571,64 @@ mod tests {
             cache.get(&entry_id, 7).await.is_none(),
             "the displaced identity reads a miss"
         );
+    }
+
+    /// A settlement must not delete an object a *later* write put at the same
+    /// store key.
+    ///
+    /// A store key is `(entry id, identity)` and an identity comes back: the
+    /// file-id pool hands a re-opened path its previous record, so the very key
+    /// a settlement decided to delete can be occupied again by a fresh write
+    /// before the delete runs. `settle` deletes behind an await, which is all
+    /// the room that needs. The steps below are what one insert does — take the
+    /// key over, then settle what that displaced — with the re-open and its
+    /// spill injected in between.
+    #[tokio::test]
+    async fn a_settlement_does_not_delete_an_object_written_after_it_was_decided() {
+        let cache = create_cache_store(1 << 20, Box::new(LiquidPolicy::new())).await;
+        let entry_id = EntryID::from(700usize);
+        let first = create_test_arrow_array(1024);
+        let takeover: ArrayRef = Arc::new(arrow::array::Int64Array::from_iter_values(
+            (0..512).map(|v| v + 3_000_000),
+        ));
+        let reborn: ArrayRef = Arc::new(arrow::array::Int64Array::from_iter_values(
+            (0..256).map(|v| v + 5_000_000),
+        ));
+
+        // Identity 7 caches the key and spills it: an object at (E, 7).
+        cache.insert(entry_id, 7, first).await.unwrap();
+        cache.flush_all_to_disk().await.unwrap();
+
+        // Identity 9 takes the key over. That displaces 7's disk entry, so this
+        // settlement is going to delete (E, 7) ...
+        let residue = cache
+            .try_insert(
+                entry_id,
+                WriteIdentity::Owned(9),
+                CacheEntry::memory_arrow(takeover),
+            )
+            .expect("the takeover fits in memory");
+
+        // ... but before it runs, 7's path is re-opened, the pool hands the same
+        // identity back, and it caches this key again and spills it. That put
+        // lands on the very object the pending delete names.
+        cache.insert(entry_id, 7, reborn.clone()).await.unwrap();
+        cache.flush_all_to_disk().await.unwrap();
+
+        // Only now does the settlement run.
+        cache.settle(entry_id, residue, None).await;
+
+        assert_eq!(
+            cache
+                .get(&entry_id, 7)
+                .await
+                .expect("the re-cached entry must survive a settlement decided before it")
+                .as_ref(),
+            reborn.as_ref(),
+            "the settlement must not reach a write that came after it"
+        );
+        let (named, charged) = charged_disk_bytes_match_the_index(&cache);
+        assert_eq!(charged, named, "one object, one reservation");
     }
 
     /// A rewrite that loses its key must not leave its disk write behind.
