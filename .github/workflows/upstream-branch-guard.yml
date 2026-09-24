@@ -1,0 +1,82 @@
+# An `upstream/**` branch exists to become a pull request against
+# datafusion-contrib/liquid-cache. Our `main` is upstream plus our patches, so a
+# branch cut from `main` carries every one of those patches into the upstream
+# diff. This fails that on push, before a PR exists, and explains why.
+name: upstream branch guard
+
+on:
+  push:
+    branches: ['upstream/**']
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    name: branch is based on upstream, not on our main
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check ancestry
+        run: |
+          set -euo pipefail
+          git fetch --quiet origin main:refs/remotes/origin/main
+
+          if ! git merge-base --is-ancestor refs/remotes/origin/main HEAD; then
+            echo "OK: this branch does not contain our main."
+            carried=$(git rev-list --count refs/remotes/origin/main..HEAD)
+            echo "It is $carried commit(s) ahead of our main's line, which is what an upstream branch should look like."
+            exit 0
+          fi
+
+          # Contaminated. Say what is wrong, why it matters, and how to fix it.
+          extra=$(git rev-list --count refs/remotes/origin/main)
+          cat <<MSG
+
+          ============================================================
+          This branch is named upstream/** but descends from our main.
+          ============================================================
+
+          WHAT THIS MEANS
+            Our main is upstream's history plus this fork's patches. Because
+            your branch has our main in its ancestry, it contains all of those
+            patches too.
+
+          WHY IT MATTERS
+            A pull request against datafusion-contrib/liquid-cache diffs your
+            branch against THEIR main. Every patch of ours that they do not
+            have shows up in that diff. The reviewer sees a change far larger
+            than the one you are proposing, mixed with work that was never
+            meant for them, and cannot review it.
+
+            Some of our patches also repair machinery upstream does not have at
+            all -- DiskResidue, reclaim_orphaned_disk, settle. Those cannot
+            apply to their tree even in principle.
+
+          HOW TO FIX IT
+            Start again from upstream's commit rather than from ours, and move
+            your change across:
+
+              git fetch https://github.com/datafusion-contrib/liquid-cache main
+              git checkout -b upstream/<topic> FETCH_HEAD
+              git cherry-pick <your commits>
+
+          HOW TO CHECK BEFORE PUSHING
+            This command must print nothing. Anything it prints is a commit of
+            ours that would land in the upstream diff:
+
+              git log --oneline origin/main..HEAD ^FETCH_HEAD
+
+          ONE MORE THING
+            Reproduce the bug on upstream's tree before opening the PR: apply
+            your test alone, watch it fail there, then apply the fix. A fix
+            whose code still exists upstream is not evidence the bug does.
+
+          (For scale: our main carries $extra commits of history.)
+
+          MSG
+          echo "::error::Branch descends from our main; an upstream PR from it would carry this fork's patches. See the log above."
+          exit 1
