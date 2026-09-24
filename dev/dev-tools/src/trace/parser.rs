@@ -56,6 +56,13 @@ pub enum TraceEvent {
         kind: CacheKind,
         bytes: u64,
     },
+    /// A disk object was deleted and its bytes returned to the budget — either
+    /// an entry evicted from the disk tier, or an object left unreachable when
+    /// its key changed hands.
+    DiskEvict {
+        entry: u64,
+        bytes: u64,
+    },
     IoReadSqueezedBacking {
         entry: u64,
         bytes: u64,
@@ -100,6 +107,9 @@ impl TraceEvent {
         match self {
             TraceEvent::InsertSuccess { entry, kind } => {
                 format!("Insert entry {} as {}", entry, kind.display_name())
+            }
+            TraceEvent::DiskEvict { entry, bytes } => {
+                format!("Free {} bytes of entry {} from disk", bytes, entry)
             }
             TraceEvent::InsertFailed { entry, kind } => {
                 format!(
@@ -198,6 +208,7 @@ impl TraceEvent {
             TraceEvent::EvictionBegin { .. } => "eviction_begin",
             TraceEvent::EvictionVictim { .. } => "eviction_victim",
             TraceEvent::IoWrite { .. } => "io_write",
+            TraceEvent::DiskEvict { .. } => "disk_evict",
             TraceEvent::IoReadSqueezedBacking { .. } => "io_r_squeezed",
             TraceEvent::IoReadArrow { .. } => "io_read_arrow",
             TraceEvent::IoReadLiquid { .. } => "io_read_liquid",
@@ -303,6 +314,16 @@ fn parse_event_line(line: &str) -> TraceEvent {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0),
             kind: fields.get("kind").map(|s| CacheKind::from_str(s)).unwrap(),
+            bytes: fields
+                .get("bytes")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0),
+        },
+        Some("disk_evict") => TraceEvent::DiskEvict {
+            entry: fields
+                .get("entry")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0),
             bytes: fields
                 .get("bytes")
                 .and_then(|s| s.parse().ok())

@@ -223,6 +223,12 @@ impl CacheSimulator {
                         .insert(*victim, VictimStatus::Selected);
                 }
             }
+            TraceEvent::DiskEvict { .. } => {
+                // The entry'''s disk copy was deleted and its bytes returned to
+                // the budget. No I/O counter moves — this frees space rather
+                // than reading or writing it — and the entry keeps whatever
+                // state it has in memory, so there is nothing to mark here.
+            }
             TraceEvent::EvictionVictim { entry } => {
                 // Remove from squeeze victims list
                 self.state.eviction_victims.retain(|v| v != entry);
