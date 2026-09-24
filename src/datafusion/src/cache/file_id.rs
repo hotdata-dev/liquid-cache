@@ -143,6 +143,19 @@ impl FileIdPool {
                 let released = inner.free.remove(at).expect("index came from the queue");
                 (released.id, Some(released.identity))
             }
+            // A fresh id while the key's file field still has room, and only
+            // then the oldest released one. Recycling eagerly would be correct
+            // — the identity check turns an aliased read into a miss — but it
+            // costs the previous holder every entry it cached, since the new
+            // owner takes those keys over. Two files read one after another,
+            // or the two sides of a join, would evict each other for no reason
+            // while 65,000 ids sat unused. Reuse is what the narrow key field
+            // forces, not something to spend before it is needed.
+            None if inner.next <= u16::MAX as u64 => {
+                let id = inner.next;
+                inner.next += 1;
+                (id, None)
+            }
             None => match inner.free.pop_front() {
                 Some(released) => (released.id, None),
                 None => {
@@ -336,10 +349,12 @@ mod tests {
         drop(a);
         assert_eq!(pool.live_count(), 1, "the released path is forgotten");
 
-        // Reused rather than climbing to 2: the supply tracks what is being
-        // read, which is the whole point.
+        // The released id is available, but a fresh one is preferred while the
+        // key field has room: reuse costs the previous holder its entries, so
+        // it is spent only once there is nothing else to hand out.
         let c = pool.acquire("c.parquet");
-        assert_eq!(c.get(), 0);
+        assert_eq!(c.get(), 2);
+        assert_eq!(pool.live_count(), 2);
     }
 
     #[test]
@@ -354,8 +369,7 @@ mod tests {
         let other = pool.acquire("b.parquet");
         assert_eq!(other.get(), 1, "id 0 is still leased");
         drop(second);
-        let recycled = pool.acquire("c.parquet");
-        assert_eq!(recycled.get(), 0);
+        assert_eq!(pool.live_count(), 1, "the last holder released id 0");
     }
 
     /// The two numbers have to move independently. Reusing an id is how the
@@ -365,6 +379,10 @@ mod tests {
     #[test]
     fn identity_follows_the_path_while_the_id_is_recycled() {
         let pool = FileIdPool::new();
+        // Past the key width, so every acquire below takes the recycling path
+        // rather than a fresh id. Held, so the queue holds only what this test
+        // releases.
+        let _fillers = exhaust_key_width(&pool);
 
         let first = pool.acquire("a.parquet");
         let (a_id, a_identity) = (first.get(), first.identity());
@@ -391,17 +409,34 @@ mod tests {
         );
     }
 
+    /// Once the key field is exhausted there is nothing to hand out but
+    /// released ids, and the oldest goes first — giving the most recently
+    /// released file's entries the longer window before they are taken over.
     #[test]
     fn released_ids_are_reused_oldest_first() {
         let pool = FileIdPool::new();
+        let _fillers = exhaust_key_width(&pool);
         let a = pool.acquire("a.parquet");
         let b = pool.acquire("b.parquet");
+        let (a_id, b_id) = (a.get(), b.get());
         drop(a);
         drop(b);
-        // 0 was released first, so it is handed out first — giving b's entries
-        // the longer eviction window.
-        assert_eq!(pool.acquire("x.parquet").get(), 0);
-        assert_eq!(pool.acquire("y.parquet").get(), 1);
+        assert_eq!(pool.acquire("x.parquet").get(), a_id);
+        assert_eq!(pool.acquire("y.parquet").get(), b_id);
+    }
+
+    /// Drive `next` past the 16-bit key field so the pool has no fresh ids to
+    /// hand out and must recycle.
+    ///
+    /// The fillers are returned rather than dropped, and the caller has to keep
+    /// them: dropping them here would leave 65,536 released records queued
+    /// ahead of whatever the test then releases, and FIFO reuse would hand back
+    /// a filler's id instead of the one under test.
+    #[must_use]
+    fn exhaust_key_width(pool: &Arc<FileIdPool>) -> Vec<Arc<FileId>> {
+        (0..=(u16::MAX as u64))
+            .map(|i| pool.acquire(&format!("filler_{i}.parquet")))
+            .collect()
     }
 
     #[test]

@@ -25,8 +25,8 @@ liquid-cache-common = { workspace = true }
 tempfile = { workspace = true }
 axum = "0.8.9"
 serde = { workspace = true }
-tower-http = { version = "0.6.11", features = ["cors"] }
-sysinfo = { version = "0.38.4", default-features = false, features = [
+tower-http = { version = "0.7.1", features = ["cors"] }
+sysinfo = { version = "0.39.6", default-features = false, features = [
 	"component",
 	"disk",
 	"network",
@@ -38,8 +38,11 @@ fastrace = { workspace = true }
 pprof = { version = "0.15.0", features = ["flamegraph"] }
 anyhow = "1.0"
 liquid-cache = { workspace = true }
+t4 = { workspace = true }
 hdrhistogram = "7.5.4"
 
 [dev-dependencies]
 insta = { workspace = true }
 parquet = { workspace = true }
+liquid-cache-datafusion-client = { workspace = true }
+liquid-cache-datafusion-local = { workspace = true }

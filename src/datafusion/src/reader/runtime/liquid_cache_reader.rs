@@ -7,17 +7,17 @@ use arrow::array::{Array, ArrayRef, BooleanArray, RecordBatch};
 use arrow::buffer::BooleanBuffer;
 use arrow::compute::prep_null_mask_filter;
 use arrow::record_batch::RecordBatchOptions;
-use arrow_schema::{ArrowError, Schema, SchemaRef};
+use arrow_schema::{ArrowError, SchemaRef};
 use futures::{Stream, StreamExt, future::BoxFuture, stream::BoxStream};
 use parquet::arrow::arrow_reader::{
-    ArrowPredicate, ArrowReaderMetadata, ArrowReaderOptions, RowSelection, RowSelector,
+    ArrowReaderMetadata, ArrowReaderOptions, RowSelection, RowSelector,
 };
 use parquet::arrow::{ParquetRecordBatchStreamBuilder, ProjectionMask};
 use parquet::errors::ParquetError;
 use parquet::file::metadata::ParquetMetaData;
 
 use crate::cache::{BatchID, CachedRowGroupRef, InsertArrowArrayError};
-use crate::reader::plantime::{LiquidRowFilter, ParquetMetadataCacheReader};
+use crate::reader::plantime::{LiquidFileReaderFactory, LiquidRowFilter};
 use crate::reader::runtime::utils::take_next_batch;
 use crate::utils::{boolean_buffer_and_then, row_selector_to_boolean_buffer};
 
@@ -58,7 +58,6 @@ struct LiquidCacheReaderInner {
 }
 
 pub(crate) struct LiquidCacheReaderConfig {
-    pub(crate) batch_size: usize,
     pub(crate) selection: RowSelection,
     pub(crate) row_filter: Option<LiquidRowFilter>,
     pub(crate) cached_row_group: CachedRowGroupRef,
@@ -71,17 +70,17 @@ pub(crate) struct LiquidCacheReaderConfig {
 pub(crate) struct ParquetFallbackConfig {
     pub(crate) row_group_idx: usize,
     pub(crate) metadata: Arc<ParquetMetaData>,
-    pub(crate) input: ParquetMetadataCacheReader,
+    pub(crate) reader_factory: Arc<LiquidFileReaderFactory>,
     pub(crate) cache_projection: ProjectionMask,
     pub(crate) cache_column_ids: Vec<usize>,
     pub(crate) cache_batch_size: usize,
     pub(crate) row_count: usize,
 }
 
-struct ParquetFallback {
+pub(crate) struct ParquetFallback {
     row_group_idx: usize,
     metadata: Arc<ParquetMetaData>,
-    input: ParquetMetadataCacheReader,
+    reader_factory: Arc<LiquidFileReaderFactory>,
     cache_projection: ProjectionMask,
     cache_column_ids: Vec<usize>,
     cache_batch_size: usize,
@@ -92,8 +91,17 @@ struct ParquetFallback {
 
 impl LiquidCacheReader {
     pub(crate) fn new(config: LiquidCacheReaderConfig) -> Self {
+        // The selection is walked in cache-sized windows, not session-sized
+        // ones. `current_batch_id` indexes stored chunks, and both the cache
+        // read and the parquet fallback turn that id back into rows with the
+        // cache batch size; windowing at `datafusion.execution.batch_size`
+        // would address different rows than the id names whenever a caller
+        // sets it to anything other than the cache's own size. The caller is
+        // unaffected either way: `DataSourceExec` re-splits every source
+        // stream to the session batch size.
+        let batch_size = config.cached_row_group.batch_size();
         let inner = LiquidCacheReaderInner::new(
-            config.batch_size,
+            batch_size,
             config.selection,
             config.cached_row_group,
             config.projection_columns,
@@ -104,14 +112,6 @@ impl LiquidCacheReader {
             state: ReaderState::Ready(Box::new(inner)),
             row_filter: config.row_filter,
         }
-    }
-
-    pub(crate) fn into_filter(self) -> Option<LiquidRowFilter> {
-        debug_assert!(
-            matches!(self.state, ReaderState::Finished),
-            "cannot extract filter before reader completes"
-        );
-        self.row_filter
     }
 }
 
@@ -161,11 +161,11 @@ impl Stream for LiquidCacheReader {
 }
 
 impl ParquetFallback {
-    fn new(config: ParquetFallbackConfig) -> Self {
+    pub(crate) fn new(config: ParquetFallbackConfig) -> Self {
         Self {
             row_group_idx: config.row_group_idx,
             metadata: config.metadata,
-            input: config.input,
+            reader_factory: config.reader_factory,
             cache_projection: config.cache_projection,
             cache_column_ids: config.cache_column_ids,
             cache_batch_size: config.cache_batch_size,
@@ -175,7 +175,10 @@ impl ParquetFallback {
         }
     }
 
-    async fn fetch_batch(&mut self, batch_id: BatchID) -> Result<RecordBatch, ParquetError> {
+    pub(crate) async fn fetch_batch(
+        &mut self,
+        batch_id: BatchID,
+    ) -> Result<RecordBatch, ParquetError> {
         if self.stream.is_none() || batch_id != self.next_batch_id {
             self.rebuild_stream(batch_id)?;
         }
@@ -199,14 +202,16 @@ impl ParquetFallback {
         let row_selection =
             build_row_selection_from(batch_id, self.cache_batch_size, self.row_count);
 
-        let stream =
-            ParquetRecordBatchStreamBuilder::new_with_metadata(self.input.clone(), reader_metadata)
-                .with_projection(self.cache_projection.clone())
-                .with_row_groups(vec![self.row_group_idx])
-                .with_batch_size(self.cache_batch_size)
-                .with_row_selection(row_selection)
-                .build()?
-                .boxed();
+        let stream = ParquetRecordBatchStreamBuilder::new_with_metadata(
+            self.reader_factory.create()?,
+            reader_metadata,
+        )
+        .with_projection(self.cache_projection.clone())
+        .with_row_groups(vec![self.row_group_idx])
+        .with_batch_size(self.cache_batch_size)
+        .with_row_selection(row_selection)
+        .build()?
+        .boxed();
 
         self.stream = Some(stream);
         self.next_batch_id = batch_id;
@@ -299,43 +304,45 @@ impl LiquidCacheReaderInner {
         row_filter: &mut Option<LiquidRowFilter>,
         selection: Vec<RowSelector>,
     ) -> Result<BooleanBuffer, ArrowError> {
-        let mut input_selection = row_selector_to_boolean_buffer(&selection);
+        let input_selection = row_selector_to_boolean_buffer(&selection);
+
+        if let Some(snapshot_selection) = self
+            .cached_row_group
+            .snapshot_selection(self.current_batch_id)
+        {
+            return Ok(boolean_buffer_and_then(
+                &input_selection,
+                &snapshot_selection,
+            ));
+        }
 
         let Some(filter) = row_filter.as_mut() else {
             return Ok(input_selection);
         };
 
-        for predicate in filter.predicates_mut() {
-            if input_selection.count_set_bits() == 0 {
-                break;
-            }
-
-            let boolean_array = match self
-                .cached_row_group
-                .evaluate_selection_with_predicate(
-                    self.current_batch_id,
-                    &input_selection,
-                    predicate,
-                )
-                .await
-            {
-                Some(result) => result?,
-                None => {
-                    self.evaluate_predicate_after_materialize(&input_selection, predicate)
-                        .await?
-                }
-            };
-
-            let boolean_mask = if boolean_array.null_count() == 0 {
-                boolean_array.into_parts().0
-            } else {
-                prep_null_mask_filter(&boolean_array).into_parts().0
-            };
-
-            input_selection = boolean_buffer_and_then(&input_selection, &boolean_mask);
+        if let Some(selection) = apply_predicates(
+            &self.cached_row_group,
+            self.current_batch_id,
+            input_selection.clone(),
+            filter,
+        )
+        .await?
+        {
+            return Ok(selection);
         }
 
-        Ok(input_selection)
+        self.read_parquet_batch_and_fill_cache(self.current_batch_id)
+            .await?;
+        apply_predicates(
+            &self.cached_row_group,
+            self.current_batch_id,
+            input_selection,
+            filter,
+        )
+        .await?
+        .ok_or_else(|| {
+            ArrowError::ComputeError("predicate unavailable after materialization".to_string())
+        })
     }
 
     #[fastrace::trace]
@@ -385,10 +392,9 @@ impl LiquidCacheReaderInner {
             arrays.push(array);
         }
 
-        // A batch that does not match the declared schema is a cache that
-        // handed back something other than what was asked for. Report it;
-        // unwinding here aborts the stream mid-flight with no error to show.
-        Ok(Some(RecordBatch::try_new(self.schema.clone(), arrays)?))
+        Ok(Some(
+            RecordBatch::try_new(self.schema.clone(), arrays).unwrap(),
+        ))
     }
 
     async fn read_parquet_batch_and_fill_cache(
@@ -424,65 +430,16 @@ impl LiquidCacheReaderInner {
                 })?;
             let array = Arc::clone(record_batch.column(col_idx));
 
-            match column.insert(batch_id, array).await {
+            match column.insert(batch_id, Arc::clone(&array)).await {
                 Ok(()) | Err(InsertArrowArrayError::AlreadyCached) => {}
-                Err(InsertArrowArrayError::CacheFull) => {}
+                Err(InsertArrowArrayError::CacheFull) => {
+                    column.insert_snapshot(batch_id, array);
+                }
             }
         }
 
         self.last_pull = Some((batch_id, record_batch.clone()));
         Ok(record_batch)
-    }
-
-    async fn evaluate_predicate_after_materialize(
-        &mut self,
-        selection: &BooleanBuffer,
-        predicate: &mut crate::reader::LiquidPredicate,
-    ) -> Result<BooleanArray, ArrowError> {
-        let record_batch = self
-            .read_parquet_batch_and_fill_cache(self.current_batch_id)
-            .await?;
-
-        if let Some(result) = self
-            .cached_row_group
-            .evaluate_selection_with_predicate(self.current_batch_id, selection, predicate)
-            .await
-        {
-            return result;
-        }
-
-        let column_ids = predicate.predicate_column_ids();
-        let mut arrays = Vec::with_capacity(column_ids.len());
-        let mut fields = Vec::with_capacity(column_ids.len());
-
-        for column_id in column_ids {
-            let array = self.parquet_array(&record_batch, column_id)?;
-            arrays.push(filter_array(array, selection)?);
-
-            let field = self
-                .cached_row_group
-                .get_column(column_id as u64)
-                .ok_or_else(|| {
-                    ArrowError::ComputeError(format!(
-                        "column {column_id} not present in liquid cache"
-                    ))
-                })?
-                .field()
-                .as_ref()
-                .clone();
-            fields.push(field);
-        }
-
-        let schema = Arc::new(Schema::new(fields));
-        let predicate_batch = if arrays.is_empty() {
-            let options =
-                RecordBatchOptions::new().with_row_count(Some(selection.count_set_bits()));
-            RecordBatch::try_new_with_options(schema, arrays, &options)?
-        } else {
-            RecordBatch::try_new(schema, arrays)?
-        };
-
-        predicate.evaluate(predicate_batch)
     }
 
     fn parquet_array(
@@ -505,6 +462,35 @@ impl LiquidCacheReaderInner {
     }
 }
 
+pub(crate) async fn apply_predicates(
+    row_group: &CachedRowGroupRef,
+    batch_id: BatchID,
+    mut input_selection: BooleanBuffer,
+    filter: &mut LiquidRowFilter,
+) -> Result<Option<BooleanBuffer>, ArrowError> {
+    for predicate in filter.predicates_mut() {
+        if input_selection.count_set_bits() == 0 {
+            break;
+        }
+
+        let Some(boolean_array) = row_group
+            .evaluate_selection_with_predicate(batch_id, &input_selection, predicate)
+            .await
+        else {
+            return Ok(None);
+        };
+        let boolean_array = boolean_array?;
+        let boolean_mask = if boolean_array.null_count() == 0 {
+            boolean_array.into_parts().0
+        } else {
+            prep_null_mask_filter(&boolean_array).into_parts().0
+        };
+        input_selection = boolean_buffer_and_then(&input_selection, &boolean_mask);
+    }
+
+    Ok(Some(input_selection))
+}
+
 fn filter_array(array: ArrayRef, selection: &BooleanBuffer) -> Result<ArrayRef, ArrowError> {
     let selection_array = BooleanArray::new(selection.clone(), None);
     arrow::compute::filter(array.as_ref(), &selection_array)
@@ -515,13 +501,15 @@ mod tests {
     use super::*;
     use crate::{
         cache::LiquidCacheParquet,
-        reader::plantime::CachedMetaReaderFactory,
+        reader::plantime::LiquidFileReaderFactory,
         reader::{FilterCandidateBuilder, LiquidPredicate, LiquidRowFilter},
     };
     use arrow::array::{ArrayRef, Int32Array};
     use arrow::record_batch::RecordBatch;
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
-    use datafusion::datasource::listing::PartitionedFile;
+    use datafusion::datasource::{
+        listing::PartitionedFile, physical_plan::parquet::DefaultParquetFileReaderFactory,
+    };
     use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
     use datafusion::{
         logical_expr::Operator,
@@ -530,7 +518,7 @@ mod tests {
         scalar::ScalarValue,
     };
     use futures::{StreamExt, pin_mut};
-    use liquid_cache::cache::{AlwaysHydrate, squeeze_policies::Evict};
+    use liquid_cache::cache::{AlwaysHydrate, Evict};
     use liquid_cache::cache_policies::LiquidPolicy;
     use object_store::local::LocalFileSystem;
     use parquet::arrow::{
@@ -541,7 +529,6 @@ mod tests {
     use std::sync::Arc;
 
     struct TestRowGroup {
-        batch_size: usize,
         row_group: CachedRowGroupRef,
         schema: SchemaRef,
         fallback: ParquetFallbackConfig,
@@ -558,7 +545,6 @@ mod tests {
     impl TestRowGroup {
         fn reader(&self, request: ReaderRequest) -> LiquidCacheReader {
             LiquidCacheReader::new(LiquidCacheReaderConfig {
-                batch_size: self.batch_size,
                 selection: request.selection,
                 row_filter: request.row_filter,
                 cached_row_group: Arc::clone(&self.row_group),
@@ -592,18 +578,21 @@ mod tests {
             std::fs::metadata(&parquet_path).unwrap().len(),
         );
         let metrics = ExecutionPlanMetricsSet::new();
-        let input = CachedMetaReaderFactory::new(object_store).create_liquid_reader(
-            0,
+        let reader_factory = Arc::new(LiquidFileReaderFactory {
+            factory: Arc::new(DefaultParquetFileReaderFactory::new(object_store)),
+            partition_index: 0,
             partitioned_file,
-            None,
-            &metrics,
-        );
+            metadata_size_hint: None,
+            metrics,
+        });
         let projection = ProjectionMask::roots(
             reader_metadata.metadata().file_metadata().schema_descr(),
             [0],
         );
 
-        let store = crate::test_utils::mount_test_store(tmp_dir.path()).await;
+        let store = t4::mount(tmp_dir.path().join("liquid_cache.t4"))
+            .await
+            .unwrap();
         let cache = LiquidCacheParquet::new(
             batch_size,
             usize::MAX,
@@ -614,7 +603,14 @@ mod tests {
             Box::new(AlwaysHydrate::new()),
         )
         .await;
-        let file = cache.register_or_get_file("test".to_string(), schema.clone());
+        let file = cache.register_or_get_file(
+            crate::cache::ParquetFileIdentity::new(
+                datafusion::execution::object_store::ObjectStoreUrl::parse("test-runtime:///")
+                    .unwrap(),
+                "test".to_string(),
+            ),
+            schema.clone(),
+        );
         let row_group = file.create_row_group(0, vec![]);
         let column = row_group.get_column(0).unwrap();
 
@@ -627,13 +623,12 @@ mod tests {
         }
 
         TestRowGroup {
-            batch_size,
             row_group,
             schema,
             fallback: ParquetFallbackConfig {
                 row_group_idx: 0,
                 metadata: Arc::clone(reader_metadata.metadata()),
-                input,
+                reader_factory,
                 cache_projection: projection,
                 cache_column_ids: vec![0],
                 cache_batch_size: batch_size,
@@ -752,30 +747,6 @@ mod tests {
         let batch = &batches[0];
         assert_eq!(batch.num_columns(), 0);
         assert_eq!(batch.num_rows(), 2);
-    }
-
-    #[tokio::test]
-    async fn into_filter_returns_stored_filter_after_completion() {
-        let batch_size = 2;
-        let test = make_row_group(batch_size, &[vec![1, 2]]).await;
-        let selection = RowSelection::from(Vec::<RowSelector>::new());
-        let filter = LiquidRowFilter::new(Vec::new());
-
-        let mut reader = test.reader(ReaderRequest {
-            selection,
-            row_filter: Some(filter),
-            projection_columns: vec![0],
-            schema: Arc::clone(&test.schema),
-        });
-
-        let waker = futures::task::noop_waker();
-        let mut cx = Context::from_waker(&waker);
-        assert!(matches!(
-            Pin::new(&mut reader).poll_next(&mut cx),
-            Poll::Ready(None)
-        ));
-
-        assert!(reader.into_filter().is_some());
     }
 
     #[tokio::test]

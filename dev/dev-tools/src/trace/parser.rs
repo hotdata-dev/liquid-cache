@@ -45,15 +45,22 @@ pub enum TraceEvent {
         entry: u64,
         kind: CacheKind,
     },
-    SqueezeBegin {
+    EvictionBegin {
         victims: Vec<u64>,
     },
-    SqueezeVictim {
+    EvictionVictim {
         entry: u64,
     },
     IoWrite {
         entry: u64,
         kind: CacheKind,
+        bytes: u64,
+    },
+    /// A disk object was deleted and its bytes returned to the budget — either
+    /// an entry evicted from the disk tier, or an object left unreachable when
+    /// its key changed hands.
+    DiskEvict {
+        entry: u64,
         bytes: u64,
     },
     IoReadSqueezedBacking {
@@ -101,6 +108,9 @@ impl TraceEvent {
             TraceEvent::InsertSuccess { entry, kind } => {
                 format!("Insert entry {} as {}", entry, kind.display_name())
             }
+            TraceEvent::DiskEvict { entry, bytes } => {
+                format!("Free {} bytes of entry {} from disk", bytes, entry)
+            }
             TraceEvent::InsertFailed { entry, kind } => {
                 format!(
                     "Failed to insert entry {} as {}",
@@ -108,10 +118,10 @@ impl TraceEvent {
                     kind.display_name()
                 )
             }
-            TraceEvent::SqueezeBegin { victims } => {
+            TraceEvent::EvictionBegin { victims } => {
                 format!("Begin squeeze (victims: {:?})", victims)
             }
-            TraceEvent::SqueezeVictim { entry } => {
+            TraceEvent::EvictionVictim { entry } => {
                 format!("Squeeze victim {}", entry)
             }
             TraceEvent::IoWrite { entry, kind, bytes } => {
@@ -195,9 +205,10 @@ impl TraceEvent {
         match self {
             TraceEvent::InsertSuccess { .. } => "insert_success",
             TraceEvent::InsertFailed { .. } => "insert_failed",
-            TraceEvent::SqueezeBegin { .. } => "squeeze_begin",
-            TraceEvent::SqueezeVictim { .. } => "squeeze_victim",
+            TraceEvent::EvictionBegin { .. } => "eviction_begin",
+            TraceEvent::EvictionVictim { .. } => "eviction_victim",
             TraceEvent::IoWrite { .. } => "io_write",
+            TraceEvent::DiskEvict { .. } => "disk_evict",
             TraceEvent::IoReadSqueezedBacking { .. } => "io_r_squeezed",
             TraceEvent::IoReadArrow { .. } => "io_read_arrow",
             TraceEvent::IoReadLiquid { .. } => "io_read_liquid",
@@ -285,13 +296,13 @@ fn parse_event_line(line: &str) -> TraceEvent {
                 .unwrap_or(0),
             kind: fields.get("kind").map(|s| CacheKind::from_str(s)).unwrap(),
         },
-        Some("squeeze_begin") => TraceEvent::SqueezeBegin {
+        Some("eviction_begin") => TraceEvent::EvictionBegin {
             victims: fields
                 .get("victims")
                 .map(|s| parse_victims(s))
                 .unwrap_or_default(),
         },
-        Some("squeeze_victim") => TraceEvent::SqueezeVictim {
+        Some("eviction_victim") => TraceEvent::EvictionVictim {
             entry: fields
                 .get("entry")
                 .and_then(|s| s.parse().ok())
@@ -303,6 +314,16 @@ fn parse_event_line(line: &str) -> TraceEvent {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0),
             kind: fields.get("kind").map(|s| CacheKind::from_str(s)).unwrap(),
+            bytes: fields
+                .get("bytes")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0),
+        },
+        Some("disk_evict") => TraceEvent::DiskEvict {
+            entry: fields
+                .get("entry")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0),
             bytes: fields
                 .get("bytes")
                 .and_then(|s| s.parse().ok())
@@ -428,6 +449,7 @@ pub fn parse_trace(input: &str) -> Vec<TraceEvent> {
                 && !line.starts_with("]")
                 && !line.starts_with("---")
                 && !line.starts_with("source:")
+                && !line.starts_with("assertion_line:")
                 && !line.starts_with("expression:")
         })
         .map(parse_event_line)

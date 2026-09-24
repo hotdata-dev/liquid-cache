@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use arrow::array::UInt64Array;
 use liquid_cache::cache::{
-    AlwaysHydrate, EntryID, LiquidCacheBuilder, LiquidPolicy, TranscodeSqueezeEvict,
+    AlwaysHydrate, EntryID, LiquidCacheBuilder, LiquidPolicy, TranscodeEvict,
 };
 
 #[tokio::main]
@@ -12,16 +12,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_max_disk_bytes(1024 * 1024 * 1024 * 10) // 10GB
         .with_batch_size(8192)
         .with_cache_policy(Box::new(LiquidPolicy::new()))
-        .with_squeeze_policy(Box::new(TranscodeSqueezeEvict))
+        .with_eviction_policy(Box::new(TranscodeEvict))
         .with_hydration_policy(Box::new(AlwaysHydrate::new()))
         .build()
         .await;
 
     let entry_id = EntryID::from(7);
-    // Names whose data this is. Entry ids are packed and can alias between
-    // sources; the cache compares this and treats a mismatch as a miss, so a
-    // caller only ever reads back what it put in.
-    let identity = 1;
+    // The identity names which source this data came from. A cache key packs
+    // its fields into fixed widths, so two sources can compute one key; the
+    // identity is what keeps a read from being served the other's data. One
+    // source here, so any constant will do.
+    let identity = 0;
     let arrow_array = Arc::new(UInt64Array::from_iter_values(0..16));
     storage
         .insert(entry_id, identity, arrow_array.clone())

@@ -3,7 +3,6 @@
 
 pub mod cache;
 pub mod liquid_array;
-pub mod store;
 mod sync;
 pub mod utils;
 

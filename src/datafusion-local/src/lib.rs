@@ -7,16 +7,14 @@ mod tests;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use datafusion::common::config::ConfigNonZeroUsize;
-use datafusion::error::Result;
-use datafusion::logical_expr::ScalarUDF;
 use datafusion::prelude::{SessionConfig, SessionContext};
-use liquid_cache::cache::squeeze_policies::{SqueezePolicy, TranscodeSqueezeEvict};
+use datafusion::{common::config::ConfigNonZeroUsize, error::Result};
 use liquid_cache::cache::{AlwaysHydrate, HydrationPolicy, default_max_memory_bytes};
+use liquid_cache::cache::{EvictionPolicy, TranscodeEvict};
 use liquid_cache::cache_policies::{CachePolicy, LiquidPolicy};
 use liquid_cache_datafusion::optimizers::LocalModeOptimizer;
 use liquid_cache_datafusion::{
-    LiquidCacheParquet, LiquidCacheParquetRef, VariantGetUdf, VariantPretty, VariantToJsonUdf,
+    LiquidCacheParquet, LiquidCacheParquetRef, register_variant_functions,
 };
 
 pub use liquid_cache as storage;
@@ -66,13 +64,14 @@ pub struct LiquidCacheLocalBuilder {
     cache_dir: PathBuf,
     /// Cache policy
     cache_policy: Box<dyn CachePolicy>,
-    /// Squeeze policy
-    squeeze_policy: Box<dyn SqueezePolicy>,
+    /// Eviction policy
+    eviction_policy: Box<dyn EvictionPolicy>,
     /// Hydration policy
     hydration_policy: Box<dyn HydrationPolicy>,
+    prefetch: bool,
     /// Footprint-based admission gate `(expansion, safety, tolerance, strict)`.
     /// When set, a scan is cached only if its estimated liquid footprint stays
-    /// within `budget × tolerance`; `strict` toggles fail-loud panic handling.
+    /// within the admission threshold; `strict` toggles fail-loud panic handling.
     admission: Option<(f64, f64, f64, bool)>,
     span: fastrace::Span,
 }
@@ -87,8 +86,9 @@ impl Default for LiquidCacheLocalBuilder {
             max_disk_bytes,
             cache_dir: std::env::temp_dir(),
             cache_policy: Box::new(LiquidPolicy::new()),
-            squeeze_policy: Box::new(TranscodeSqueezeEvict),
+            eviction_policy: Box::new(TranscodeEvict),
             hydration_policy: Box::new(AlwaysHydrate::new()),
+            prefetch: true,
             admission: None,
             span: fastrace::Span::enter_with_local_parent("liquid_cache_datafusion_local_builder"),
         }
@@ -127,9 +127,9 @@ impl LiquidCacheLocalBuilder {
         self
     }
 
-    /// Set squeeze policy
-    pub fn with_squeeze_policy(mut self, squeeze_policy: Box<dyn SqueezePolicy>) -> Self {
-        self.squeeze_policy = squeeze_policy;
+    /// Set eviction policy
+    pub fn with_eviction_policy(mut self, eviction_policy: Box<dyn EvictionPolicy>) -> Self {
+        self.eviction_policy = eviction_policy;
         self
     }
 
@@ -145,6 +145,12 @@ impl LiquidCacheLocalBuilder {
         self
     }
 
+    /// Enable or disable row-group prefetching.
+    pub fn with_prefetch(mut self, prefetch: bool) -> Self {
+        self.prefetch = prefetch;
+        self
+    }
+
     /// Set fastrace span
     pub fn with_span(mut self, span: fastrace::Span) -> Self {
         self.span = span;
@@ -153,12 +159,13 @@ impl LiquidCacheLocalBuilder {
 
     /// Enable the footprint-based admission gate. A scan is cached only when its
     /// estimated liquid footprint (raw required bytes x `expansion` x `safety`)
-    /// stays within `budget × tolerance`; larger scans are read directly from the
-    /// parquet source, bypassing the cache. `expansion`/`safety` are `>= 1.0`
-    /// (inflate the estimate); `tolerance` is `>= 1.0` (overcommit the budget,
-    /// clamped to the measured ~5x compaction crossover). `strict == true` lets a
-    /// footprint-estimation panic abort the query (fail loud); `false` catches it
-    /// and caches the scan normally.
+    /// stays within the admission threshold (`memory × tolerance + disk`); larger
+    /// scans are read directly from the parquet source, bypassing the cache.
+    /// `expansion`/`safety` are `>= 1.0` (inflate the estimate); `tolerance` is
+    /// `>= 1.0` (overcommit the memory tier, clamped to the measured ~5x
+    /// compaction crossover). `strict == true` lets a footprint-estimation panic
+    /// abort the query (fail loud); `false` catches it and caches the scan
+    /// normally.
     pub fn with_admission_gate(
         mut self,
         expansion: f64,
@@ -186,7 +193,7 @@ impl LiquidCacheLocalBuilder {
         config.options_mut().execution.parquet.skip_metadata = false;
         config.options_mut().execution.batch_size = ConfigNonZeroUsize::try_new(self.batch_size)?;
 
-        let store = liquid_cache::store::mount(self.cache_dir.join("liquid_cache.t4"))
+        let store = t4::mount(self.cache_dir.join("liquid_cache.t4"))
             .await
             .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
         #[cfg(not(test))]
@@ -196,26 +203,26 @@ impl LiquidCacheLocalBuilder {
             self.max_disk_bytes,
             store,
             self.cache_policy,
-            self.squeeze_policy,
+            self.eviction_policy,
             self.hydration_policy,
         )
         .await;
 
         #[cfg(test)]
-        let cache = LiquidCacheParquet::new_with_squeeze_victim_concurrency(
+        let cache = LiquidCacheParquet::new_with_eviction_concurrency(
             self.batch_size,
             self.max_memory_bytes,
             self.max_disk_bytes,
             store,
             self.cache_policy,
-            self.squeeze_policy,
+            self.eviction_policy,
             self.hydration_policy,
             false,
         )
         .await;
         let cache_ref = Arc::new(cache);
 
-        let mut optimizer = LocalModeOptimizer::new(cache_ref.clone());
+        let mut optimizer = LocalModeOptimizer::new(cache_ref.clone()).with_prefetch(self.prefetch);
         if let Some((expansion, safety, tolerance, strict)) = self.admission {
             optimizer = optimizer.with_admission_gate(expansion, safety, tolerance, strict);
         }
@@ -227,9 +234,7 @@ impl LiquidCacheLocalBuilder {
             .build();
 
         let ctx = SessionContext::new_with_state(state);
-        ctx.register_udf(ScalarUDF::new_from_impl(VariantGetUdf::default()));
-        ctx.register_udf(ScalarUDF::new_from_impl(VariantPretty::default()));
-        ctx.register_udf(ScalarUDF::new_from_impl(VariantToJsonUdf::default()));
+        register_variant_functions(&ctx);
         Ok((ctx, cache_ref))
     }
 }

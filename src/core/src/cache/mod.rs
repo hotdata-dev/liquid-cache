@@ -10,26 +10,22 @@ mod io_context;
 mod liquid_expr;
 mod observer;
 pub mod policies;
-mod transcode;
 mod utils;
 
 pub use builders::{EvaluatePredicate, Get, Insert, LiquidCacheBuilder, default_max_memory_bytes};
 pub use cached_batch::{CacheEntry, CachedBatchType};
-pub use core::LiquidCache;
-pub use expressions::{CacheExpression, VariantRequest};
-#[cfg(test)]
-pub(crate) use io_context::TestSqueezeIo;
-pub use io_context::{DefaultCacheMetadata, DefaultSqueezeIo, EntryMetadata};
+pub use core::{LiquidCache, PrefetchResult};
+pub use expressions::{CacheExpression, Date32Field, VariantRequest};
+pub use io_context::{DefaultCacheMetadata, EntryMetadata};
 pub use liquid_expr::LiquidExpr;
 pub use observer::EventTrace;
 pub use observer::Observer;
 pub use observer::{CacheStats, RuntimeStats, RuntimeStatsSnapshot};
 pub use policies::{
-    AlwaysHydrate, CachePolicy, HydrationPolicy, HydrationRequest, LiquidPolicy, MaterializedEntry,
-    NoHydration, SqueezePolicy, TranscodeSqueezeEvict,
+    AlwaysHydrate, CachePolicy, Evict, EvictionPolicy, HydrationPolicy, HydrationRequest,
+    LiquidPolicy, MaterializedEntry, NoHydration, TranscodeEvict,
 };
-pub use transcode::{transcode_liquid_inner, transcode_liquid_inner_with_hint};
-pub use utils::{EntryID, LiquidCompressorStates};
+pub use utils::EntryID;
 
 /// The cache could not reserve enough disk budget for a write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,11 +40,6 @@ pub mod cache_policies {
 /// Legacy path: re-export hydration policy types under `cache::hydration_policies`.
 pub mod hydration_policies {
     pub use super::policies::hydration::*;
-}
-
-/// Legacy path: re-export squeeze policy types under `cache::squeeze_policies`.
-pub mod squeeze_policies {
-    pub use super::policies::squeeze::*;
 }
 
 #[cfg(test)]

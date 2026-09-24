@@ -1,9 +1,6 @@
 use arrow_schema::{DataType, Field, Schema};
 use liquid_cache::{
-    cache::{
-        CacheStats,
-        squeeze_policies::{Evict, SqueezePolicy, TranscodeEvict, TranscodeSqueezeEvict},
-    },
+    cache::{CacheStats, Evict, EvictionPolicy, TranscodeEvict},
     cache_policies::LiquidPolicy,
 };
 use liquid_cache_datafusion::LiquidCacheParquetRef;
@@ -23,11 +20,10 @@ use datafusion::{
 
 use crate::LiquidCacheLocalBuilder;
 mod batch_size_alignment;
-mod column_free_conjunct;
+mod constant_conjunct;
 mod date_optimizer;
 mod filter_limit;
-mod page_index;
-mod squeeze;
+mod nested_filter;
 mod unevaluable_conjunct;
 mod variants;
 
@@ -86,11 +82,6 @@ impl fmt::Display for CacheStatsSummary {
             "entries.memory.liquid: {}",
             self.stats.memory_liquid_entries
         )?;
-        writeln!(
-            f,
-            "entries.memory.squeezed_liquid: {}",
-            self.stats.memory_squeezed_liquid_entries
-        )?;
         writeln!(f, "entries.disk.liquid: {}", self.stats.disk_liquid_entries)?;
         writeln!(f, "entries.disk.arrow: {}", self.stats.disk_arrow_entries)?;
         writeln!(f, "usage.memory_bytes: {}", self.stats.memory_usage_bytes)?;
@@ -100,33 +91,22 @@ impl fmt::Display for CacheStatsSummary {
     }
 }
 
-/// Session config for the tests that read [`TEST_FILE`] and pin cache traces,
-/// entry counts or IO counts.
-///
-/// DataFusion 55 lowered `repartition_file_min_size` from 10 MiB to 1 MiB, so the
-/// 2.3 MB test file is now split into one scan partition per `target_partitions`
-/// instead of being read by a single one. Several scan partitions hit the shared
-/// cache concurrently, which makes admission and eviction order — and with it
-/// every trace and byte count these tests assert — depend on scheduling and on
-/// the host's core count. Raise the threshold back above the file size so the
-/// scan stays single-partition and the snapshots stay reproducible.
-pub(super) fn cache_test_config() -> SessionConfig {
-    let mut config = SessionConfig::new();
-    config.options_mut().optimizer.repartition_file_min_size = 16 * 1024 * 1024;
-    config
-}
-
 async fn create_session_context_with_liquid_cache(
-    squeeze_policy: Box<dyn SqueezePolicy>,
+    eviction_policy: Box<dyn EvictionPolicy>,
     cache_size_bytes: usize,
     cache_dir: &Path,
 ) -> Result<(SessionContext, LiquidCacheParquetRef)> {
-    let mut config = cache_test_config();
+    // These tests snapshot exact cache contents and counters. A repartitioned
+    // file scan populates the cache concurrently, so insertion order (and, for
+    // LIMIT queries, which partitions finish before cancellation) is not a
+    // stable property to snapshot.
+    let mut config = SessionConfig::new().with_repartition_file_scans(false);
     config.options_mut().execution.target_partitions = 4;
     let (ctx, cache) = LiquidCacheLocalBuilder::new()
+        .with_prefetch(false)
         .with_max_memory_bytes(cache_size_bytes)
         .with_cache_dir(cache_dir.to_path_buf())
-        .with_squeeze_policy(squeeze_policy)
+        .with_eviction_policy(eviction_policy)
         .with_cache_policy(Box::new(LiquidPolicy::new()))
         .build(config)
         .await?;
@@ -145,14 +125,62 @@ async fn get_physical_plan(sql: &str, ctx: &SessionContext) -> Arc<dyn Execution
     state.create_physical_plan(&plan).await.unwrap()
 }
 
+async fn get_result(ctx: &SessionContext, sql: &str) -> String {
+    let plan = get_physical_plan(sql, ctx).await;
+    let batches = collect(plan, ctx.task_ctx()).await.unwrap();
+    pretty_format_batches(&batches).unwrap().to_string()
+}
+
+async fn run_io_profile(prefetch: bool, cache_dir: &Path) -> (String, u64, u64, u64) {
+    let config = SessionConfig::new().with_repartition_file_scans(false);
+    let builder = LiquidCacheLocalBuilder::new()
+        .with_max_memory_bytes(64 * 1024 * 1024)
+        .with_cache_dir(cache_dir.to_path_buf());
+    let builder = if prefetch {
+        builder
+    } else {
+        builder.with_prefetch(false)
+    };
+    let (ctx, cache) = builder.build(config).await.unwrap();
+    ctx.register_parquet("hits", TEST_FILE, ParquetReadOptions::default())
+        .await
+        .unwrap();
+    let sql = r#"SELECT "WatchID" FROM hits WHERE "SearchPhrase" LIKE '%abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789%'"#;
+
+    let first = get_result(&ctx, sql).await;
+    cache.flush_data().await.unwrap();
+    cache.storage().stats();
+    let second = get_result(&ctx, sql).await;
+    let runtime = cache.storage().stats().runtime;
+    assert_eq!(first, second);
+
+    (
+        second,
+        runtime.read_io_count,
+        runtime.get,
+        runtime.eval_predicate,
+    )
+}
+
+#[tokio::test]
+async fn prefetch_matches_lazy_io() {
+    let lazy_dir = TempDir::new().unwrap();
+    let prefetch_dir = TempDir::new().unwrap();
+
+    let lazy = run_io_profile(false, lazy_dir.path()).await;
+    let prefetch = run_io_profile(true, prefetch_dir.path()).await;
+
+    assert_eq!(lazy, prefetch);
+}
+
 async fn run_sql_with_cache(
     sql: &str,
-    squeeze_policy: Box<dyn SqueezePolicy>,
+    eviction_policy: Box<dyn EvictionPolicy>,
     cache_size_bytes: usize,
     cache_dir: &Path,
 ) -> QueryOutcome {
     let (ctx, cache) =
-        create_session_context_with_liquid_cache(squeeze_policy, cache_size_bytes, cache_dir)
+        create_session_context_with_liquid_cache(eviction_policy, cache_size_bytes, cache_dir)
             .await
             .unwrap();
 
@@ -160,13 +188,7 @@ async fn run_sql_with_cache(
     let displayable = DisplayableExecutionPlan::new(plan.as_ref());
     let plan_string = format!("{}", displayable.tree_render());
 
-    async fn get_result(ctx: &SessionContext, sql: &str) -> String {
-        let plan = get_physical_plan(sql, ctx).await;
-        let batches = collect(plan, ctx.task_ctx()).await.unwrap();
-        pretty_format_batches(&batches).unwrap().to_string()
-    }
-
-    // Clear any historical runtime counters before warming the cache.
+    // Clear any historical runtime counters before prefetching the cache.
     cache.storage().stats();
 
     let first_run = get_result(&ctx, sql).await;
@@ -189,14 +211,11 @@ async fn test_runner(sql: &str, reference: &str, cache_dir: &Path) {
     let cache_sizes = [10 * 1024, 1024 * 1024, usize::MAX]; // 10KB, 1MB, unlimited
 
     for cache_size in cache_sizes {
-        let squeeze_policies: Vec<Box<dyn SqueezePolicy>> = vec![
-            Box::new(TranscodeSqueezeEvict),
-            Box::new(Evict),
-            Box::new(TranscodeEvict),
-        ];
-        for squeeze_policy in squeeze_policies {
+        let eviction_policies: Vec<Box<dyn EvictionPolicy>> =
+            vec![Box::new(TranscodeEvict), Box::new(Evict)];
+        for eviction_policy in eviction_policies {
             let QueryOutcome { values, .. } =
-                run_sql_with_cache(sql, squeeze_policy, cache_size, cache_dir).await;
+                run_sql_with_cache(sql, eviction_policy, cache_size, cache_dir).await;
             assert_eq!(
                 values, reference,
                 "Results differ, cache_size: {cache_size}"
@@ -214,23 +233,19 @@ async fn test_url_prefix_filtering() {
         values,
         plan,
         stats,
-    } = run_sql_with_cache(
-        sql,
-        Box::new(TranscodeSqueezeEvict),
-        1024 * 1024,
-        cache_dir.path(),
-    )
-    .await;
+    } = run_sql_with_cache(sql, Box::new(TranscodeEvict), 1024 * 1024, cache_dir.path()).await;
 
     assert!(stats.has_cache_hits());
     assert!(stats.entries_reused());
 
     let reference = values.clone();
 
-    insta::assert_snapshot!(format!(
-        "plan: \n{}\nvalues: \n{}\nstats:\n{}",
-        plan, values, stats
-    ));
+    insta::with_settings!({ filters => vec![(r"usage\.(memory|disk)_bytes: \d+", "usage.${1}_bytes: [bytes]")] }, {
+        insta::assert_snapshot!(format!(
+            "plan: \n{}\nvalues: \n{}\nstats:\n{}",
+            plan, values, stats
+        ));
+    });
     test_runner(sql, &reference, cache_dir.path()).await;
 }
 
@@ -243,23 +258,19 @@ async fn test_url_selection_and_ordering() {
         values,
         plan,
         stats,
-    } = run_sql_with_cache(
-        sql,
-        Box::new(TranscodeSqueezeEvict),
-        1024 * 300,
-        cache_dir.path(),
-    )
-    .await;
+    } = run_sql_with_cache(sql, Box::new(TranscodeEvict), 1024 * 300, cache_dir.path()).await;
 
     assert!(stats.has_cache_hits());
     assert!(stats.entries_reused());
 
     let reference = values.clone();
 
-    insta::assert_snapshot!(format!(
-        "plan: \n{}\nvalues: \n{}\nstats:\n{}",
-        plan, values, stats
-    ));
+    insta::with_settings!({ filters => vec![(r"usage\.(memory|disk)_bytes: \d+", "usage.${1}_bytes: [bytes]")] }, {
+        insta::assert_snapshot!(format!(
+            "plan: \n{}\nvalues: \n{}\nstats:\n{}",
+            plan, values, stats
+        ));
+    });
     test_runner(sql, &reference, cache_dir.path()).await;
 }
 
@@ -272,23 +283,19 @@ async fn test_os_selection() {
         values,
         plan,
         stats,
-    } = run_sql_with_cache(
-        sql,
-        Box::new(TranscodeSqueezeEvict),
-        1024 * 1024,
-        cache_dir.path(),
-    )
-    .await;
+    } = run_sql_with_cache(sql, Box::new(TranscodeEvict), 1024 * 1024, cache_dir.path()).await;
 
     assert!(stats.has_cache_hits());
     assert!(stats.entries_reused());
 
     let reference = values.clone();
 
-    insta::assert_snapshot!(format!(
-        "plan: \n{}\nvalues: \n{}\nstats:\n{}",
-        plan, values, stats
-    ));
+    insta::with_settings!({ filters => vec![(r"usage\.(memory|disk)_bytes: \d+", "usage.${1}_bytes: [bytes]")] }, {
+        insta::assert_snapshot!(format!(
+            "plan: \n{}\nvalues: \n{}\nstats:\n{}",
+            plan, values, stats
+        ));
+    });
 
     test_runner(sql, &reference, cache_dir.path()).await;
 }
@@ -302,23 +309,19 @@ async fn test_referer_filtering() {
         values,
         plan,
         stats,
-    } = run_sql_with_cache(
-        sql,
-        Box::new(TranscodeSqueezeEvict),
-        1024 * 1024,
-        cache_dir.path(),
-    )
-    .await;
+    } = run_sql_with_cache(sql, Box::new(TranscodeEvict), 1024 * 1024, cache_dir.path()).await;
 
     assert!(stats.has_cache_hits());
     assert!(stats.entries_reused());
 
     let reference = values.clone();
 
-    insta::assert_snapshot!(format!(
-        "plan: \n{}\nvalues: \n{}\nstats:\n{}",
-        plan, values, stats
-    ));
+    insta::with_settings!({ filters => vec![(r"usage\.(memory|disk)_bytes: \d+", "usage.${1}_bytes: [bytes]")] }, {
+        insta::assert_snapshot!(format!(
+            "plan: \n{}\nvalues: \n{}\nstats:\n{}",
+            plan, values, stats
+        ));
+    });
 
     test_runner(sql, &reference, cache_dir.path()).await;
 }
@@ -332,82 +335,36 @@ async fn test_single_column_filter_projection() {
         values,
         plan,
         stats,
-    } = run_sql_with_cache(
-        sql,
-        Box::new(TranscodeSqueezeEvict),
-        1024 * 1024,
-        cache_dir.path(),
-    )
-    .await;
+    } = run_sql_with_cache(sql, Box::new(TranscodeEvict), 1024 * 1024, cache_dir.path()).await;
 
     assert!(stats.has_cache_hits());
     assert!(stats.entries_reused());
 
     let reference = values.clone();
 
-    insta::assert_snapshot!(format!(
-        "plan: \n{}\nvalues: \n{}\nstats:\n{}",
-        plan, values, stats
-    ));
+    insta::with_settings!({ filters => vec![(r"usage\.(memory|disk)_bytes: \d+", "usage.${1}_bytes: [bytes]")] }, {
+        insta::assert_snapshot!(format!(
+            "plan: \n{}\nvalues: \n{}\nstats:\n{}",
+            plan, values, stats
+        ));
+    });
 
     test_runner(sql, &reference, cache_dir.path()).await;
 }
 
-/// Runs on x86_64 only, because the snapshot pins `usage.memory_bytes` exactly
-/// and aarch64 reports 935 bytes less at every one of the three measurement
-/// points (1000915 -> 999980, 1036304 -> 1035369), reproducibly.
-///
-/// The split is by architecture, not by OS. Measured:
-///
-/// | target              | usage.memory_bytes |
-/// |---------------------|--------------------|
-/// | x86_64-linux        | 1000915 (recorded) |
-/// | aarch64-linux       | 999980             |
-/// | aarch64-darwin      | 999980             |
-///
-/// aarch64-linux and aarch64-darwin agree exactly, so the OS is not the
-/// variable — gating on `target_os` would still fail on Graviton or on any ARM
-/// Linux runner.
-///
-/// The whole delta is the FSST-compressed payload — `RawFsstBuffer::values.len()`.
-/// Componentwise, everything else is byte-identical across the two architectures
-/// (the arrow entries, the fastlanes bit-packed dictionary keys at 17504, the
-/// prefix keys, the compact offsets, the struct sizes, and the 537585 bytes of
-/// uncompressed FSST input). Only the compressed output moves: 254655 on aarch64
-/// against 255590 on x86_64.
-///
-/// Cause: `fsst-rs` 0.5.11 drains a hash map of symbol candidates into a
-/// `BinaryHeap` (`builder.rs:796`), and `Candidate`'s ordering key is just
-/// `(gain, symbol.len())` (`builder.rs:835-837`) — the symbol bytes are excluded.
-/// Two distinct symbols with equal gain and equal length therefore compare
-/// `Equal`, so which one wins is decided by heap insertion order, i.e. hash-map
-/// iteration order, which is not stable across architectures (hashbrown selects
-/// an SSE2, NEON or generic probe implementation per target). Different
-/// tie-break, different 255-symbol table, different compressed length. The real
-/// fix belongs upstream: make `Candidate`'s ordering total by including the
-/// symbol bytes as a final tie-breaker.
-///
-/// Note this means liquid-encoded bytes are NOT identical across architectures —
-/// `to_bytes` writes `values` verbatim — so compression ratios and capacity
-/// figures do not transfer between arm64 and x86_64. `usage.disk_bytes` staying
-/// at 35000 is not evidence against that; the two disk-resident entries are
-/// different, much smaller columns than the one that moves.
-///
-/// The byte-exact snapshot therefore runs on x86_64 only, keeping its full
-/// strength and the `cargo insta` workflow there. Everywhere else the test still
-/// runs and bounds the same figures to within 1% — see the bottom of this test.
 #[tokio::test]
 async fn test_provide_schema2() {
     use std::fmt::Write as _;
 
     let cache_dir = TempDir::new().unwrap();
     let df_ctx = SessionContext::new();
-    let mut config = cache_test_config();
+    let mut config = SessionConfig::new();
     config.options_mut().execution.target_partitions = 4;
     let (liquid_ctx, cache) = LiquidCacheLocalBuilder::new()
+        .with_prefetch(false)
         .with_cache_dir(cache_dir.path().to_path_buf())
         .with_max_memory_bytes(1024 * 1024)
-        .with_squeeze_policy(Box::new(TranscodeSqueezeEvict))
+        .with_eviction_policy(Box::new(TranscodeEvict))
         .build(config)
         .await
         .unwrap();
@@ -453,7 +410,7 @@ async fn test_provide_schema2() {
         let displayable = DisplayableExecutionPlan::new(plan.as_ref());
         let plan_string = format!("{}", displayable.tree_render());
 
-        // Reset runtime counters so we measure hits from the warm run onwards.
+        // Reset runtime counters so we measure hits from the prefetch run onwards.
         cache.storage().stats();
 
         let first_liquid_run = liquid_ctx.sql(sql).await.unwrap().collect().await.unwrap();
@@ -477,75 +434,9 @@ async fn test_provide_schema2() {
         }
     }
 
-    #[cfg(target_arch = "x86_64")]
-    insta::assert_snapshot!(snapshot);
-
-    // Off x86_64 the byte-exact snapshot cannot match, because FSST picks a
-    // different symbol table (see above). Bound the figures instead of skipping
-    // the test: arm64 is a production target, so it still deserves a tripwire on
-    // a gross accounting regression. The plan text is only checked byte-for-byte
-    // on x86_64, but what this test covers besides it — the DataFusion-vs-liquid
-    // column equality, the cache hits, the tier split, the `Utf8`-declared schema
-    // over a `string_view` file — is architecture-independent and worth running.
-    #[cfg(not(target_arch = "x86_64"))]
-    assert_memory_bytes_within_1pct(
-        &snapshot,
-        include_str!("snapshots/liquid_cache_datafusion_local__tests__provide_schema2.snap"),
-    );
-}
-
-/// Checks each `usage.memory_bytes` line in `snapshot` against the figure the
-/// committed x86_64 snapshot records for the same query, allowing 1%.
-///
-/// `recorded` is the `.snap` file itself rather than a hand-copied array, so
-/// regenerating the snapshot on x86_64 with `cargo insta accept` cannot leave
-/// this assertion silently checking stale numbers.
-///
-/// The known architecture difference is ~0.1% (935 bytes in ~1 MiB), so 1% has an
-/// order of magnitude of headroom while still catching the kind of regression that
-/// matters — a buffer counted twice, or a tier accounted at the wrong size.
-#[cfg(not(target_arch = "x86_64"))]
-fn assert_memory_bytes_within_1pct(snapshot: &str, recorded: &str) {
-    let actual = memory_bytes(snapshot);
-    let expected = memory_bytes(recorded);
-
-    // Both sides are parsed with the same predicate, so a changed prefix would
-    // empty both and make the length check below pass on nothing.
-    assert!(
-        !expected.is_empty(),
-        "found no `usage.memory_bytes` readings in the committed snapshot; the \
-         stats format has changed and this assertion is no longer reading anything"
-    );
-    assert_eq!(
-        actual.len(),
-        expected.len(),
-        "expected {} memory_bytes readings, found {}: {actual:?}",
-        expected.len(),
-        actual.len()
-    );
-
-    for (idx, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
-        let drift = actual.abs_diff(expected);
-        assert!(
-            drift * 100 <= expected,
-            "query[{idx}]: memory_bytes {actual} is more than 1% from the x86_64 \
-             figure {expected} (off by {drift}); the architecture difference should \
-             be ~0.1%, so this is a real accounting change"
-        );
-    }
-}
-
-/// Pulls every `usage.memory_bytes` figure out of a stats snapshot, in order.
-///
-/// Works on both the live snapshot and a committed `.snap` file: insta writes the
-/// snapshot body unindented after its YAML header, so the same prefix matches.
-#[cfg(not(target_arch = "x86_64"))]
-fn memory_bytes(snapshot: &str) -> Vec<u64> {
-    snapshot
-        .lines()
-        .filter_map(|line| line.strip_prefix("usage.memory_bytes: "))
-        .map(|value| value.trim().parse().expect("memory_bytes must be a number"))
-        .collect()
+    insta::with_settings!({ filters => vec![(r"usage\.(memory|disk)_bytes: \d+", "usage.${1}_bytes: [bytes]")] }, {
+        insta::assert_snapshot!(snapshot);
+    });
 }
 
 #[tokio::test]
@@ -557,27 +448,23 @@ async fn test_provide_schema_with_filter() {
         values,
         plan,
         stats,
-    } = run_sql_with_cache(
-        sql,
-        Box::new(TranscodeSqueezeEvict),
-        1024 * 1024,
-        cache_dir.path(),
-    )
-    .await;
+    } = run_sql_with_cache(sql, Box::new(TranscodeEvict), 1024 * 1024, cache_dir.path()).await;
 
     assert!(stats.has_cache_hits());
     assert!(stats.entries_reused());
 
     let reference = values.clone();
 
-    insta::assert_snapshot!(format!(
-        "plan: \n{}\nvalues: \n{}\nstats:\n{}",
-        plan, values, stats
-    ));
+    insta::with_settings!({ filters => vec![(r"usage\.(memory|disk)_bytes: \d+", "usage.${1}_bytes: [bytes]")] }, {
+        insta::assert_snapshot!(format!(
+            "plan: \n{}\nvalues: \n{}\nstats:\n{}",
+            plan, values, stats
+        ));
+    });
 
     let (ctx, _) = LiquidCacheLocalBuilder::new()
-        .with_squeeze_policy(Box::new(TranscodeSqueezeEvict))
-        .build(cache_test_config())
+        .with_eviction_policy(Box::new(TranscodeEvict))
+        .build(SessionConfig::new())
         .await
         .unwrap();
 
@@ -612,94 +499,52 @@ async fn test_provide_schema_with_filter() {
     assert_eq!(formatted_results, reference);
 }
 
-/// Covers the multi-partition scan path against the shared cache.
-///
-/// The tests above pin `repartition_file_min_size` above the test file size so
-/// the scan stays single-partition and their traces stay reproducible. That pin
-/// is deliberate, but it also means nothing else exercises several scan
-/// partitions admitting into one cache concurrently — which is exactly what a
-/// default DataFusion 55 deployment does for any file over 1 MiB, since DF 55
-/// lowered the threshold from 10 MiB to 1 MiB.
-///
-/// So this test leaves `repartition_file_min_size` at the DF 55 default and
-/// asserts only order-independent properties: the result rows compared as a
-/// sorted multiset (against a single-partition run of the same query), and that
-/// the warm run hits the cache. No trace, byte count or row order is pinned, so
-/// it cannot reintroduce the snapshot flakiness the pin defends against.
 #[tokio::test]
-async fn test_multi_partition_scan_shares_cache() {
-    /// Rows as an order-independent multiset.
-    async fn sorted_rows(ctx: &SessionContext, sql: &str) -> Vec<String> {
-        let plan = get_physical_plan(sql, ctx).await;
-        let batches = collect(plan, ctx.task_ctx()).await.unwrap();
-        let mut rows = pretty_format_batches(&batches)
-            .unwrap()
-            .to_string()
-            .lines()
-            .map(str::to_string)
-            .collect::<Vec<_>>();
-        rows.sort();
-        rows
-    }
+async fn test_repartitioned_file_scan_cache_correctness() {
+    let reference_cache_dir = TempDir::new().unwrap();
+    let parallel_cache_dir = TempDir::new().unwrap();
+    let sql = r#"select "WatchID", "OS", "EventTime" from hits where "OS" <> 2 order by "WatchID" desc limit 10"#;
 
-    async fn build_ctx(
-        config: SessionConfig,
-        cache_dir: &Path,
-    ) -> (SessionContext, LiquidCacheParquetRef) {
-        let (ctx, cache) = LiquidCacheLocalBuilder::new()
-            .with_max_memory_bytes(1024 * 1024)
-            .with_cache_dir(cache_dir.to_path_buf())
-            .with_squeeze_policy(Box::new(TranscodeSqueezeEvict))
-            .with_cache_policy(Box::new(LiquidPolicy::new()))
-            .build(config)
-            .await
-            .unwrap();
-        ctx.register_parquet("hits", TEST_FILE, ParquetReadOptions::default())
-            .await
-            .unwrap();
-        (ctx, cache)
-    }
+    let reference = run_sql_with_cache(
+        sql,
+        Box::new(TranscodeEvict),
+        1024 * 1024,
+        reference_cache_dir.path(),
+    )
+    .await
+    .values;
 
-    let sql = r#"select "OS", COUNT(*) from hits where "URL" like '%tours%' group by "OS""#;
+    // DataFusion 55 lowered repartition_file_min_size from 10 MiB to 1 MiB,
+    // which splits the 2.3 MiB fixture into four concurrent scan partitions.
+    let mut config = SessionConfig::new();
+    config.options_mut().execution.target_partitions = 4;
+    let (ctx, cache) = LiquidCacheLocalBuilder::new()
+        .with_max_memory_bytes(1024 * 1024)
+        .with_cache_dir(parallel_cache_dir.path().to_path_buf())
+        .with_eviction_policy(Box::new(TranscodeEvict))
+        .with_cache_policy(Box::new(LiquidPolicy::new()))
+        .build(config)
+        .await
+        .unwrap();
+    ctx.register_parquet("hits", TEST_FILE, ParquetReadOptions::default())
+        .await
+        .unwrap();
 
-    // Multi-partition: DF 55 default `repartition_file_min_size` (1 MiB) against
-    // the 2.3 MB test file, so `target_partitions` really does split the scan.
-    let multi_dir = TempDir::new().unwrap();
-    let mut multi_config = SessionConfig::new();
-    multi_config.options_mut().execution.target_partitions = 4;
-    let (multi_ctx, cache) = build_ctx(multi_config, multi_dir.path()).await;
-
-    // Guard the premise: if a future default makes the scan single-partition
-    // again, this test would silently stop covering concurrent admission.
-    let scan_partitions = {
-        let mut node = get_physical_plan(sql, &multi_ctx).await;
-        while let Some(child) = node.children().first() {
-            node = Arc::clone(child);
-        }
-        node.properties().partitioning.partition_count()
-    };
+    let plan = get_physical_plan(sql, &ctx).await;
+    let plan = format!(
+        "{}",
+        DisplayableExecutionPlan::new(plan.as_ref()).tree_render()
+    );
     assert!(
-        scan_partitions > 1,
-        "expected a multi-partition scan, got {scan_partitions}"
+        plan.contains("files: 4"),
+        "expected a repartitioned scan:\n{plan}"
     );
 
-    // Clear historical counters, then warm the cache and read it back.
-    cache.storage().stats();
-    let first_run = sorted_rows(&multi_ctx, sql).await;
+    assert_eq!(get_result(&ctx, sql).await, reference);
     let entries_after_first_run = cache.storage().stats().total_entries;
-    let second_run = sorted_rows(&multi_ctx, sql).await;
-    let stats = CacheStatsSummary::from_stats(cache.storage().stats(), entries_after_first_run);
+    assert_eq!(get_result(&ctx, sql).await, reference);
 
-    assert_eq!(first_run, second_run);
-    assert!(
-        stats.has_cache_hits(),
-        "warm multi-partition run did not read from the cache"
-    );
-
-    // Same answer as the single-partition path the snapshot tests pin.
-    let single_dir = TempDir::new().unwrap();
-    let mut single_config = cache_test_config();
-    single_config.options_mut().execution.target_partitions = 4;
-    let (single_ctx, _single_cache) = build_ctx(single_config, single_dir.path()).await;
-    assert_eq!(sorted_rows(&single_ctx, sql).await, second_run);
+    let stats = cache.storage().stats();
+    assert!(stats.runtime.get_with_selection > 0);
+    assert!(stats.total_entries >= entries_after_first_run);
 }

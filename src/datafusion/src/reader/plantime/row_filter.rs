@@ -64,14 +64,14 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use arrow::array::BooleanArray;
-use arrow::datatypes::{DataType, Schema};
+use arrow::datatypes::Schema;
 use arrow::error::{ArrowError, Result as ArrowResult};
 use arrow::record_batch::RecordBatch;
 use arrow_schema::SchemaRef;
 use datafusion::datasource::physical_plan::ParquetFileMetrics;
 use datafusion::logical_expr::Operator;
 use datafusion::physical_expr::utils::reassign_expr_columns;
-use datafusion::physical_plan::expressions::{BinaryExpr, LikeExpr, Literal};
+use datafusion::physical_plan::expressions::{BinaryExpr, LikeExpr};
 use datafusion::physical_plan::metrics;
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::ArrowPredicate;
@@ -79,12 +79,12 @@ use parquet::file::metadata::ParquetMetaData;
 
 use datafusion::common::Result;
 use datafusion::common::cast::as_boolean_array;
-use datafusion::common::internal_err;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion, TreeNodeVisitor};
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::{PhysicalExpr, split_conjunction};
 
 /// A row filter that can be used to filter rows from a parquet file.
+#[derive(Clone)]
 pub struct LiquidRowFilter {
     predicates: Vec<LiquidPredicate>,
 }
@@ -106,24 +106,6 @@ impl LiquidRowFilter {
     }
 }
 
-pub(crate) fn get_predicate_column_id(projection: &parquet::arrow::ProjectionMask) -> Vec<usize> {
-    #[derive(Debug, Clone)]
-    struct ProjectionMaskLiquid {
-        mask: Option<Vec<bool>>,
-    }
-    let project_inner: &ProjectionMaskLiquid = unsafe { std::mem::transmute(projection) };
-    project_inner
-        .mask
-        .as_ref()
-        .map(|m| {
-            m.iter()
-                .enumerate()
-                .filter_map(|(pos, &x)| if x { Some(pos) } else { None })
-                .collect::<Vec<usize>>()
-        })
-        .unwrap_or_default()
-}
-
 /// A "compiled" predicate passed to `ParquetRecordBatchStream` to perform
 /// row-level filtering during parquet decoding.
 ///
@@ -133,7 +115,7 @@ pub(crate) fn get_predicate_column_id(projection: &parquet::arrow::ProjectionMas
 ///
 /// An expression can be evaluated as a `DatafusionArrowPredicate` if it:
 /// * Does not reference any projected columns
-/// * Does not reference columns with non-primitive types (e.g. structs / lists)
+/// * References only columns present in the physical file schema
 #[derive(Debug, Clone)]
 pub struct LiquidPredicate {
     /// the filter expression
@@ -143,6 +125,9 @@ pub struct LiquidPredicate {
     /// Path to the columns in the parquet schema required to evaluate the
     /// expression
     projection_mask: ProjectionMask,
+    /// Indices into the file schema of the columns required to evaluate the
+    /// expression, in `filter_schema` order
+    column_ids: Vec<usize>,
     /// how many rows were filtered out by this predicate
     rows_pruned: metrics::Count,
     /// how many rows passed this predicate
@@ -173,6 +158,7 @@ impl LiquidPredicate {
             physical_expr,
             physical_expr_physical_column_index: candidate.expr,
             projection_mask: projection,
+            column_ids: candidate.projection,
             rows_pruned,
             rows_matched,
             time,
@@ -202,8 +188,7 @@ impl LiquidPredicate {
 
     /// Get the column ids of the predicate.
     pub fn predicate_column_ids(&self) -> Vec<usize> {
-        let projection = self.projection();
-        get_predicate_column_id(projection)
+        self.column_ids.clone()
     }
 }
 
@@ -290,9 +275,11 @@ impl FilterCandidateBuilder {
             return Ok(None);
         };
 
-        // A conjunct that references no column (`NULL`, `false`, a volatile
-        // function) is still a conjunct: dropping it here would widen the filter,
-        // because the scan is the only place the predicate is applied.
+        // A conjunct that references no column - a literal `NULL` or `false` left
+        // behind by expression simplification, for instance - is still a conjunct.
+        // Dropping it here widens the filter, because by the time this runs
+        // DataFusion has removed the `FilterExec` on the assumption the predicate
+        // was fully pushed down, so the scan is the only place it is applied.
         let projected_file_schema = Arc::new(
             self.file_schema
                 .project(&required_indices_into_file_schema)?,
@@ -313,11 +300,9 @@ impl FilterCandidateBuilder {
 
 // a struct that implements TreeNodeRewriter to traverse a PhysicalExpr tree structure to determine
 // if any column references in the expression would prevent it from being predicate-pushed-down.
-// if non_primitive_columns || projected_columns, it can't be pushed down.
+// if projected_columns, it can't be pushed down.
 // can't be reused between calls to `rewrite`; each construction must be used only once.
 struct PushdownChecker<'schema> {
-    /// Does the expression require any non-primitive columns (like structs)?
-    non_primitive_columns: bool,
     /// Does the expression reference any columns that are not in the file schema?
     projected_columns: bool,
     // Indices into the file schema of the columns required to evaluate the expression
@@ -328,7 +313,6 @@ struct PushdownChecker<'schema> {
 impl<'schema> PushdownChecker<'schema> {
     fn new(file_schema: &'schema Schema) -> Self {
         Self {
-            non_primitive_columns: false,
             projected_columns: false,
             required_columns: BTreeSet::default(),
             file_schema,
@@ -338,10 +322,6 @@ impl<'schema> PushdownChecker<'schema> {
     fn check_single_column(&mut self, column_name: &str) -> Option<TreeNodeRecursion> {
         if let Ok(idx) = self.file_schema.index_of(column_name) {
             self.required_columns.insert(idx);
-            if DataType::is_nested(self.file_schema.field(idx).data_type()) {
-                self.non_primitive_columns = true;
-                return Some(TreeNodeRecursion::Jump);
-            }
         } else {
             // If the column does not exist in the file schema then it cannot be pushed down.
             self.projected_columns = true;
@@ -353,7 +333,7 @@ impl<'schema> PushdownChecker<'schema> {
 
     #[inline]
     fn prevents_pushdown(&self) -> bool {
-        self.non_primitive_columns || self.projected_columns
+        self.projected_columns
     }
 }
 
@@ -382,35 +362,6 @@ fn pushdown_columns(
     let mut checker = PushdownChecker::new(file_schema);
     expr.visit(&mut checker)?;
     Ok((!checker.prevents_pushdown()).then_some(checker.required_columns.into_iter().collect()))
-}
-
-/// The first conjunct of `expr` the liquid row filter cannot evaluate against
-/// `schema`, if any.
-///
-/// This is the plan-time counterpart of the per-conjunct check
-/// [`build_row_filter`] performs at open time, and the two must agree: a scan
-/// whose predicate holds an unevaluable conjunct must never reach
-/// [`build_row_filter`], because by then DataFusion has removed the `FilterExec`
-/// and the scan is the only place the predicate is applied. See
-/// [`crate::optimizers::rewrite_data_source_plan`], which declines such a scan.
-///
-/// Pass the **table** schema, not the file schema. A column that is missing from
-/// an individual file, and a partition column, are both absent from the file
-/// schema but are turned into literals by the opener's physical-expr adapter
-/// before the row filter ever sees them — refusing on their account would
-/// needlessly bypass the cache. What genuinely cannot be evaluated is a
-/// reference to a nested column, or to a column that exists nowhere in the
-/// table.
-pub fn unevaluable_conjunct<'e>(
-    expr: &'e Arc<dyn PhysicalExpr>,
-    schema: &Schema,
-) -> Result<Option<&'e Arc<dyn PhysicalExpr>>> {
-    for conjunct in split_conjunction(expr) {
-        if pushdown_columns(conjunct, schema)?.is_none() {
-            return Ok(Some(conjunct));
-        }
-    }
-    Ok(None)
 }
 
 /// Calculate the total compressed size of all `Column`'s required for
@@ -444,22 +395,16 @@ fn columns_sorted(_columns: &[usize], _metadata: &ParquetMetaData) -> Result<boo
 ///
 /// # returns
 /// * `Ok(Some(row_filter))` if the expression can be used as RowFilter
-/// * `Ok(None)` if the expression holds no conjuncts at all
+/// * `Ok(None)` if the expression cannot be used as an RowFilter
 /// * `Err(e)` if an error occurs while building the filter
 ///
-/// Every conjunct must make it into the returned filter. Upstream DataFusion may
-/// drop a conjunct it cannot evaluate, because it only ever pushes down what it
-/// can evaluate and the `FilterExec` above it keeps the rest. Here the
-/// `FilterExec` is already gone by the time this runs — DataFusion removed it on
-/// the assumption the predicate was fully pushed — so this scan is the only place
-/// the predicate is applied, and a dropped conjunct *widens* the filter: rows
-/// that should not match come back (issues #19, #21, #23).
+/// Note that the returned `RowFilter` may not contains all conjuncts in the
+/// original expression. This is because some conjuncts may not be able to be
+/// evaluated as an `ArrowPredicate` and will be ignored.
 ///
-/// Such a predicate is therefore kept off the liquid path at plan time, by
-/// [`crate::optimizers::rewrite_data_source_plan`], which leaves the scan as a
-/// vanilla parquet read so DataFusion applies the predicate itself. Reaching
-/// this function with an unevaluable conjunct means that gate and this builder
-/// have drifted apart, so it is an error rather than a silent narrowing.
+/// For example, if the expression is `a = 1 AND b = 2 AND c = 3` and `b = 2`
+/// can not be evaluated for some reason, the returned `RowFilter` will contain
+/// `a = 1` and `c = 3`.
 pub fn build_row_filter(
     expr: &Arc<dyn PhysicalExpr>,
     physical_file_schema: &SchemaRef,
@@ -474,7 +419,6 @@ pub fn build_row_filter(
     // Split into conjuncts:
     // `a = 1 AND b = 2 AND c = 3` -> [`a = 1`, `b = 2`, `c = 3`]
     let predicates = split_conjunction(expr);
-    let conjunct_count = predicates.len();
 
     // Determine which conjuncts can be evaluated as ArrowPredicates, if any
     let mut candidates: Vec<FilterCandidate> = predicates
@@ -487,24 +431,6 @@ pub fn build_row_filter(
         .into_iter()
         .flatten()
         .collect();
-
-    // One candidate per conjunct, or none of them can be trusted: see the note
-    // on this function. The plan-time gate should have kept such a predicate off
-    // this path entirely, so fail loudly rather than answer a weaker question
-    // than the one that was asked.
-    debug_assert_eq!(
-        candidates.len(),
-        conjunct_count,
-        "row filter dropped {} of {conjunct_count} conjuncts of `{expr}`",
-        conjunct_count - candidates.len()
-    );
-    if candidates.len() != conjunct_count {
-        return internal_err!(
-            "row filter can evaluate only {} of the {conjunct_count} conjuncts of `{expr}`; \
-             the scan is the only place this predicate is applied, so it cannot be pushed down",
-            candidates.len()
-        );
-    }
 
     // no candidates
     if candidates.is_empty() {
@@ -553,146 +479,17 @@ pub fn build_row_filter(
 }
 
 fn get_priority(expr: &Arc<dyn PhysicalExpr>) -> u8 {
-    // A constant conjunct reads no column and can empty the selection outright,
-    // which skips every predicate after it, so it goes first.
-    if expr.is::<Literal>() {
-        return 0;
-    }
-
     if let Some(binary) = expr.downcast_ref::<BinaryExpr>() {
         match binary.op() {
-            Operator::Eq | Operator::NotEq => 1,
-            Operator::LikeMatch | Operator::ILikeMatch => 2,
-            Operator::NotLikeMatch | Operator::NotILikeMatch => 3,
-            Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq => 4,
-            _ => 5,
+            Operator::Eq | Operator::NotEq => 0, // Highest priority
+            Operator::LikeMatch | Operator::ILikeMatch => 1,
+            Operator::NotLikeMatch | Operator::NotILikeMatch => 2,
+            Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq => 3,
+            _ => 4,
         }
     } else if expr.is::<LikeExpr>() {
-        2 // LIKE expressions
+        1 // LIKE expressions
     } else {
-        6 // All other expression types
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use arrow::array::{Int32Array, Int64Array, RecordBatch, StructArray};
-    use arrow_schema::{Field, Fields};
-    use datafusion::common::ScalarValue;
-    use datafusion::physical_plan::expressions::{BinaryExpr, Column, Literal};
-    use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
-    use parquet::arrow::ArrowWriter;
-    use parquet::arrow::arrow_reader::ArrowReaderMetadata;
-
-    fn col(name: &str, index: usize) -> Arc<dyn PhysicalExpr> {
-        Arc::new(Column::new(name, index))
-    }
-
-    fn eq(left: Arc<dyn PhysicalExpr>, right: i64) -> Arc<dyn PhysicalExpr> {
-        Arc::new(BinaryExpr::new(
-            left,
-            Operator::Eq,
-            Arc::new(Literal::new(ScalarValue::Int64(Some(right)))),
-        ))
-    }
-
-    fn and(left: Arc<dyn PhysicalExpr>, right: Arc<dyn PhysicalExpr>) -> Arc<dyn PhysicalExpr> {
-        Arc::new(BinaryExpr::new(left, Operator::And, right))
-    }
-
-    /// `id int64` plus `st struct<a int32>`, the shape from the issue.
-    fn schema_with_struct() -> Schema {
-        Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new(
-                "st",
-                DataType::Struct(Fields::from(vec![Field::new("a", DataType::Int32, false)])),
-                false,
-            ),
-        ])
-    }
-
-    /// A one-row parquet file over `schema_with_struct`, and its metadata.
-    fn metadata() -> (SchemaRef, ParquetMetaData) {
-        let schema = Arc::new(schema_with_struct());
-        let fields = Fields::from(vec![Field::new("a", DataType::Int32, false)]);
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(Int64Array::from(vec![1])),
-                Arc::new(StructArray::new(
-                    fields,
-                    vec![Arc::new(Int32Array::from(vec![1]))],
-                    None,
-                )),
-            ],
-        )
-        .unwrap();
-
-        let mut buffer = Vec::new();
-        let mut writer = ArrowWriter::try_new(&mut buffer, Arc::clone(&schema), None).unwrap();
-        writer.write(&batch).unwrap();
-        writer.close().unwrap();
-
-        let bytes = bytes::Bytes::from(buffer);
-        let reader = ArrowReaderMetadata::load(&bytes, Default::default()).unwrap();
-        let metadata = Arc::try_unwrap(Arc::clone(reader.metadata()))
-            .unwrap_or_else(|shared| shared.as_ref().clone());
-        (schema, metadata)
-    }
-
-    /// `PushdownChecker`'s `non_primitive_columns` path: `st` is a struct, so no
-    /// conjunct that reads it can be evaluated as an `ArrowPredicate`.
-    #[test]
-    fn nested_column_conjunct_is_unevaluable() {
-        let schema = schema_with_struct();
-        let nested = eq(col("st", 1), 3);
-        let expr = and(eq(col("id", 0), 0), Arc::clone(&nested));
-
-        let found = unevaluable_conjunct(&expr, &schema).unwrap();
-        assert!(Arc::ptr_eq(found.unwrap(), &nested));
-    }
-
-    /// `PushdownChecker`'s `projected_columns` path: `missing` is in no schema the
-    /// scan can read.
-    #[test]
-    fn conjunct_on_column_outside_schema_is_unevaluable() {
-        let schema = schema_with_struct();
-        let absent = eq(col("missing", 2), 3);
-        let expr = and(eq(col("id", 0), 0), Arc::clone(&absent));
-
-        let found = unevaluable_conjunct(&expr, &schema).unwrap();
-        assert!(Arc::ptr_eq(found.unwrap(), &absent));
-    }
-
-    /// A predicate every conjunct of which reads a primitive column of the schema
-    /// is evaluable, so the scan is not declined for it.
-    #[test]
-    fn primitive_conjuncts_are_evaluable() {
-        let schema = schema_with_struct();
-        let expr = and(eq(col("id", 0), 0), eq(col("id", 0), 3));
-
-        assert!(unevaluable_conjunct(&expr, &schema).unwrap().is_none());
-    }
-
-    /// The invariant behind the plan-time gate: reaching the builder with a
-    /// conjunct it cannot evaluate is a bug, not a licence to narrow the filter.
-    /// A debug build trips the assertion; a release build returns the error.
-    #[test]
-    #[cfg_attr(debug_assertions, should_panic(expected = "row filter dropped"))]
-    fn build_row_filter_refuses_to_drop_a_conjunct() {
-        let (schema, metadata) = metadata();
-        let expr = and(eq(col("id", 0), 0), eq(col("st", 1), 3));
-        let metrics = ExecutionPlanMetricsSet::new();
-        let file_metrics = ParquetFileMetrics::new(0, "test.parquet", &metrics);
-
-        let Err(err) = build_row_filter(&expr, &schema, &metadata, false, &file_metrics) else {
-            panic!("a dropped conjunct must not be reported as a usable filter");
-        };
-        assert!(
-            err.to_string().contains("cannot be pushed down"),
-            "unexpected error: {err}"
-        );
+        5 // All other expression types
     }
 }

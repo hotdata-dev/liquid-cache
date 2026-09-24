@@ -33,12 +33,11 @@ use datafusion::{
     execution::{SessionStateBuilder, object_store::ObjectStoreUrl},
     prelude::{SessionConfig, SessionContext},
 };
-use datafusion_proto::bytes::physical_plan_from_bytes;
 use fastrace::prelude::SpanContext;
 use futures::{Stream, TryStreamExt};
 use liquid_cache::cache::CacheExpression;
 use liquid_cache_common::rpc::{FetchResults, LiquidCacheActions};
-use liquid_cache_datafusion::cache::{ColumnSqueezeHints, LiquidCacheParquetRef};
+use liquid_cache_datafusion::cache::{ColumnLineages, LiquidCacheParquetRef};
 use log::info;
 use prost::bytes::Bytes;
 use service::LiquidCacheServiceInner;
@@ -52,6 +51,7 @@ mod utils;
 use utils::FinalStream;
 mod admin_server;
 mod errors;
+mod plan_codec;
 pub use admin_server::{models::*, run_admin_server};
 pub use errors::{
     LiquidCacheErrorExt, LiquidCacheResult, anyhow_to_status, df_error_to_status_with_trace,
@@ -59,8 +59,7 @@ pub use errors::{
 pub use liquid_cache as storage;
 use liquid_cache::{
     cache::{
-        AlwaysHydrate, HydrationPolicy,
-        squeeze_policies::{SqueezePolicy, TranscodeSqueezeEvict},
+        AlwaysHydrate, HydrationPolicy, {EvictionPolicy, TranscodeEvict},
     },
     cache_policies::{CachePolicy, LiquidPolicy},
 };
@@ -79,7 +78,7 @@ mod tests;
 /// use arrow_flight::flight_service_server::FlightServiceServer;
 /// use datafusion::prelude::SessionContext;
 /// use liquid_cache_datafusion_server::LiquidCacheService;
-/// use liquid_cache_datafusion_server::storage::cache::squeeze_policies::TranscodeSqueezeEvict;
+/// use liquid_cache_datafusion_server::storage::cache::TranscodeEvict;
 /// use liquid_cache_datafusion_server::storage::cache::AlwaysHydrate;
 /// use liquid_cache_datafusion_server::storage::cache_policies::LiquidPolicy;
 /// use tonic::transport::Server;
@@ -90,7 +89,7 @@ mod tests;
 ///         None,
 ///         None,
 ///         Box::new(LiquidPolicy::new()),
-///         Box::new(TranscodeSqueezeEvict),
+///         Box::new(TranscodeEvict),
 ///         Box::new(AlwaysHydrate::new()),
 ///     )
 ///     .await
@@ -115,7 +114,7 @@ impl LiquidCacheService {
             None,
             None,
             Box::new(LiquidPolicy::new()),
-            Box::new(TranscodeSqueezeEvict),
+            Box::new(TranscodeEvict),
             Box::new(AlwaysHydrate::new()),
         )
         .await
@@ -133,7 +132,7 @@ impl LiquidCacheService {
         max_memory_bytes: Option<usize>,
         disk_cache_dir: Option<PathBuf>,
         cache_policy: Box<dyn CachePolicy>,
-        squeeze_policy: Box<dyn SqueezePolicy>,
+        eviction_policy: Box<dyn EvictionPolicy>,
         hydration_policy: Box<dyn HydrationPolicy>,
     ) -> anyhow::Result<Self> {
         let disk_cache_dir = match disk_cache_dir {
@@ -150,7 +149,7 @@ impl LiquidCacheService {
                 max_memory_bytes,
                 disk_cache_dir,
                 cache_policy,
-                squeeze_policy,
+                eviction_policy,
                 hydration_policy,
             )
             .await,
@@ -168,6 +167,8 @@ impl LiquidCacheService {
         let mut session_config = SessionConfig::from_env()?;
         let options_mut = session_config.options_mut();
         options_mut.execution.parquet.pushdown_filters = true;
+        options_mut.execution.parquet.skip_arrow_metadata = false;
+        options_mut.execution.parquet.skip_metadata = false;
         options_mut.execution.batch_size = ConfigNonZeroUsize::try_new(8192 * 2)?;
 
         {
@@ -187,6 +188,7 @@ impl LiquidCacheService {
             .build();
 
         let ctx = SessionContext::new_with_state(state);
+        liquid_cache_datafusion::register_variant_functions(&ctx);
         Ok(ctx)
     }
 
@@ -251,15 +253,15 @@ impl LiquidCacheService {
                 Ok(Response::new(Box::pin(output)))
             }
             LiquidCacheActions::RegisterPlan(cmd) => {
-                let plan = physical_plan_from_bytes(&cmd.plan, &self.inner.get_ctx().task_ctx())?;
+                let plan = plan_codec::decode_plan(&cmd.plan, &self.inner.get_ctx().task_ctx())?;
                 let handle = Uuid::from_bytes_ref(cmd.handle.as_ref().try_into()?);
-                let mut squeeze_hints = ColumnSqueezeHints::default();
-                for hint in &cmd.squeeze_hints {
+                let mut lineages = ColumnLineages::default();
+                for hint in &cmd.lineages {
                     if let Some(expr) = CacheExpression::from_metadata_value(&hint.hint) {
-                        squeeze_hints.insert(hint.column.clone(), Arc::new(expr));
+                        lineages.insert(hint.column.clone(), Arc::new(expr));
                     }
                 }
-                self.inner.register_plan(*handle, plan, squeeze_hints);
+                self.inner.register_plan(*handle, plan, lineages);
                 let output = futures::stream::iter(vec![Ok(arrow_flight::Result {
                     body: Bytes::default(),
                 })]);

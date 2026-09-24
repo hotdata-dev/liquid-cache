@@ -1,7 +1,7 @@
 use arrow::buffer::BooleanBuffer;
 use divan::Bencher;
 use liquid_cache::cache::AlwaysHydrate;
-use liquid_cache::cache::squeeze_policies::TranscodeSqueezeEvict;
+use liquid_cache::cache::TranscodeEvict;
 use liquid_cache::cache_policies::LiquidPolicy;
 use liquid_cache_datafusion::cache::CachedColumn;
 use liquid_cache_datafusion::{FilterCandidateBuilder, LiquidPredicate};
@@ -15,7 +15,7 @@ use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::expressions::{BinaryExpr, Literal};
 use datafusion::physical_plan::expressions::Column;
 use datafusion::physical_plan::metrics;
-use liquid_cache_datafusion::cache::{BatchID, LiquidCacheParquet};
+use liquid_cache_datafusion::cache::{BatchID, LiquidCacheParquet, ParquetFileIdentity};
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use rand::RngExt as _;
@@ -40,20 +40,25 @@ fn create_boolean_filter(array_size: usize, selectivity: f64) -> BooleanBuffer {
 fn setup_cache() -> (Arc<CachedColumn>, tempfile::TempDir) {
     let tmp_dir = tempfile::tempdir().unwrap();
     let store_path = tmp_dir.path().join("liquid_cache.t4");
-    let store = tokio_test::block_on(liquid_cache::store::mount(&store_path))
-        .expect("failed to mount t4 store");
+    let store = tokio_test::block_on(t4::mount(&store_path)).expect("failed to mount t4 store");
     let cache = tokio_test::block_on(LiquidCacheParquet::new(
         BATCH_SIZE,
         1024 * 1024 * 1024, // max_memory_bytes (1GB)
         usize::MAX,
         store,
         Box::new(LiquidPolicy::new()),
-        Box::new(TranscodeSqueezeEvict),
+        Box::new(TranscodeEvict),
         Box::new(AlwaysHydrate::new()),
     ));
     let field = Arc::new(Field::new("test_column", DataType::Int32, false));
     let schema = Arc::new(Schema::new(vec![field.clone()]));
-    let file = cache.register_or_get_file("test_file.parquet".to_string(), schema);
+    let file = cache.register_or_get_file(
+        ParquetFileIdentity::new(
+            datafusion::execution::object_store::ObjectStoreUrl::local_filesystem(),
+            "test_file.parquet".to_string(),
+        ),
+        schema,
+    );
     let row_group = file.create_row_group(0, vec![]);
     (row_group.get_column(0).unwrap(), tmp_dir)
 }

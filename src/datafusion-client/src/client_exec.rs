@@ -23,7 +23,10 @@ use datafusion::physical_plan::filter_pushdown::{
     ChildPushdownResult, FilterDescription, FilterPushdownPhase, FilterPushdownPropagation,
 };
 use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
-use datafusion::physical_plan::{ExecutionPlanProperties, PhysicalExpr, PlanProperties};
+use datafusion::physical_plan::{
+    ChildrenPropertiesMode, ExecutionPlanProperties, PhysicalExpr, PlanProperties,
+    ReplaceChildrenOptions,
+};
 use datafusion::{
     error::Result,
     execution::{RecordBatchStream, SendableRecordBatchStream},
@@ -37,10 +40,10 @@ use fastrace::future::FutureExt;
 use fastrace::prelude::*;
 use futures::{Stream, TryStreamExt, future::BoxFuture, ready};
 use liquid_cache_common::rpc::{
-    ColumnSqueezeHint, FetchResults, LiquidCacheActions, RegisterObjectStoreRequest,
+    ColumnLineage, FetchResults, LiquidCacheActions, RegisterObjectStoreRequest,
     RegisterPlanRequest,
 };
-use liquid_cache_datafusion::cache::ColumnSqueezeHints;
+use liquid_cache_datafusion::cache::ColumnLineages;
 use tonic::Request;
 use uuid::Uuid;
 
@@ -63,9 +66,9 @@ pub struct LiquidCacheClientExec {
     uuid: Uuid,
     plan_registered: Arc<AtomicUsize>,
     properties: Arc<PlanProperties>,
-    /// Typed squeeze hints for the scan in `remote_plan`, derived by the client
+    /// Typed lineage expressions for the scan in `remote_plan`, derived by the client
     /// from the full physical plan and shipped to the cache server.
-    squeeze_hints: ColumnSqueezeHints,
+    lineages: ColumnLineages,
 }
 
 impl std::fmt::Debug for LiquidCacheClientExec {
@@ -75,18 +78,22 @@ impl std::fmt::Debug for LiquidCacheClientExec {
 }
 
 impl LiquidCacheClientExec {
+    fn plan_properties(remote_plan: &Arc<dyn ExecutionPlan>) -> Arc<PlanProperties> {
+        Arc::new(PlanProperties::new(
+            remote_plan.equivalence_properties().clone(),
+            remote_plan.output_partitioning().clone(),
+            remote_plan.pipeline_behavior(),
+            remote_plan.boundedness(),
+        ))
+    }
+
     pub(crate) fn new(
         remote_plan: Arc<dyn ExecutionPlan>,
         cache_server: String,
         object_stores: Vec<(ObjectStoreUrl, HashMap<String, String>)>,
-        squeeze_hints: ColumnSqueezeHints,
+        lineages: ColumnLineages,
     ) -> Self {
-        let properties = Arc::new(PlanProperties::new(
-            remote_plan.equivalence_properties().clone(), // Equivalence Properties
-            remote_plan.output_partitioning().clone(),    // Output Partitioning
-            remote_plan.pipeline_behavior(),
-            remote_plan.boundedness(),
-        ));
+        let properties = Self::plan_properties(&remote_plan);
         let uuid = Uuid::new_v4();
         Self {
             remote_plan,
@@ -96,7 +103,7 @@ impl LiquidCacheClientExec {
             uuid,
             metrics: ExecutionPlanMetricsSet::new(),
             properties,
-            squeeze_hints,
+            lineages,
         }
     }
 
@@ -140,29 +147,49 @@ impl ExecutionPlan for LiquidCacheClientExec {
         vec![&self.remote_plan]
     }
 
-    /// The client node holds no expressions of its own; the wrapped remote plan
-    /// is visited as a child.
-    fn apply_expressions(
-        &self,
-        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
-    ) -> Result<TreeNodeRecursion> {
-        Ok(TreeNodeRecursion::Continue)
+    fn replace_children(
+        self: Arc<Self>,
+        mut children: Vec<Arc<dyn ExecutionPlan>>,
+        options: ReplaceChildrenOptions,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        if children.len() != 1 {
+            return internal_err!(
+                "LiquidCacheClientExec expects one child, received {}",
+                children.len()
+            );
+        }
+        let remote_plan = children.swap_remove(0);
+        let properties = match options.children_properties {
+            ChildrenPropertiesMode::Keep => Arc::clone(&self.properties),
+            ChildrenPropertiesMode::Recompute => Self::plan_properties(&remote_plan),
+        };
+        Ok(Arc::new(Self {
+            remote_plan,
+            cache_server: self.cache_server.clone(),
+            plan_registered: self.plan_registered.clone(),
+            object_stores: self.object_stores.clone(),
+            metrics: self.metrics.clone(),
+            uuid: self.uuid,
+            properties,
+            lineages: self.lineages.clone(),
+        }))
     }
 
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(Self {
-            remote_plan: children.first().unwrap().clone(),
-            cache_server: self.cache_server.clone(),
-            plan_registered: self.plan_registered.clone(),
-            object_stores: self.object_stores.clone(),
-            metrics: self.metrics.clone(),
-            uuid: self.uuid,
-            properties: self.properties.clone(),
-            squeeze_hints: self.squeeze_hints.clone(),
-        }))
+        self.replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn execute(
@@ -188,7 +215,7 @@ impl ExecutionPlan for LiquidCacheClientExec {
             self.uuid,
             partition,
             self.object_stores.clone(),
-            squeeze_hints_to_wire(&self.squeeze_hints),
+            lineages_to_wire(&self.lineages),
         );
         Ok(Box::pin(FlightStream::new(
             Some(Box::pin(stream)),
@@ -245,11 +272,11 @@ impl ExecutionPlan for LiquidCacheClientExec {
     }
 }
 
-/// Convert typed squeeze hints into their wire form (canonical string encoding).
-fn squeeze_hints_to_wire(hints: &ColumnSqueezeHints) -> Vec<ColumnSqueezeHint> {
+/// Convert typed lineage expressions into their wire form (canonical string encoding).
+fn lineages_to_wire(hints: &ColumnLineages) -> Vec<ColumnLineage> {
     hints
         .iter()
-        .map(|(column, expr)| ColumnSqueezeHint {
+        .map(|(column, expr)| ColumnLineage {
             column: column.clone(),
             hint: expr.to_metadata_value(),
         })
@@ -263,7 +290,7 @@ async fn flight_stream(
     handle: Uuid,
     partition: usize,
     object_stores: Vec<(ObjectStoreUrl, HashMap<String, String>)>,
-    squeeze_hints: Vec<ColumnSqueezeHint>,
+    lineages: Vec<ColumnLineage>,
 ) -> Result<SendableRecordBatchStream> {
     // Materialized scalar-subquery results are embedded in scan predicates as
     // `ScalarSubqueryExpr`, which cannot be serialized on its own and is
@@ -303,7 +330,7 @@ async fn flight_stream(
             let action = LiquidCacheActions::RegisterPlan(RegisterPlanRequest {
                 plan: plan_bytes.to_vec(),
                 handle: handle.into_bytes().to_vec().into(),
-                squeeze_hints: squeeze_hints.clone(),
+                lineages: lineages.clone(),
             })
             .into();
             client

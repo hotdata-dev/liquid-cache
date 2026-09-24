@@ -15,81 +15,17 @@ use super::{
     policies::{CachePolicy, HydrationPolicy, HydrationRequest, MaterializedEntry},
     utils::CacheConfig,
 };
-use crate::cache::DefaultSqueezeIo;
-use crate::cache::policies::{SqueezeOutcome, SqueezePolicy};
-use crate::cache::utils::{LiquidCompressorStates, arrow_to_bytes};
+use crate::cache::policies::{EvictionOutcome, EvictionPolicy};
+use crate::cache::utils::arrow_to_bytes;
 use crate::cache::{
     CacheExpression, LiquidExpr,
     index::{ArtIndex, WriteIdentity},
     utils::EntryID,
 };
 use crate::cache::{CacheFull, CacheStats, EventTrace};
-use crate::liquid_array::{
-    LiquidSqueezedArrayRef, SqueezeIoHandler, SqueezedBacking, SqueezedDate32Array,
-    VariantStructSqueezedArray,
-};
-use crate::sync::{Arc, Mutex};
-use std::collections::HashMap;
+use crate::sync::Arc;
 
 // CacheStats and RuntimeStats moved to stats.rs
-
-/// What the disk tier holds for an entry that is currently (also) in memory.
-///
-/// Hydrating a disk entry replaces its index entry with a memory one, but the
-/// bytes stay in the store under the same key and stay counted against the
-/// disk budget. Without this record, evicting the hydrated entry serialised
-/// and wrote the same bytes again — one redundant write per read of an
-/// oversized working set, and a second disk reservation for one object, so
-/// the disk tally drifted up until the tier evicted real entries early
-/// (liquid-cache#43).
-#[derive(Debug, Clone, Copy)]
-struct DiskCopy {
-    /// Whose bytes these are. A key can change hands while a write to it is
-    /// in flight, and a declined rewrite leaves the object behind; without
-    /// this the next owner adopts it on kind and length alone and reads the
-    /// previous owner's rows as its own.
-    identity: u64,
-    kind: DiskKind,
-    bytes: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DiskKind {
-    Liquid,
-    Arrow,
-}
-
-impl DiskCopy {
-    /// The store object an entry refers to: a disk stub's bytes, or the
-    /// full serialisation a squeezed entry reads back through.
-    fn referenced_by(identity: u64, entry: &CacheEntry) -> Option<Self> {
-        match entry {
-            CacheEntry::DiskLiquid { disk_bytes, .. } => Some(Self {
-                identity,
-                kind: DiskKind::Liquid,
-                bytes: *disk_bytes,
-            }),
-            CacheEntry::DiskArrow { disk_bytes, .. } => Some(Self {
-                identity,
-                kind: DiskKind::Arrow,
-                bytes: *disk_bytes,
-            }),
-            CacheEntry::MemorySqueezedLiquid(squeezed) => Some(match squeezed.disk_backing() {
-                SqueezedBacking::Liquid(bytes) => Self {
-                    identity,
-                    kind: DiskKind::Liquid,
-                    bytes,
-                },
-                SqueezedBacking::Arrow(bytes) => Self {
-                    identity,
-                    kind: DiskKind::Arrow,
-                    bytes,
-                },
-            }),
-            CacheEntry::MemoryArrow(_) | CacheEntry::MemoryLiquid(_) => None,
-        }
-    }
-}
 
 /// Cache storage for liquid cache.
 ///
@@ -104,6 +40,9 @@ impl DiskCopy {
 ///
 /// let entry_id = EntryID::from(0);
 /// let arrow_array = Arc::new(UInt64Array::from_iter_values(0..32));
+/// // `0` is the file identity: cache keys pack their fields into fixed
+/// // widths, so two sources can compute one key, and the identity is what
+/// // keeps a read from being served the other's data.
 /// storage.insert(entry_id, 0, arrow_array.clone()).await;
 ///
 /// // Get the arrow array back asynchronously
@@ -118,30 +57,106 @@ pub struct LiquidCache {
     budget: BudgetAccounting,
     cache_policy: Box<dyn CachePolicy>,
     hydration_policy: Box<dyn HydrationPolicy>,
-    squeeze_policy: Box<dyn SqueezePolicy>,
+    eviction_policy: Box<dyn EvictionPolicy>,
     observer: Arc<Observer>,
     metadata: Arc<dyn EntryMetadata>,
     store: t4::Store,
-    squeeze_victims_concurrently: bool,
-    disk_copies: Mutex<HashMap<EntryID, DiskCopy>>,
+    evict_victims_concurrently: bool,
 }
 
-/// Builder returned by [`LiquidCache::insert`] for configuring cache writes.
+/// Outcome of [`LiquidCache::prefetch`].
+pub enum PrefetchResult {
+    /// A memory-form snapshot of the entry (Arrow or Liquid), ready to hand to a reader.
+    Snapshot(Arc<CacheEntry>),
+    /// The entry is not in the index, or its disk blob is gone.
+    Absent,
+}
+
+/// Disk an insert left for its caller to reclaim.
+///
+/// A store object is addressed by entry id *and* the identity that wrote it, so
+/// an object stops being reachable through the index the moment the key changes
+/// hands or the write that produced it is dropped. Nothing else will ever delete
+/// it or release its bytes: `release_disk` is driven by an index entry, and by
+/// then no index entry names it.
+#[derive(Default)]
+struct DiskResidue {
+    /// `(identity, disk_bytes)` of a disk-resident entry this write displaced,
+    /// whose object is now unreachable and has to be deleted.
+    displaced: Option<(u64, usize)>,
+    /// Bytes of a displaced disk entry whose object this write *overwrote in
+    /// place*. The object is current and must be kept; only the superseded
+    /// entry's reservation is given back, or one object is charged twice.
+    superseded: Option<usize>,
+    /// The write itself did not land, so whatever the caller already wrote to
+    /// the store under its own identity is unreachable too.
+    dropped: bool,
+}
+
+impl DiskResidue {
+    fn dropped() -> Self {
+        Self {
+            displaced: None,
+            superseded: None,
+            dropped: true,
+        }
+    }
+
+    /// A displaced disk entry's object survives this insert unless the insert
+    /// put its own bytes over it.
+    ///
+    /// The store key is `(entry id, identity)`, so only a disk-resident entry
+    /// written under the identity that already held the key addresses the very
+    /// same object: there the put overwrote it, and reclaiming would delete the
+    /// bytes just written. Otherwise the object is left behind — a different
+    /// identity addresses a different key, and an entry that lives in memory
+    /// wrote nothing at all — and it becomes unreachable the moment the index
+    /// stops naming it.
+    fn displacing(
+        displaced: Option<&(u64, Arc<CacheEntry>)>,
+        writer: u64,
+        written: CachedBatchType,
+    ) -> Self {
+        let overwrites_in_place = matches!(
+            written,
+            CachedBatchType::DiskLiquid | CachedBatchType::DiskArrow
+        );
+        let disk_bytes = displaced.and_then(|(identity, entry)| match entry.as_ref() {
+            CacheEntry::DiskLiquid { disk_bytes, .. }
+            | CacheEntry::DiskArrow { disk_bytes, .. } => Some((*identity, *disk_bytes)),
+            CacheEntry::MemoryArrow(_) | CacheEntry::MemoryLiquid(_) => None,
+        });
+        // Same identity and a disk-resident write means this put landed on the
+        // very object the displaced entry named: keep the object, give back only
+        // its reservation. Anything else leaves an object nothing can reach.
+        match disk_bytes {
+            Some((identity, bytes)) if overwrites_in_place && identity == writer => Self {
+                displaced: None,
+                superseded: Some(bytes),
+                dropped: false,
+            },
+            other => Self {
+                displaced: other,
+                superseded: None,
+                dropped: false,
+            },
+        }
+    }
+}
+
 impl LiquidCache {
     /// Return current cache statistics: counts and resource usage.
     pub fn stats(&self) -> CacheStats {
-        // Count entries by residency/format
+        // Count entries by storage tier and format
         let total_entries = self.index.entry_count();
 
         let mut memory_arrow_entries = 0usize;
         let mut memory_liquid_entries = 0usize;
-        let mut memory_squeezed_liquid_entries = 0usize;
         let mut disk_liquid_entries = 0usize;
         let mut disk_arrow_entries = 0usize;
 
         let mut memory_arrow_bytes = 0usize;
         let mut memory_liquid_bytes = 0usize;
-        let mut memory_squeezed_liquid_bytes = 0usize;
 
         self.index.for_each(|_, _, batch| match batch {
             CacheEntry::MemoryArrow(array) => {
@@ -151,10 +166,6 @@ impl LiquidCache {
             CacheEntry::MemoryLiquid(array) => {
                 memory_liquid_entries += 1;
                 memory_liquid_bytes += array.get_array_memory_size();
-            }
-            CacheEntry::MemorySqueezedLiquid(array) => {
-                memory_squeezed_liquid_entries += 1;
-                memory_squeezed_liquid_bytes += array.get_array_memory_size();
             }
             CacheEntry::DiskLiquid { .. } => disk_liquid_entries += 1,
             CacheEntry::DiskArrow { .. } => disk_arrow_entries += 1,
@@ -166,15 +177,13 @@ impl LiquidCache {
 
         CacheStats {
             total_entries,
+            identity_mismatches: self.index.identity_mismatches(),
             memory_arrow_entries,
             memory_liquid_entries,
-            memory_squeezed_liquid_entries,
             disk_liquid_entries,
             disk_arrow_entries,
             memory_arrow_bytes,
             memory_liquid_bytes,
-            memory_squeezed_liquid_bytes,
-            identity_mismatches: self.index.identity_mismatches(),
             memory_usage_bytes,
             disk_usage_bytes,
             max_memory_bytes: self.config.max_memory_bytes(),
@@ -208,6 +217,48 @@ impl LiquidCache {
         EvaluatePredicate::new(self, entry_id, identity, predicate)
     }
 
+    /// Prefetch an entry into a memory-form snapshot without recording an access.
+    pub async fn prefetch(&self, entry_id: &EntryID, identity: u64) -> PrefetchResult {
+        // Checked, not raw: a prefetch hands a snapshot to a caller, so an
+        // aliased key must read as absent rather than as someone else's rows.
+        let Some(entry) = self.index.get_checked(entry_id, identity) else {
+            return PrefetchResult::Absent;
+        };
+        match entry.as_ref() {
+            CacheEntry::MemoryArrow(_) | CacheEntry::MemoryLiquid(_) => {
+                PrefetchResult::Snapshot(entry)
+            }
+            disk @ CacheEntry::DiskArrow { .. } => {
+                let Some(array) = self.read_disk_arrow_array(entry_id, identity).await else {
+                    return PrefetchResult::Absent;
+                };
+                self.maybe_hydrate(
+                    entry_id,
+                    identity,
+                    disk,
+                    MaterializedEntry::Arrow(&array),
+                    None,
+                )
+                .await;
+                PrefetchResult::Snapshot(Arc::new(CacheEntry::memory_arrow(array)))
+            }
+            disk @ CacheEntry::DiskLiquid { .. } => {
+                let Some(array) = self.read_disk_liquid_array(entry_id, identity).await else {
+                    return PrefetchResult::Absent;
+                };
+                self.maybe_hydrate(
+                    entry_id,
+                    identity,
+                    disk,
+                    MaterializedEntry::Liquid(&array),
+                    None,
+                )
+                .await;
+                PrefetchResult::Snapshot(Arc::new(CacheEntry::memory_liquid(array)))
+            }
+        }
+    }
+
     /// Try to read a liquid array from the cache.
     /// Returns None if the cached data is not in liquid format.
     pub async fn try_read_liquid(
@@ -224,7 +275,7 @@ impl LiquidCache {
         match batch.as_ref() {
             CacheEntry::MemoryLiquid(array) => Some(array.clone()),
             entry @ CacheEntry::DiskLiquid { .. } => {
-                let liquid = self.read_disk_liquid_array(entry_id, identity).await;
+                let liquid = self.read_disk_liquid_array(entry_id, identity).await?;
                 self.maybe_hydrate(
                     entry_id,
                     identity,
@@ -235,13 +286,6 @@ impl LiquidCache {
                 .await;
                 Some(liquid)
             }
-            CacheEntry::MemorySqueezedLiquid(array) => match array.disk_backing() {
-                SqueezedBacking::Liquid(_) => {
-                    let liquid = self.read_disk_liquid_array(entry_id, identity).await;
-                    Some(liquid)
-                }
-                SqueezedBacking::Arrow(_) => None,
-            },
             CacheEntry::DiskArrow { .. } | CacheEntry::MemoryArrow(_) => None,
         }
     }
@@ -254,28 +298,16 @@ impl LiquidCache {
     }
 
     /// Reset the cache.
-    ///
-    /// Deletes the store objects before forgetting the records that name them.
-    /// The store key carries the identity that wrote it, so everything after a
-    /// reset writes under new keys and nothing would ever overwrite these
-    /// again — dropping the records first would strand up to `max_disk_bytes`
-    /// per reset, unreachable and uncounted.
-    pub async fn reset(&self) {
-        let recorded: Vec<(EntryID, DiskCopy)> = {
-            let mut copies = self.disk_copies.lock().unwrap();
-            copies.drain().collect()
-        };
-        for (entry_id, copy) in recorded {
-            self.store
-                .remove(&entry_id_to_key(&entry_id, copy.identity))
-                .await
-                .expect("disk remove failed");
-        }
+    pub fn reset(&self) {
         self.index.reset();
         self.budget.reset_usage();
     }
 
-    /// Check if a batch is cached.
+    /// Check whether the cache holds this entry *for this identity*.
+    ///
+    /// A key held by another identity reads as absent: it belongs to a source
+    /// that can no longer read it, and serving it here would hand one caller
+    /// another's rows.
     pub fn is_cached(&self, entry_id: &EntryID, identity: u64) -> bool {
         self.index.is_cached(entry_id, identity)
     }
@@ -300,14 +332,9 @@ impl LiquidCache {
         &self.observer
     }
 
-    /// Get the compressor states of the cache.
-    pub fn compressor_states(&self, entry_id: &EntryID) -> Arc<LiquidCompressorStates> {
-        self.metadata.get_compressor(entry_id)
-    }
-
-    /// Add a squeeze hint for an entry.
-    pub fn add_squeeze_hint(&self, entry_id: &EntryID, expression: Arc<CacheExpression>) {
-        self.metadata.add_squeeze_hint(entry_id, expression);
+    /// Add a lineage expression for an entry.
+    pub fn add_lineage(&self, entry_id: &EntryID, expression: Arc<CacheExpression>) {
+        self.metadata.add_lineage(entry_id, expression);
     }
 
     /// Flush all entries to disk.
@@ -322,71 +349,51 @@ impl LiquidCache {
                     let bytes = arrow_to_bytes(array).expect("failed to convert arrow to bytes");
                     let disk_bytes = bytes.len();
                     match self
-                        .write_batch_to_disk(
-                            entry_id,
-                            WriteIdentity::Rewrite(flush_identity),
-                            &batch,
-                            bytes,
-                        )
+                        .write_batch_to_disk(entry_id, flush_identity, &batch, bytes)
                         .await
                     {
                         Ok(()) => {
-                            self.try_insert(
-                                entry_id,
-                                WriteIdentity::Rewrite(flush_identity),
-                                CacheEntry::disk_arrow(array.data_type().clone(), disk_bytes),
-                            )
-                            .expect("failed to insert disk arrow entry");
+                            let residue = self
+                                .try_insert(
+                                    entry_id,
+                                    WriteIdentity::Rewrite(flush_identity),
+                                    CacheEntry::disk_arrow(array.data_type().clone(), disk_bytes),
+                                )
+                                .expect("failed to insert disk arrow entry");
+                            self.settle(entry_id, residue, Some((flush_identity, disk_bytes)))
+                                .await;
                         }
-                        Err(CacheFull) => self.drop_memory_entry(entry_id, &batch).await,
+                        Err(CacheFull) => self.drop_memory_entry(entry_id, &batch),
                     }
                 }
                 CacheEntry::MemoryLiquid(liquid_array) => {
-                    let data_type = liquid_array.original_arrow_data_type();
-                    if let Some(DiskCopy {
-                        kind: DiskKind::Liquid,
-                        bytes,
-                        ..
-                    }) = self.disk_copy(&entry_id, flush_identity)
-                    {
-                        // Hydrated from disk and never modified since: the
-                        // bytes are already there, flip the index rather
-                        // than re-serialising and rewriting them.
-                        self.try_insert(
-                            entry_id,
-                            WriteIdentity::Rewrite(flush_identity),
-                            CacheEntry::disk_liquid(data_type, bytes),
-                        )
-                        .expect("failed to insert disk liquid entry");
-                        continue;
-                    }
                     let liquid_bytes = liquid_array.to_bytes();
                     let disk_bytes = liquid_bytes.len();
                     match self
                         .write_batch_to_disk(
                             entry_id,
-                            WriteIdentity::Rewrite(flush_identity),
+                            flush_identity,
                             &batch,
                             Bytes::from(liquid_bytes),
                         )
                         .await
                     {
                         Ok(()) => {
-                            self.try_insert(
-                                entry_id,
-                                WriteIdentity::Rewrite(flush_identity),
-                                CacheEntry::disk_liquid(data_type, disk_bytes),
-                            )
-                            .expect("failed to insert disk liquid entry");
+                            let residue = self
+                                .try_insert(
+                                    entry_id,
+                                    WriteIdentity::Rewrite(flush_identity),
+                                    CacheEntry::disk_liquid(
+                                        liquid_array.original_arrow_data_type(),
+                                        disk_bytes,
+                                    ),
+                                )
+                                .expect("failed to insert disk liquid entry");
+                            self.settle(entry_id, residue, Some((flush_identity, disk_bytes)))
+                                .await;
                         }
-                        Err(CacheFull) => self.drop_memory_entry(entry_id, &batch).await,
+                        Err(CacheFull) => self.drop_memory_entry(entry_id, &batch),
                     }
-                }
-                CacheEntry::MemorySqueezedLiquid(array) => {
-                    // We don't have to do anything, because it's already on disk
-                    let disk_entry = Self::disk_entry_from_squeezed(array);
-                    self.try_insert(entry_id, WriteIdentity::Rewrite(flush_identity), disk_entry)
-                        .expect("failed to insert disk entry");
                 }
                 CacheEntry::DiskArrow { .. } | CacheEntry::DiskLiquid { .. } => {
                     // Already on disk, skip
@@ -402,29 +409,20 @@ impl LiquidCache {
     async fn write_in_memory_batch_to_disk(
         &self,
         entry_id: EntryID,
-        identity: WriteIdentity,
+        identity: u64,
         batch: CacheEntry,
     ) -> Result<CacheEntry, CacheFull> {
         match &batch {
             batch @ CacheEntry::MemoryArrow(_) => {
-                let squeeze_io: Arc<dyn SqueezeIoHandler> = Arc::new(DefaultSqueezeIo::new(
-                    self.store.clone(),
-                    entry_id,
-                    identity.value(),
-                    self.observer.clone(),
-                ));
-                let outcome = self.squeeze_policy.squeeze(
-                    batch,
-                    self.metadata.get_compressor(&entry_id).as_ref(),
-                    None,
-                    &squeeze_io,
-                );
-                let SqueezeOutcome::Replace {
+                let outcome = self
+                    .eviction_policy
+                    .evict(batch, self.metadata.lineage(&entry_id).as_deref());
+                let EvictionOutcome::Replace {
                     entry: new_batch,
                     bytes_to_write,
                 } = outcome
                 else {
-                    unreachable!("memory arrow squeeze cannot remove entry");
+                    unreachable!("memory Arrow eviction cannot remove entry");
                 };
                 if let Some(bytes_to_write) = bytes_to_write {
                     self.write_batch_to_disk(entry_id, identity, &new_batch, bytes_to_write)
@@ -433,29 +431,14 @@ impl LiquidCache {
                 Ok(new_batch)
             }
             CacheEntry::MemoryLiquid(liquid_array) => {
-                let data_type = liquid_array.original_arrow_data_type();
-                if let Some(DiskCopy {
-                    kind: DiskKind::Liquid,
-                    bytes,
-                    ..
-                }) = self.disk_copy(&entry_id, identity.value())
-                {
-                    return Ok(CacheEntry::disk_liquid(data_type, bytes));
-                }
                 let liquid_bytes = Bytes::from(liquid_array.to_bytes());
                 let disk_bytes = liquid_bytes.len();
                 self.write_batch_to_disk(entry_id, identity, &batch, liquid_bytes)
                     .await?;
-                Ok(CacheEntry::disk_liquid(data_type, disk_bytes))
-            }
-            CacheEntry::MemorySqueezedLiquid(squeezed_array) => {
-                // The full data is already on disk, so we just need to mark ourself as disk entry
-                let data_type = squeezed_array.original_arrow_data_type();
-                let entry = match squeezed_array.disk_backing() {
-                    SqueezedBacking::Liquid(n) => CacheEntry::disk_liquid(data_type, n),
-                    SqueezedBacking::Arrow(n) => CacheEntry::disk_arrow(data_type, n),
-                };
-                Ok(entry)
+                Ok(CacheEntry::disk_liquid(
+                    liquid_array.original_arrow_data_type(),
+                    disk_bytes,
+                ))
             }
             CacheEntry::DiskLiquid { .. } | CacheEntry::DiskArrow { .. } => {
                 unreachable!("Unexpected batch in write_in_memory_batch_to_disk")
@@ -470,9 +453,16 @@ impl LiquidCache {
         identity: WriteIdentity,
         mut batch_to_cache: CacheEntry,
     ) -> Result<(), CacheFull> {
+        // Set once this loop spills the entry to disk itself: those bytes are the
+        // caller's own write, so a rewrite dropped as stale has to reclaim them.
+        let mut wrote = None;
         loop {
-            let Err(not_inserted) = self.try_insert(entry_id, identity, batch_to_cache) else {
-                return Ok(());
+            let not_inserted = match self.try_insert(entry_id, identity, batch_to_cache) {
+                Ok(residue) => {
+                    self.settle(entry_id, residue, wrote).await;
+                    return Ok(());
+                }
+                Err(not_inserted) => not_inserted,
             };
             self.trace(InternalEvent::InsertFailed {
                 entry: entry_id,
@@ -485,12 +475,17 @@ impl LiquidCache {
                 // this can happen if the entry to be inserted is too large, in that case,
                 // we write it to disk
                 let on_disk_batch = self
-                    .write_in_memory_batch_to_disk(entry_id, identity, not_inserted)
+                    .write_in_memory_batch_to_disk(entry_id, identity.value(), not_inserted)
                     .await?;
+                if let CacheEntry::DiskLiquid { disk_bytes, .. }
+                | CacheEntry::DiskArrow { disk_bytes, .. } = &on_disk_batch
+                {
+                    wrote = Some((identity.value(), *disk_bytes));
+                }
                 batch_to_cache = on_disk_batch;
                 continue;
             }
-            self.squeeze_victims(victims).await?;
+            self.evict_victims(victims).await?;
 
             batch_to_cache = not_inserted;
             crate::utils::yield_now_if_shuttle();
@@ -503,12 +498,12 @@ impl LiquidCache {
         batch_size: usize,
         max_memory_bytes: usize,
         max_disk_bytes: usize,
-        squeeze_policy: Box<dyn SqueezePolicy>,
+        eviction_policy: Box<dyn EvictionPolicy>,
         cache_policy: Box<dyn CachePolicy>,
         hydration_policy: Box<dyn HydrationPolicy>,
         metadata: Arc<dyn EntryMetadata>,
         store: t4::Store,
-        squeeze_victims_concurrently: bool,
+        evict_victims_concurrently: bool,
     ) -> Self {
         let config = CacheConfig::new(batch_size, max_memory_bytes, max_disk_bytes);
         let observer = Arc::new(Observer::new());
@@ -522,146 +517,22 @@ impl LiquidCache {
             config,
             cache_policy,
             hydration_policy,
-            squeeze_policy,
+            eviction_policy,
             observer,
             metadata,
             store,
-            squeeze_victims_concurrently,
-            disk_copies: Mutex::new(HashMap::new()),
+            evict_victims_concurrently,
         }
     }
 
-    /// The store object recorded for `entry_id`, but only if it belongs to
-    /// `identity`. A copy left by a previous owner reads as absent, so it is
-    /// never adopted by whoever holds the key now.
-    fn disk_copy(&self, entry_id: &EntryID, identity: u64) -> Option<DiskCopy> {
-        self.disk_copies
-            .lock()
-            .unwrap()
-            .get(entry_id)
-            .copied()
-            .filter(|copy| copy.identity == identity)
-    }
-
-    /// The record regardless of owner, for paths that act on whatever object
-    /// is there — superseding it, discarding it, releasing its reservation.
-    fn any_disk_copy(&self, entry_id: &EntryID) -> Option<DiskCopy> {
-        self.disk_copies.lock().unwrap().get(entry_id).copied()
-    }
-
-    /// A caller-supplied value supersedes whatever the store holds for the
-    /// entry. Hydration keeps the record, because the bytes on disk are still
-    /// the value in memory; an overwrite must not, or a later demotion would
-    /// flip the index to a stub over the previous value. Only [`Insert`] calls
-    /// this: `insert_inner` is shared with `maybe_hydrate`.
-    ///
-    /// A concurrent overwrite and squeeze of one entry is not serialised here
-    /// or anywhere else in the cache (a squeeze that read the old value can
-    /// still land its result after the new one), so this covers the
-    /// sequential case only.
-    pub(crate) async fn supersede_disk_copy(&self, entry_id: EntryID) {
-        if self.any_disk_copy(&entry_id).is_none() {
-            return;
-        }
-        match self.index.get(&entry_id).as_deref() {
-            Some(CacheEntry::DiskLiquid { .. } | CacheEntry::DiskArrow { .. }) => {
-                // Still a stub: the whole entry is the superseded object.
-                self.remove_disk_entry(entry_id).await;
-            }
-            Some(squeezed @ CacheEntry::MemorySqueezedLiquid(_)) => {
-                // A squeezed entry reads back through the object too, so it
-                // cannot stay in the index over a deleted one, not even for
-                // the span of an insert that then fails with `CacheFull`.
-                self.drop_memory_entry(entry_id, squeezed).await;
-            }
-            Some(CacheEntry::MemoryArrow(_) | CacheEntry::MemoryLiquid(_)) | None => {
-                self.discard_disk_copy(entry_id).await;
-            }
-        }
-    }
-
-    /// Delete the store object recorded for `entry_id`, if any, and release
-    /// its reservation. The index entry, if one remains, must not be a form
-    /// that reads through the object.
-    async fn discard_disk_copy(&self, entry_id: EntryID) {
-        let Some(copy) = self.disk_copies.lock().unwrap().remove(&entry_id) else {
-            return;
-        };
-        self.store
-            .remove(&entry_id_to_key(&entry_id, copy.identity))
-            .await
-            .expect("disk remove failed");
-        self.budget.release_disk(copy.bytes);
-    }
-
-    /// If `outcome` demotes an entry to a form backed by a store object whose
-    /// bytes are already there, drop the write and point the entry at the
-    /// existing copy.
-    fn reuse_disk_copy(
-        &self,
-        entry_id: &EntryID,
-        identity: u64,
-        outcome: SqueezeOutcome,
-    ) -> SqueezeOutcome {
-        let (entry, bytes) = match outcome {
-            SqueezeOutcome::Replace {
-                entry,
-                bytes_to_write: Some(bytes),
-            } => (entry, bytes),
-            other => return other,
-        };
-        let keep_write = move |entry| SqueezeOutcome::Replace {
-            entry,
-            bytes_to_write: Some(bytes),
-        };
-        let (Some(copy), Some(wanted)) = (
-            self.disk_copy(entry_id, identity),
-            DiskCopy::referenced_by(identity, &entry),
-        ) else {
-            return keep_write(entry);
-        };
-        if copy.kind != wanted.kind {
-            return keep_write(entry);
-        }
-        let entry = match entry {
-            // A squeezed entry reads back through the full serialisation the
-            // policy handed over to be written. A copy of the same kind and
-            // length is that serialisation (the array was hydrated from it),
-            // so the entry can keep its backing as chosen.
-            CacheEntry::MemorySqueezedLiquid(_) => {
-                if wanted.bytes != copy.bytes {
-                    return keep_write(entry);
-                }
-                entry
-            }
-            CacheEntry::DiskLiquid { data_type, .. } => {
-                CacheEntry::disk_liquid(data_type, copy.bytes)
-            }
-            CacheEntry::DiskArrow { data_type, .. } => {
-                CacheEntry::disk_arrow(data_type, copy.bytes)
-            }
-            CacheEntry::MemoryArrow(_) | CacheEntry::MemoryLiquid(_) => {
-                unreachable!("referenced_by only matches entries backed by a store object")
-            }
-        };
-        SqueezeOutcome::Replace {
-            entry,
-            bytes_to_write: None,
-        }
-    }
-
-    /// A declined write is not an error: the entry being rewritten has since
-    /// been taken over or removed. Neither is worth retrying, so the
-    /// reservation is handed back and the call reports success with nothing
-    /// stored. See [`WriteIdentity`].
     fn try_insert(
         &self,
         entry_id: EntryID,
         identity: WriteIdentity,
         to_insert: CacheEntry,
-    ) -> Result<(), CacheEntry> {
+    ) -> Result<DiskResidue, CacheEntry> {
         let new_memory_size = to_insert.memory_usage_bytes();
-        let cached_batch_type = if let Some(entry) = self.index.get(&entry_id) {
+        let (cached_batch_type, outcome) = if let Some(entry) = self.index.get(&entry_id) {
             let old_memory_size = entry.memory_usage_bytes();
             if self
                 .budget
@@ -671,29 +542,29 @@ impl LiquidCache {
                 return Err(to_insert);
             }
             let batch_type = CachedBatchType::from(&to_insert);
-            if !self.index.insert(&entry_id, identity, to_insert) {
-                // Restoring the reservation *grows* it again when the entry we
-                // were replacing was larger, so this can legitimately fail on
-                // a full cache. Nothing is stored either way; the budget is
-                // left under-counted rather than the process brought down.
-                let _ = self
-                    .budget
-                    .try_update_memory_usage(new_memory_size, old_memory_size);
-                return Ok(());
+            let outcome = self.index.insert(&entry_id, identity, to_insert);
+            if !outcome.stored {
+                // A rewrite whose key changed hands since it was read. Give the
+                // reservation back rather than counting memory for an entry that
+                // was never stored, and tell the caller its disk write is now
+                // unreachable.
+                self.budget
+                    .try_update_memory_usage(new_memory_size, old_memory_size)
+                    .ok();
+                return Ok(DiskResidue::dropped());
             }
-            batch_type
+            (batch_type, outcome)
         } else {
             if self.budget.try_reserve_memory(new_memory_size).is_err() {
                 return Err(to_insert);
             }
             let batch_type = CachedBatchType::from(&to_insert);
-            if !self.index.insert(&entry_id, identity, to_insert) {
-                self.budget
-                    .try_update_memory_usage(new_memory_size, 0)
-                    .expect("memory release cannot fail");
-                return Ok(());
+            let outcome = self.index.insert(&entry_id, identity, to_insert);
+            if !outcome.stored {
+                self.budget.try_update_memory_usage(new_memory_size, 0).ok();
+                return Ok(DiskResidue::dropped());
             }
-            batch_type
+            (batch_type, outcome)
         };
 
         self.trace(InternalEvent::InsertSuccess {
@@ -703,34 +574,82 @@ impl LiquidCache {
         self.cache_policy
             .notify_insert(&entry_id, cached_batch_type);
 
-        Ok(())
+        Ok(DiskResidue::displacing(
+            outcome.displaced.as_ref(),
+            identity.value(),
+            cached_batch_type,
+        ))
     }
 
-    /// Drop a memory entry from the cache altogether, including the disk copy
-    /// it may hold: with the index entry gone nothing could reach that object
-    /// again, and its reservation would shrink the disk tier for good.
-    async fn drop_memory_entry(&self, entry_id: EntryID, _expected: &CacheEntry) {
+    /// Delete a store object nothing can reach any more and give its bytes back.
+    ///
+    /// Reached on the paths where an object outlives the index entry that named
+    /// it: a write dropped as stale after its bytes were already written, an
+    /// entry displaced by a write under a different identity, and a disk entry
+    /// replaced by a memory one — hydration, or a caller overwriting the value
+    /// — which puts nothing in the store and so leaves the old object whole.
+    async fn reclaim_orphaned_disk(&self, entry_id: EntryID, identity: u64, disk_bytes: usize) {
+        match self
+            .store
+            .remove(&entry_id_to_key(&entry_id, identity))
+            .await
+        {
+            // `false` means the object was already gone, which is fine: the
+            // bytes still have to be given back either way.
+            Ok(_) | Err(t4::Error::NotFound) => {}
+            Err(error) => panic!("orphan remove failed: {error}"),
+        }
+        self.budget.release_disk(disk_bytes);
+        self.trace(InternalEvent::DiskEvict {
+            entry: entry_id,
+            bytes: disk_bytes,
+        });
+    }
+
+    /// Reclaim whatever an insert left unreachable, including the caller's own
+    /// write when it was dropped as stale.
+    ///
+    /// `wrote` is the (identity, bytes) the caller put in the store before the
+    /// insert, if any.
+    async fn settle(&self, entry_id: EntryID, residue: DiskResidue, wrote: Option<(u64, usize)>) {
+        if let Some((identity, bytes)) = residue.displaced {
+            self.reclaim_orphaned_disk(entry_id, identity, bytes).await;
+        }
+        if let Some(bytes) = residue.superseded {
+            // The object stays — this write overwrote it — so only the byte
+            // count the superseded entry held is returned.
+            self.budget.release_disk(bytes);
+        }
+        if residue.dropped
+            && let Some((identity, bytes)) = wrote
+        {
+            self.reclaim_orphaned_disk(entry_id, identity, bytes).await;
+        }
+    }
+
+    fn drop_memory_entry(&self, entry_id: EntryID, _expected: &CacheEntry) {
         let Some(removed) = self.index.remove(&entry_id) else {
             return;
         };
         assert!(
             matches!(
                 removed.as_ref(),
-                CacheEntry::MemoryArrow(_)
-                    | CacheEntry::MemoryLiquid(_)
-                    | CacheEntry::MemorySqueezedLiquid(_)
+                CacheEntry::MemoryArrow(_) | CacheEntry::MemoryLiquid(_)
             ),
             "flush should only drop memory entries"
         );
         self.budget
             .try_update_memory_usage(removed.memory_usage_bytes(), 0)
             .expect("memory release cannot fail");
-        self.discard_disk_copy(entry_id).await;
         self.cache_policy.notify_remove(&entry_id);
     }
 
-    async fn remove_disk_entry(&self, entry_id: EntryID) {
-        let Some(removed) = self.index.remove(&entry_id) else {
+    async fn remove_disk_entry(&self, entry_id: EntryID, removed_identity: u64) {
+        // Checked: the caller read this entry earlier, and between then and now
+        // the key can change hands. Removing the new owner's record would strand
+        // its store object while releasing a byte count taken from the record
+        // just destroyed.
+        let Some(removed) = self.index.remove_checked(&entry_id, removed_identity) else {
             return;
         };
         let disk_bytes = match removed.as_ref() {
@@ -738,15 +657,10 @@ impl LiquidCache {
             | CacheEntry::DiskArrow { disk_bytes, .. } => *disk_bytes,
             _ => panic!("remove_disk_entry called for non-disk entry"),
         };
-        // Take the record first: it names the owner whose object this is, and
-        // the key needs it.
-        let removed_copy = self.disk_copies.lock().unwrap().remove(&entry_id);
-        if let Some(copy) = removed_copy {
-            self.store
-                .remove(&entry_id_to_key(&entry_id, copy.identity))
-                .await
-                .expect("disk remove failed");
-        }
+        self.store
+            .remove(&entry_id_to_key(&entry_id, removed_identity))
+            .await
+            .expect("disk remove failed");
         self.budget.release_disk(disk_bytes);
         self.cache_policy.notify_remove(&entry_id);
         self.trace(InternalEvent::DiskEvict {
@@ -771,98 +685,71 @@ impl LiquidCache {
     }
 
     #[fastrace::trace]
-    async fn squeeze_victims(&self, victims: Vec<EntryID>) -> Result<(), CacheFull> {
-        self.trace(InternalEvent::SqueezeBegin {
+    async fn evict_victims(&self, victims: Vec<EntryID>) -> Result<(), CacheFull> {
+        self.trace(InternalEvent::EvictionBegin {
             victims: victims.clone(),
         });
-        if self.squeeze_victims_concurrently {
+        if self.evict_victims_concurrently {
             let results = futures::stream::iter(victims)
-                .map(|victim| self.squeeze_victim_inner(victim))
+                .map(|victim| self.evict_victim_inner(victim))
                 .buffer_unordered(usize::MAX)
                 .collect::<Vec<_>>()
                 .await;
             results.into_iter().collect::<Result<Vec<_>, _>>()?;
         } else {
             for victim in victims {
-                self.squeeze_victim_inner(victim).await?;
+                self.evict_victim_inner(victim).await?;
             }
         }
         Ok(())
     }
 
-    async fn squeeze_victim_inner(&self, to_squeeze: EntryID) -> Result<(), CacheFull> {
-        let Some((squeezed_identity, mut to_squeeze_batch)) =
-            self.index.get_with_identity(&to_squeeze)
-        else {
+    async fn evict_victim_inner(&self, victim: EntryID) -> Result<(), CacheFull> {
+        // Read the identity alongside the entry: everything this loop writes
+        // back is a rewrite of what it just read, and must be dropped rather
+        // than relabelled if the key changes hands meanwhile.
+        let Some((identity, mut victim_entry)) = self.index.get_with_identity(&victim) else {
             return Ok(());
         };
-        self.trace(InternalEvent::SqueezeVictim { entry: to_squeeze });
-        let compressor = self.metadata.get_compressor(&to_squeeze);
-        let squeeze_hint_arc = self.metadata.squeeze_hint(&to_squeeze);
-        let squeeze_hint = squeeze_hint_arc.as_deref();
-        let squeeze_io: Arc<dyn SqueezeIoHandler> = Arc::new(DefaultSqueezeIo::new(
-            self.store.clone(),
-            to_squeeze,
-            squeezed_identity,
-            self.observer.clone(),
-        ));
-
+        self.trace(InternalEvent::EvictionVictim { entry: victim });
         loop {
-            // The policy always decides the next form, so an entry hydrated
-            // from the disk tier can still reach the squeezed tier (floats
-            // squeeze even without a hint). `reuse_disk_copy` then drops the
-            // write when the form's backing is the copy already on disk; the
-            // serialisation the policy produced for it is the only cost.
-            let outcome = self.squeeze_policy.squeeze(
-                to_squeeze_batch.as_ref(),
-                compressor.as_ref(),
-                squeeze_hint,
-                &squeeze_io,
+            let outcome = self.eviction_policy.evict(
+                victim_entry.as_ref(),
+                self.metadata.lineage(&victim).as_deref(),
             );
-            let outcome = self.reuse_disk_copy(&to_squeeze, squeezed_identity, outcome);
 
             match outcome {
-                SqueezeOutcome::Replace {
+                EvictionOutcome::Replace {
                     entry: new_batch,
                     bytes_to_write,
                 } => {
+                    // Remember what went to the store: if the rewrite is then
+                    // dropped as stale, these bytes are unreachable and have to
+                    // be reclaimed here.
+                    let mut wrote = None;
                     if let Some(bytes_to_write) = bytes_to_write {
-                        self.write_batch_to_disk(
-                            to_squeeze,
-                            WriteIdentity::Rewrite(squeezed_identity),
-                            &new_batch,
-                            bytes_to_write,
-                        )
-                        .await?;
+                        let len = bytes_to_write.len();
+                        self.write_batch_to_disk(victim, identity, &new_batch, bytes_to_write)
+                            .await?;
+                        wrote = Some((identity, len));
                     }
-                    match self.try_insert(
-                        to_squeeze,
-                        WriteIdentity::Rewrite(squeezed_identity),
-                        new_batch,
-                    ) {
-                        Ok(()) => {
+                    match self.try_insert(victim, WriteIdentity::Rewrite(identity), new_batch) {
+                        Ok(residue) => {
+                            self.settle(victim, residue, wrote).await;
                             break;
                         }
                         Err(batch) => {
-                            to_squeeze_batch = Arc::new(batch);
+                            victim_entry = Arc::new(batch);
                         }
                     }
                 }
-                SqueezeOutcome::Remove => {
-                    self.remove_disk_entry(to_squeeze).await;
+                EvictionOutcome::Remove => {
+                    self.remove_disk_entry(victim, identity).await;
                     break;
                 }
             }
         }
         Ok(())
-    }
-
-    fn disk_entry_from_squeezed(array: &LiquidSqueezedArrayRef) -> CacheEntry {
-        let data_type = array.original_arrow_data_type();
-        match array.disk_backing() {
-            SqueezedBacking::Liquid(n) => CacheEntry::disk_liquid(data_type, n),
-            SqueezedBacking::Arrow(n) => CacheEntry::disk_arrow(data_type, n),
-        }
     }
 
     async fn maybe_hydrate(
@@ -873,13 +760,11 @@ impl LiquidCache {
         materialized: MaterializedEntry<'_>,
         expression: Option<&CacheExpression>,
     ) {
-        let compressor = self.metadata.get_compressor(entry_id);
         if let Some(new_entry) = self.hydration_policy.hydrate(&HydrationRequest {
             entry_id: *entry_id,
             cached,
             materialized,
             expression,
-            compressor,
         }) {
             let cached_type = CachedBatchType::from(cached);
             let new_type = CachedBatchType::from(&new_entry);
@@ -901,19 +786,46 @@ impl LiquidCache {
         selection: Option<&BooleanBuffer>,
         expression: Option<&CacheExpression>,
     ) -> Option<ArrayRef> {
-        use arrow::array::BooleanArray;
-
+        self.observer.on_get(selection.is_some());
         let batch = self.index.get_checked(entry_id, identity)?;
         self.cache_policy
             .notify_access(entry_id, CachedBatchType::from(batch.as_ref()));
+        self.read_entry_inner(entry_id, identity, batch.as_ref(), selection, expression)
+            .await
+    }
+
+    /// Read an already-looked-up cache entry.
+    pub async fn read_entry(
+        &self,
+        entry_id: &EntryID,
+        identity: u64,
+        entry: &CacheEntry,
+        selection: Option<&BooleanBuffer>,
+        expression: Option<&CacheExpression>,
+    ) -> Option<ArrayRef> {
+        self.observer.on_get(selection.is_some());
+        self.read_entry_inner(entry_id, identity, entry, selection, expression)
+            .await
+    }
+
+    async fn read_entry_inner(
+        &self,
+        entry_id: &EntryID,
+        identity: u64,
+        entry: &CacheEntry,
+        selection: Option<&BooleanBuffer>,
+        expression: Option<&CacheExpression>,
+    ) -> Option<ArrayRef> {
+        use arrow::array::BooleanArray;
+
         self.trace(InternalEvent::Read {
             entry: *entry_id,
             selection: selection.is_some(),
             expr: expression.cloned(),
-            cached: CachedBatchType::from(batch.as_ref()),
+            cached: CachedBatchType::from(entry),
         });
 
-        match batch.as_ref() {
+        match entry {
             CacheEntry::MemoryArrow(array) => match selection {
                 Some(selection) => {
                     let selection_array = BooleanArray::new(selection.clone(), None);
@@ -926,11 +838,7 @@ impl LiquidCache {
                 None => Some(array.to_arrow_array()),
             },
             CacheEntry::DiskArrow { .. } | CacheEntry::DiskLiquid { .. } => {
-                self.read_disk_array(batch.as_ref(), entry_id, identity, expression, selection)
-                    .await
-            }
-            CacheEntry::MemorySqueezedLiquid(array) => {
-                self.read_squeezed_array(array, entry_id, identity, expression, selection)
+                self.read_disk_array(entry, entry_id, identity, expression, selection)
                     .await
             }
         }
@@ -951,7 +859,7 @@ impl LiquidCache {
                 {
                     return Some(arrow::array::new_empty_array(data_type));
                 }
-                let full_array = self.read_disk_arrow_array(entry_id, identity).await;
+                let full_array = self.read_disk_arrow_array(entry_id, identity).await?;
                 self.maybe_hydrate(
                     entry_id,
                     identity,
@@ -974,7 +882,7 @@ impl LiquidCache {
                 {
                     return Some(arrow::array::new_empty_array(data_type));
                 }
-                let liquid = self.read_disk_liquid_array(entry_id, identity).await;
+                let liquid = self.read_disk_liquid_array(entry_id, identity).await?;
                 self.maybe_hydrate(
                     entry_id,
                     identity,
@@ -992,114 +900,10 @@ impl LiquidCache {
         }
     }
 
-    async fn read_squeezed_array(
-        &self,
-        array: &LiquidSqueezedArrayRef,
-        entry_id: &EntryID,
-        identity: u64,
-        expression: Option<&CacheExpression>,
-        selection: Option<&BooleanBuffer>,
-    ) -> Option<ArrayRef> {
-        if let Some(array) = self.try_read_squeezed_date32_array(array, expression, selection) {
-            self.observer.on_get_squeezed_success();
-            self.trace(InternalEvent::ReadSqueezedData {
-                entry: *entry_id,
-                expression: expression.unwrap().clone(),
-            });
-            return Some(array);
-        }
-
-        if let Some(array) = self
-            .try_read_squeezed_variant_array(array, entry_id, identity, expression, selection)
-            .await
-        {
-            self.observer.on_get_squeezed_success();
-            self.trace(InternalEvent::ReadSqueezedData {
-                entry: *entry_id,
-                expression: expression.unwrap().clone(),
-            });
-            return Some(array);
-        }
-
-        // no shortcut, needs to read full data
-        let out = match selection {
-            Some(selection) => array.filter(selection).await,
-            None => array.to_arrow_array().await,
-        };
-        Some(out)
-    }
-
-    fn try_read_squeezed_date32_array(
-        &self,
-        array: &LiquidSqueezedArrayRef,
-        expression: Option<&CacheExpression>,
-        selection: Option<&BooleanBuffer>,
-    ) -> Option<ArrayRef> {
-        if let Some(field) = expression.and_then(CacheExpression::as_date32_field)
-            && let Some(squeezed) = array.as_any().downcast_ref::<SqueezedDate32Array>()
-            && squeezed.field() == field
-        {
-            let component = squeezed.to_component_array();
-            self.observer.on_hit_date32_expression();
-            if let Some(selection) = selection {
-                let selection_array = BooleanArray::new(selection.clone(), None);
-                let filtered = arrow::compute::filter(&component, &selection_array).ok()?;
-                return Some(filtered);
-            }
-            return Some(component);
-        }
-        None
-    }
-
-    async fn try_read_squeezed_variant_array(
-        &self,
-        array: &LiquidSqueezedArrayRef,
-        entry_id: &EntryID,
-        identity: u64,
-        expression: Option<&CacheExpression>,
-        selection: Option<&BooleanBuffer>,
-    ) -> Option<ArrayRef> {
-        let requests = expression.and_then(|expr| expr.variant_requests())?;
-        let variant_squeezed = array
-            .as_any()
-            .downcast_ref::<VariantStructSqueezedArray>()?;
-        let all_paths_present = requests
-            .iter()
-            .all(|request| variant_squeezed.contains_path(request.path()));
-
-        let full_array = if !all_paths_present {
-            let batch = CacheEntry::MemorySqueezedLiquid(array.clone());
-            self.observer.on_get_squeezed_needs_io();
-            let full_array = self.read_disk_arrow_array(entry_id, identity).await;
-            self.maybe_hydrate(
-                entry_id,
-                identity,
-                &batch,
-                MaterializedEntry::Arrow(&full_array),
-                expression,
-            )
-            .await;
-            full_array
-        } else {
-            let requested_paths = requests.iter().map(|r| r.path());
-            variant_squeezed
-                .to_arrow_array_with_paths(requested_paths)
-                .unwrap()
-        };
-
-        match selection {
-            Some(selection) => {
-                let selection_array = BooleanArray::new(selection.clone(), None);
-                arrow::compute::filter(&full_array, &selection_array).ok()
-            }
-            None => Some(full_array),
-        }
-    }
-
     async fn write_batch_to_disk(
         &self,
         entry_id: EntryID,
-        identity: WriteIdentity,
+        identity: u64,
         batch: &CacheEntry,
         bytes: Bytes,
     ) -> Result<(), CacheFull> {
@@ -1113,7 +917,11 @@ impl LiquidCache {
                 return Err(CacheFull);
             }
             for victim in victims {
-                self.remove_disk_entry(victim).await;
+                // Each victim's object is addressed by the identity that wrote
+                // it, so look that up rather than assuming this writer's.
+                if let Some((victim_identity, _)) = self.index.get_with_identity(&victim) {
+                    self.remove_disk_entry(victim, victim_identity).await;
+                }
             }
         }
         self.trace(InternalEvent::IoWrite {
@@ -1121,103 +929,19 @@ impl LiquidCache {
             kind: CachedBatchType::from(batch),
             bytes: len,
         });
-        // A *rewrite* replays an entry read earlier, so a takeover in the
-        // meantime makes it stale: its object would be unreachable, and
-        // superseding on its behalf below would delete the live owner's. Drop
-        // it, and hand back the reservation taken above — nothing records
-        // those bytes, so nothing would ever release them.
-        //
-        // An *owned* write is the caller taking the key, and the index has not
-        // caught up yet by construction. Dropping it would leave the caller's
-        // own index entry pointing at bytes that were never written, and the
-        // next read of it panics.
-        if let WriteIdentity::Rewrite(rewriting) = identity
-            && let Some((current, _)) = self.index.get_with_identity(&entry_id)
-            && current != rewriting
-        {
-            self.budget.release_disk(len);
-            return Ok(());
-        }
-        let is_rewrite = matches!(identity, WriteIdentity::Rewrite(_));
-        let identity = identity.value();
         self.store
             .put(entry_id_to_key(&entry_id, identity), bytes.to_vec())
             .await
             .expect("write failed");
-        // `bytes` is whatever `batch` serialises to: Arrow IPC for an arrow
-        // entry (the flush path writes those directly), liquid otherwise.
-        let kind = match batch {
-            CacheEntry::DiskArrow { .. } | CacheEntry::MemoryArrow(_) => DiskKind::Arrow,
-            CacheEntry::MemorySqueezedLiquid(squeezed) => match squeezed.disk_backing() {
-                SqueezedBacking::Arrow(_) => DiskKind::Arrow,
-                SqueezedBacking::Liquid(_) => DiskKind::Liquid,
-            },
-            CacheEntry::DiskLiquid { .. } | CacheEntry::MemoryLiquid(_) => DiskKind::Liquid,
-        };
-        // The check above ran before the await, so a takeover can have landed
-        // while the bytes were being written. Ask the index again, not the
-        // record: the record may still name a previous owner this writer is
-        // legitimately superseding, whereas the index names whoever the bytes
-        // can actually be read by. A rewrite that is no longer that owner is
-        // stale and must leave the current one's record and object alone.
-        //
-        // The index read and the swap below are two steps, so this narrows the
-        // window rather than closing it — as with every other check-then-act
-        // pair in this file.
-        if is_rewrite
-            && self
-                .index
-                .get_with_identity(&entry_id)
-                .is_some_and(|(current, _)| current != identity)
-        {
-            // Stale: another identity owns the key now. Remove the object this
-            // write just made — nothing names it — and hand back its
-            // reservation. The remove holds no claim on the key, so a second
-            // caller may race it; `t4::Store::remove` reports a missing key as
-            // `Ok(false)` rather than an error, so that is harmless.
-            self.store
-                .remove(&entry_id_to_key(&entry_id, identity))
-                .await
-                .expect("disk remove failed");
-            self.budget.release_disk(len);
-            return Ok(());
-        }
-        let previous = self.disk_copies.lock().unwrap().insert(
-            entry_id,
-            DiskCopy {
-                identity,
-                kind,
-                bytes: len,
-            },
-        );
-        if let Some(previous) = previous {
-            // Same owner: the put replaced that object, so its reservation
-            // goes with it and there is nothing left to delete.
-            //
-            // Different owner: this is a caller taking the key from one that
-            // has let it go — a stale rewrite was turned away above. The key
-            // carries the identity, so the put landed somewhere else and the
-            // previous object is still there — with no record naming it and
-            // nothing that would ever reach it. Releasing its reservation
-            // without removing it would leave disk held by a blob the budget
-            // has stopped counting.
-            if previous.identity != identity {
-                self.store
-                    .remove(&entry_id_to_key(&entry_id, previous.identity))
-                    .await
-                    .expect("disk remove failed");
-            }
-            self.budget.release_disk(previous.bytes);
-        }
         Ok(())
     }
 
-    async fn read_disk_arrow_array(&self, entry_id: &EntryID, identity: u64) -> ArrayRef {
-        let bytes = self
-            .store
-            .get(&entry_id_to_key(entry_id, identity))
-            .await
-            .expect("read failed");
+    async fn read_disk_arrow_array(&self, entry_id: &EntryID, identity: u64) -> Option<ArrayRef> {
+        let bytes = match self.store.get(&entry_id_to_key(entry_id, identity)).await {
+            Ok(bytes) => bytes,
+            Err(t4::Error::NotFound) => return None,
+            Err(error) => panic!("read failed: {error}"),
+        };
         let bytes_len = bytes.len();
         let cursor = std::io::Cursor::new(bytes);
         let mut reader =
@@ -1228,30 +952,26 @@ impl LiquidCache {
             entry: *entry_id,
             bytes: bytes_len,
         });
-        array
+        Some(array)
     }
 
     async fn read_disk_liquid_array(
         &self,
         entry_id: &EntryID,
         identity: u64,
-    ) -> crate::liquid_array::LiquidArrayRef {
-        let bytes = self
-            .store
-            .get(&entry_id_to_key(entry_id, identity))
-            .await
-            .expect("read failed");
+    ) -> Option<crate::liquid_array::LiquidArrayRef> {
+        let bytes = match self.store.get(&entry_id_to_key(entry_id, identity)).await {
+            Ok(bytes) => bytes,
+            Err(t4::Error::NotFound) => return None,
+            Err(error) => panic!("read failed: {error}"),
+        };
         self.trace(InternalEvent::IoReadLiquid {
             entry: *entry_id,
             bytes: bytes.len(),
         });
-        let compressor_states = self.metadata.get_compressor(entry_id);
-        let compressor = compressor_states.fsst_compressor();
-
-        (crate::liquid_array::ipc::read_from_bytes(
+        Some(Arc::new(crate::liquid_array::LiquidArray::from_bytes(
             Bytes::from(bytes),
-            &crate::liquid_array::ipc::LiquidIPCContext::new(compressor),
-        )) as _
+        )))
     }
 
     pub(crate) async fn eval_predicate_internal(
@@ -1261,19 +981,49 @@ impl LiquidCache {
         selection_opt: Option<&BooleanBuffer>,
         predicate: &LiquidExpr,
     ) -> Option<BooleanArray> {
-        use arrow::array::BooleanArray;
-
         self.observer.on_eval_predicate();
         let batch = self.index.get_checked(entry_id, identity)?;
         self.cache_policy
             .notify_access(entry_id, CachedBatchType::from(batch.as_ref()));
+        self.eval_predicate_on_entry_inner(
+            entry_id,
+            identity,
+            batch.as_ref(),
+            selection_opt,
+            predicate,
+        )
+        .await
+    }
+
+    /// Evaluate a predicate on an already-looked-up cache entry.
+    pub async fn eval_predicate_on_entry(
+        &self,
+        entry_id: &EntryID,
+        identity: u64,
+        entry: &CacheEntry,
+        selection_opt: Option<&BooleanBuffer>,
+        predicate: &LiquidExpr,
+    ) -> Option<BooleanArray> {
+        self.observer.on_eval_predicate();
+        self.eval_predicate_on_entry_inner(entry_id, identity, entry, selection_opt, predicate)
+            .await
+    }
+
+    async fn eval_predicate_on_entry_inner(
+        &self,
+        entry_id: &EntryID,
+        identity: u64,
+        entry: &CacheEntry,
+        selection_opt: Option<&BooleanBuffer>,
+        predicate: &LiquidExpr,
+    ) -> Option<BooleanArray> {
         self.trace(InternalEvent::EvalPredicate {
             entry: *entry_id,
             selection: selection_opt.is_some(),
-            cached: CachedBatchType::from(batch.as_ref()),
+            cached: CachedBatchType::from(entry),
         });
 
-        match batch.as_ref() {
+        match entry {
             CacheEntry::MemoryArrow(array) => {
                 let mut owned = None;
                 let selection = selection_opt.unwrap_or_else(|| {
@@ -1281,11 +1031,12 @@ impl LiquidCache {
                     owned.as_ref().unwrap()
                 });
                 let selection_array = BooleanArray::new(selection.clone(), None);
-                let filtered = arrow::compute::filter(array, &selection_array).ok()?;
-                self.eval_predicate_on_array(filtered, predicate)
+                let filtered = arrow::compute::filter(array, &selection_array)
+                    .expect("selection must match array length");
+                Some(self.eval_predicate_on_array(filtered, predicate))
             }
             entry @ CacheEntry::DiskArrow { .. } => {
-                let array = self.read_disk_arrow_array(entry_id, identity).await;
+                let array = self.read_disk_arrow_array(entry_id, identity).await?;
                 self.maybe_hydrate(
                     entry_id,
                     identity,
@@ -1300,8 +1051,9 @@ impl LiquidCache {
                     owned.as_ref().unwrap()
                 });
                 let selection_array = BooleanArray::new(selection.clone(), None);
-                let filtered = arrow::compute::filter(&array, &selection_array).ok()?;
-                self.eval_predicate_on_array(filtered, predicate)
+                let filtered = arrow::compute::filter(&array, &selection_array)
+                    .expect("selection must match array length");
+                Some(self.eval_predicate_on_array(filtered, predicate))
             }
             CacheEntry::MemoryLiquid(array) => {
                 let mut owned = None;
@@ -1309,10 +1061,10 @@ impl LiquidCache {
                     owned = Some(BooleanBuffer::new_set(array.len()));
                     owned.as_ref().unwrap()
                 });
-                array.try_eval_predicate(predicate, selection)
+                Some(array.try_eval_predicate(predicate, selection))
             }
             entry @ CacheEntry::DiskLiquid { .. } => {
-                let liquid = self.read_disk_liquid_array(entry_id, identity).await;
+                let liquid = self.read_disk_liquid_array(entry_id, identity).await?;
                 self.maybe_hydrate(
                     entry_id,
                     identity,
@@ -1326,45 +1078,27 @@ impl LiquidCache {
                     owned = Some(BooleanBuffer::new_set(liquid.len()));
                     owned.as_ref().unwrap()
                 });
-                liquid.try_eval_predicate(predicate, selection)
-            }
-            CacheEntry::MemorySqueezedLiquid(array) => {
-                self.eval_predicate_on_squeezed(array, selection_opt, predicate)
-                    .await
+                Some(liquid.try_eval_predicate(predicate, selection))
             }
         }
     }
 
-    async fn eval_predicate_on_squeezed(
-        &self,
-        array: &LiquidSqueezedArrayRef,
-        selection_opt: Option<&BooleanBuffer>,
-        predicate: &LiquidExpr,
-    ) -> Option<BooleanArray> {
-        let mut owned = None;
-        let selection = selection_opt.unwrap_or_else(|| {
-            owned = Some(BooleanBuffer::new_set(array.len()));
-            owned.as_ref().unwrap()
-        });
-        array.try_eval_predicate(predicate, selection).await
-    }
-
-    /// `None` when the cached array cannot answer the predicate. See the
-    /// free function of the same name in `liquid_array`.
-    fn eval_predicate_on_array(
-        &self,
-        array: ArrayRef,
-        predicate: &LiquidExpr,
-    ) -> Option<BooleanArray> {
+    fn eval_predicate_on_array(&self, array: ArrayRef, predicate: &LiquidExpr) -> BooleanArray {
         let schema = Arc::new(Schema::new(vec![Field::new(
             "liquid_predicate_col",
             array.data_type().clone(),
             true,
         )]));
-        let record_batch = RecordBatch::try_new(schema, vec![array]).ok()?;
-        let result = predicate.physical_expr().evaluate(&record_batch).ok()?;
-        let boolean_array = result.into_array(record_batch.num_rows()).ok()?;
-        Some(boolean_array.as_boolean().clone())
+        let record_batch =
+            RecordBatch::try_new(schema, vec![array]).expect("single-column predicate batch");
+        let result = predicate
+            .physical_expr()
+            .evaluate(&record_batch)
+            .expect("validated LiquidExpr must evaluate");
+        let boolean_array = result
+            .into_array(record_batch.num_rows())
+            .expect("predicate output must be an array");
+        boolean_array.as_boolean().clone()
     }
 }
 
@@ -1372,19 +1106,11 @@ impl LiquidCache {
 mod tests {
     use super::*;
     use crate::cache::{
-        AlwaysHydrate, CacheEntry, CacheExpression, CachePolicy, LiquidCacheBuilder, LiquidPolicy,
-        TranscodeSqueezeEvict, transcode_liquid_inner,
-        utils::{
-            LiquidCompressorStates, arrow_to_bytes, create_cache_store, create_test_array,
-            create_test_arrow_array,
-        },
-    };
-    use crate::liquid_array::{
-        Date32Field, LiquidPrimitiveArray, LiquidSqueezedArrayRef, SqueezedDate32Array,
+        CacheEntry, CachePolicy, LiquidCacheBuilder, LiquidPolicy, TranscodeEvict,
+        utils::{arrow_to_bytes, create_cache_store, create_test_array, create_test_arrow_array},
     };
     use crate::sync::thread;
-    use arrow::array::{Array, ArrayRef, Date32Array, Int32Array};
-    use arrow::datatypes::Date32Type;
+    use arrow::array::{Array, ArrayRef, Int32Array};
     use std::future::Future;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1411,6 +1137,403 @@ mod tests {
             let id_to_use = self.target_id.unwrap();
             vec![id_to_use]
         }
+    }
+
+    /// Hydrating a disk entry must not charge its bytes to the disk budget
+    /// twice.
+    ///
+    /// The read that materializes a `DiskArrow`/`DiskLiquid` entry replaces it
+    /// with a memory entry. The store object under `(entry id, identity)` and
+    /// its share of `used_disk_bytes` outlive that replacement, so the next
+    /// spill reserves the same byte count again for an object the put simply
+    /// overwrites. Over a fixed working set, repeated read/spill rounds make
+    /// `disk_usage_bytes` climb without a byte more being written.
+    #[tokio::test]
+    async fn hydrating_a_disk_entry_does_not_recharge_its_disk_bytes() {
+        let store = create_cache_store(1 << 20, Box::new(LiquidPolicy::new())).await;
+        let entry_id = EntryID::from(500usize);
+        let array = create_test_arrow_array(1024);
+
+        store.insert(entry_id, 0, array.clone()).await.unwrap();
+        store.flush_all_to_disk().await.unwrap();
+        let charged = store.budget.disk_usage_bytes();
+        assert!(charged > 0, "flush must have written bytes");
+
+        let mut usage = vec![charged];
+        for _ in 0..3 {
+            // Reading a disk entry hydrates it back into memory ...
+            let read = store.get(&entry_id, 0).await.expect("present");
+            assert_eq!(read.as_ref(), array.as_ref());
+            assert!(matches!(
+                store.index().get(&entry_id).unwrap().as_ref(),
+                CacheEntry::MemoryArrow(_)
+            ));
+            // ... and the next flush spills the very same bytes again.
+            store.flush_all_to_disk().await.unwrap();
+            usage.push(store.budget.disk_usage_bytes());
+        }
+
+        assert_eq!(
+            usage,
+            vec![charged; 4],
+            "one entry of a fixed size occupies the same disk across read/spill rounds"
+        );
+    }
+
+    /// A spill that overwrites an entry's own disk object in place must release
+    /// the copy it superseded.
+    ///
+    /// Reported by review. The store key is `(entry id, identity)`, so this
+    /// insert's put landed on the very object the old entry named — deleting it
+    /// would destroy the bytes just written. But the old entry's reservation is
+    /// still counted, so one object ends up charged twice.
+    #[tokio::test]
+    async fn an_in_place_disk_overwrite_releases_the_copy_it_supersedes() {
+        // Tiny, so the second insert cannot stay in memory and — with only a
+        // disk entry present — has no memory victim to evict. `insert_inner`
+        // then spills the batch itself and re-inserts it over its own object.
+        let store = create_cache_store(64, Box::new(LiquidPolicy::new())).await;
+        let entry_id = EntryID::from(1usize);
+
+        // Get the key onto disk first, so the next insert displaces a disk entry.
+        store
+            .insert(entry_id, 7, create_test_arrow_array(512))
+            .await
+            .unwrap();
+        store.flush_all_to_disk().await.unwrap();
+        let (named_once, charged_once) = charged_disk_bytes_match_the_index(&store);
+        assert!(
+            named_once > 0,
+            "the entry must be on disk for this to test anything"
+        );
+        assert_eq!(named_once, charged_once, "baseline must be consistent");
+
+        // Same key, same identity, written to disk again over its own object.
+        store
+            .insert(entry_id, 7, create_test_arrow_array(4096))
+            .await
+            .unwrap();
+
+        let (named, charged) = charged_disk_bytes_match_the_index(&store);
+        assert_eq!(
+            charged, named,
+            "the superseded copy must be released: one object, one reservation"
+        );
+    }
+
+    /// Every byte counted against the disk budget must belong to an index
+    /// entry that is on disk. Anything else can never be released:
+    /// `release_disk` is only ever reached from an index entry.
+    fn charged_disk_bytes_match_the_index(cache: &LiquidCache) -> (usize, usize) {
+        let mut named = 0usize;
+        cache.for_each_entry(|_, _, entry| match entry {
+            CacheEntry::DiskLiquid { disk_bytes, .. }
+            | CacheEntry::DiskArrow { disk_bytes, .. } => named += *disk_bytes,
+            CacheEntry::MemoryArrow(_) | CacheEntry::MemoryLiquid(_) => {}
+        });
+        (named, cache.budget.disk_usage_bytes())
+    }
+
+    /// Overwriting a disk-resident entry under the identity that already holds
+    /// the key must not leave the superseded copy charged.
+    ///
+    /// The store key is `(entry id, identity)`, so the object the old entry
+    /// named is still there — but this insert wrote nothing to the store, so
+    /// it did not overwrite it, and the index no longer names it.
+    #[tokio::test]
+    async fn overwriting_a_disk_entry_releases_the_superseded_copy() {
+        let store = create_cache_store(1 << 20, Box::new(LiquidPolicy::new())).await;
+        let entry_id = EntryID::from(501usize);
+
+        store
+            .insert(entry_id, 5, create_test_arrow_array(1024))
+            .await
+            .unwrap();
+        store.flush_all_to_disk().await.unwrap();
+        assert!(
+            store.budget.disk_usage_bytes() > 0,
+            "flush must have written"
+        );
+
+        // Same identity, new value: the index entry becomes a memory one.
+        store
+            .insert(entry_id, 5, create_test_arrow_array(2048))
+            .await
+            .unwrap();
+
+        let (named, charged) = charged_disk_bytes_match_the_index(&store);
+        assert_eq!(
+            charged, named,
+            "the superseded copy is still charged but no index entry names it"
+        );
+    }
+
+    /// An overwrite must never be readable as the value it replaced, and the
+    /// form recorded in the index must be the form the store actually holds.
+    #[tokio::test]
+    async fn an_overwritten_entry_never_reads_back_the_superseded_bytes() {
+        let store = create_cache_store(1 << 20, Box::new(LiquidPolicy::new())).await;
+        let entry_id = EntryID::from(502usize);
+        let first = create_test_arrow_array(1024);
+        let second: ArrayRef = Arc::new(arrow::array::Int64Array::from_iter_values(
+            (0..2048).map(|v| v + 1_000_000),
+        ));
+
+        store.insert(entry_id, 5, first.clone()).await.unwrap();
+        store.flush_all_to_disk().await.unwrap();
+        assert!(matches!(
+            store.index().get(&entry_id).unwrap().as_ref(),
+            CacheEntry::DiskArrow { .. }
+        ));
+
+        store.insert(entry_id, 5, second.clone()).await.unwrap();
+        assert_eq!(
+            store.get(&entry_id, 5).await.expect("present").as_ref(),
+            second.as_ref(),
+            "the overwrite must be what a read returns"
+        );
+
+        // Spill again: whatever form the index records has to match the bytes
+        // the store now holds, or the next read decodes one as the other.
+        store.flush_all_to_disk().await.unwrap();
+        assert!(
+            matches!(
+                store.index().get(&entry_id).unwrap().as_ref(),
+                CacheEntry::DiskArrow { .. }
+            ),
+            "an Arrow flush must be recorded as an Arrow copy"
+        );
+        assert_eq!(
+            store.get(&entry_id, 5).await.expect("present").as_ref(),
+            second.as_ref(),
+            "reading the spilled copy must not return the superseded value"
+        );
+    }
+
+    /// A hydrated entry that is then transcoded and spilled must be recorded
+    /// as the form it was written in, not the form it was hydrated from.
+    #[tokio::test]
+    async fn a_hydrated_then_transcoded_entry_is_recorded_as_what_was_written() {
+        let store = create_cache_store(1 << 20, Box::new(LiquidPolicy::new())).await;
+        let entry_id = EntryID::from(503usize);
+        let array = create_test_arrow_array(1024);
+
+        store.insert(entry_id, 5, array.clone()).await.unwrap();
+        store.flush_all_to_disk().await.unwrap();
+
+        // Hydrate the Arrow copy back into memory ...
+        store.get(&entry_id, 5).await.expect("present");
+        // ... transcode it to liquid, then spill it as liquid.
+        store
+            .evict_victim_inner(entry_id)
+            .await
+            .expect("transcode must fit");
+        assert!(matches!(
+            store.index().get(&entry_id).unwrap().as_ref(),
+            CacheEntry::MemoryLiquid(_)
+        ));
+        store.flush_all_to_disk().await.unwrap();
+        assert!(
+            matches!(
+                store.index().get(&entry_id).unwrap().as_ref(),
+                CacheEntry::DiskLiquid { .. }
+            ),
+            "a liquid flush must be recorded as a liquid copy"
+        );
+
+        assert_eq!(
+            store.get(&entry_id, 5).await.expect("present").as_ref(),
+            array.as_ref(),
+            "a liquid stub must not be decoded over Arrow IPC bytes"
+        );
+        let (named, charged) = charged_disk_bytes_match_the_index(&store);
+        assert_eq!(
+            charged, named,
+            "the Arrow copy it was hydrated from is still charged"
+        );
+    }
+
+    /// A flush that cannot place an entry on disk drops it. Nothing of that
+    /// entry may stay charged against the disk budget afterwards.
+    #[tokio::test]
+    async fn a_flush_that_drops_an_entry_leaves_no_disk_charged_to_it() {
+        let array = create_test_arrow_array(1024);
+        let one_copy = arrow_to_bytes(&array).unwrap().len();
+        let cache = LiquidCacheBuilder::new()
+            .with_max_memory_bytes(1 << 20)
+            .with_max_disk_bytes(one_copy)
+            .with_eviction_policy(Box::new(TranscodeEvict))
+            .with_hydration_policy(Box::new(crate::cache::AlwaysHydrate::new()))
+            .with_cache_policy(Box::new(LiquidPolicy::new()))
+            .build()
+            .await;
+        let first = EntryID::from(504usize);
+        let second = EntryID::from(505usize);
+
+        cache.insert(first, 0, array.clone()).await.unwrap();
+        cache.flush_all_to_disk().await.unwrap();
+        // Reading it brings it back into memory; the disk tier should now be
+        // empty, so the next flush has room for both entries.
+        cache.get(&first, 0).await.expect("present");
+
+        cache.insert(second, 0, array.clone()).await.unwrap();
+        cache.flush_all_to_disk().await.unwrap();
+
+        let (named, charged) = charged_disk_bytes_match_the_index(&cache);
+        assert_eq!(
+            charged, named,
+            "disk charged to entries the flush dropped can never be released"
+        );
+    }
+
+    /// A takeover landing *during* a rewrite's `store.put` must leave the new
+    /// owner whole: its bytes, its record, and its share of the budget.
+    ///
+    /// The steps below are what `evict_victim_inner` does — read the entry with
+    /// the identity it holds, write it to the store, then swap the record — with
+    /// the takeover injected between the read and the write, which is the one
+    /// interleaving that ordering cannot be produced by calling it once.
+    ///
+    /// Three things hold it together, and the first is the decisive one:
+    /// `entry_id_to_key` puts the writer's identity in the store key, so the
+    /// stale put addresses its own object and can never reach the new owner's;
+    /// `WriteIdentity::Rewrite` makes the index refuse the record swap; and
+    /// `settle` reclaims the object the refused write had already put there.
+    #[tokio::test]
+    async fn a_takeover_during_a_rewrites_disk_write_leaves_the_new_owner_whole() {
+        let cache = create_cache_store(1 << 20, Box::new(LiquidPolicy::new())).await;
+        let entry_id = EntryID::from(600usize);
+        let theirs = create_test_arrow_array(1024);
+        let ours: ArrayRef = Arc::new(arrow::array::Int64Array::from_iter_values(
+            (0..512).map(|v| v + 7_000_000),
+        ));
+
+        // Identity 7 caches an entry, and eviction picks it up.
+        cache.insert(entry_id, 7, theirs.clone()).await.unwrap();
+        let (observed, _read) = cache.index().get_with_identity(&entry_id).unwrap();
+        assert_eq!(observed, 7);
+        let stale_bytes = arrow_to_bytes(&theirs).unwrap();
+        let stale_len = stale_bytes.len();
+        let stale_rewrite = CacheEntry::disk_arrow(theirs.data_type().clone(), stale_len);
+
+        // Identity 9 takes the key over and puts its own copy on disk.
+        cache.insert(entry_id, 9, ours.clone()).await.unwrap();
+        cache.flush_all_to_disk().await.unwrap();
+        let owner_bytes = match cache.index().get(&entry_id).unwrap().as_ref() {
+            CacheEntry::DiskArrow { disk_bytes, .. } => *disk_bytes,
+            other => panic!("expected the new owner on disk, found {other}"),
+        };
+
+        // Only now does the stale rewrite's write complete ...
+        cache
+            .write_batch_to_disk(entry_id, observed, &stale_rewrite, stale_bytes)
+            .await
+            .unwrap();
+        // ... and reach the record swap.
+        let residue = cache
+            .try_insert(entry_id, WriteIdentity::Rewrite(observed), stale_rewrite)
+            .expect("a refused rewrite is not a failure to insert");
+        cache
+            .settle(entry_id, residue, Some((observed, stale_len)))
+            .await;
+
+        // The stale writer's object is gone; the new owner's is not.
+        assert!(
+            matches!(
+                cache.store.get(&entry_id_to_key(&entry_id, observed)).await,
+                Err(t4::Error::NotFound)
+            ),
+            "the refused rewrite must take its own write back"
+        );
+        assert!(
+            cache
+                .store
+                .get(&entry_id_to_key(&entry_id, 9))
+                .await
+                .is_ok(),
+            "the new owner's object must survive a stale writer"
+        );
+        let (named, charged) = charged_disk_bytes_match_the_index(&cache);
+        assert_eq!(charged, named);
+        assert_eq!(charged, owner_bytes, "only the new owner's copy is charged");
+
+        // And the new owner's record still names bytes that decode to its rows.
+        assert!(matches!(
+            cache.index().get(&entry_id).unwrap().as_ref(),
+            CacheEntry::DiskArrow { .. }
+        ));
+        assert_eq!(
+            cache.get(&entry_id, 9).await.expect("present").as_ref(),
+            ours.as_ref(),
+            "the new owner must read its own rows, never the stale writer's"
+        );
+        assert!(
+            cache.get(&entry_id, 7).await.is_none(),
+            "the displaced identity reads a miss"
+        );
+    }
+
+    /// A rewrite that loses its key must not leave its disk write behind.
+    ///
+    /// The bytes were already in the store when the index refused the write, and
+    /// the store key carries the identity that wrote them, so nothing reachable
+    /// through the index names them afterwards: neither the object nor its share
+    /// of `used_disk_bytes` would ever come back.
+    #[tokio::test]
+    async fn a_dropped_rewrite_reclaims_the_disk_it_already_wrote() {
+        let store = create_cache_store(10 * 1024, Box::new(LiquidPolicy::new())).await;
+        let entry_id = EntryID::from(1usize);
+
+        // The owner caches an entry and flushes it, so a disk object exists.
+        store
+            .insert(entry_id, 7, create_test_arrow_array(64))
+            .await
+            .unwrap();
+        store.flush_all_to_disk().await.unwrap();
+        let after_flush = store.budget.disk_usage_bytes();
+        assert!(after_flush > 0, "flush must have written bytes");
+
+        // Another identity takes the key over, so the earlier owner's rewrite is
+        // now stale. Its disk object is unreachable and must be reclaimed.
+        store
+            .insert(entry_id, 9, create_test_arrow_array(64))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.budget.disk_usage_bytes(),
+            0,
+            "the displaced owner's disk bytes must be released, not stranded"
+        );
+        assert!(
+            store.get(&entry_id, 9).await.is_some(),
+            "the new owner must still read its own entry"
+        );
+        assert!(
+            store.get(&entry_id, 7).await.is_none(),
+            "the displaced owner must not read the new owner's rows"
+        );
+    }
+
+    /// The removal path is identity-checked: a caller that read an entry earlier
+    /// must not destroy the record of whoever holds the key now.
+    #[tokio::test]
+    async fn removing_a_disk_entry_under_a_stale_identity_is_refused() {
+        let store = create_cache_store(10 * 1024, Box::new(LiquidPolicy::new())).await;
+        let entry_id = EntryID::from(2usize);
+
+        store
+            .insert(entry_id, 3, create_test_arrow_array(64))
+            .await
+            .unwrap();
+        store.flush_all_to_disk().await.unwrap();
+
+        // A stale identity tries to evict it. Nothing of the current owner's may
+        // be touched.
+        store.remove_disk_entry(entry_id, 999).await;
+        assert!(
+            store.get(&entry_id, 3).await.is_some(),
+            "a stale remove must leave the current owner's entry readable"
+        );
     }
 
     #[tokio::test]
@@ -1458,44 +1581,6 @@ mod tests {
 
         assert_eq!(store.budget.memory_usage_bytes(), size3 + size2);
         assert!(store.index().get(&EntryID::from(999)).is_none());
-    }
-
-    #[tokio::test]
-    async fn get_arrow_array_with_expression_extracts_year() {
-        let store = create_cache_store(1 << 20, Box::new(LiquidPolicy::new())).await;
-        let entry_id = EntryID::from(42);
-
-        let date_values = Date32Array::from(vec![Some(2), Some(365 + 1), None, Some(365 + 100)]);
-        let liquid = LiquidPrimitiveArray::<Date32Type>::from_arrow_array(date_values.clone());
-        let squeezed = SqueezedDate32Array::from_liquid_date32(&liquid, Date32Field::Year);
-        let squeezed: LiquidSqueezedArrayRef = Arc::new(squeezed);
-
-        store
-            .insert_inner(
-                entry_id,
-                WriteIdentity::Owned(0),
-                CacheEntry::memory_squeezed_liquid(squeezed.clone()),
-            )
-            .await
-            .unwrap();
-
-        let expr = Arc::new(CacheExpression::extract_date32(Date32Field::Year));
-        let result = store
-            .get(&entry_id, 0)
-            .with_expression_hint(expr)
-            .read()
-            .await
-            .expect("array present");
-
-        let result = result
-            .as_any()
-            .downcast_ref::<Date32Array>()
-            .expect("date32 result");
-        assert_eq!(result.len(), 4);
-        assert_eq!(result.value(0), 0);
-        assert_eq!(result.value(1), 365);
-        assert!(result.is_null(2));
-        assert_eq!(result.value(3), 365);
     }
 
     #[tokio::test]
@@ -1598,7 +1683,7 @@ mod tests {
         // Build a small cache in blocking liquid mode to avoid background tasks
         let storage = LiquidCacheBuilder::new()
             .with_max_memory_bytes(10 * 1024 * 1024)
-            .with_squeeze_policy(Box::new(TranscodeSqueezeEvict))
+            .with_eviction_policy(Box::new(TranscodeEvict))
             .build()
             .await;
 
@@ -1652,12 +1737,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn missing_disk_blob_is_a_cache_miss() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = t4::mount(directory.path().join("cache.t4")).await.unwrap();
+        let cache = LiquidCacheBuilder::new()
+            .with_store(store.clone())
+            .build()
+            .await;
+        let id = EntryID::from(320usize);
+
+        cache
+            .insert(id, 0, create_test_arrow_array(8))
+            .await
+            .unwrap();
+        cache.flush_all_to_disk().await.unwrap();
+        store.remove(&entry_id_to_key(&id, 0)).await.unwrap();
+
+        assert!(cache.get(&id, 0).await.is_none());
+    }
+
+    #[tokio::test]
     async fn hydrate_disk_liquid_on_get_promotes_to_memory_liquid() {
         let store = create_cache_store(1 << 20, Box::new(LiquidPolicy::new())).await;
         let entry_id = EntryID::from(322usize);
         let arrow_array: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3, 4]));
-        let compressor = LiquidCompressorStates::new();
-        let liquid = transcode_liquid_inner(&arrow_array, &compressor).unwrap();
+        let liquid =
+            Arc::new(crate::liquid_array::LiquidArray::from_arrow_array(&arrow_array).unwrap());
 
         store
             .insert_inner(
@@ -1681,251 +1786,12 @@ mod tests {
         }
     }
 
-    /// An owned write is the caller taking the key, and the index has not
-    /// caught up yet by construction — the write happens first, the index
-    /// entry second. Dropping it as "stale" would leave the caller's own entry
-    /// pointing at bytes that were never written, and the next read panics.
-    #[tokio::test]
-    async fn an_owned_write_is_not_dropped_because_the_index_lags() {
-        let store = create_cache_store(1024 * 1024, Box::new(LiquidPolicy::new())).await;
-        let entry_id = EntryID::from(51usize);
-
-        // Identity 1 holds the key.
-        store
-            .insert_inner(entry_id, WriteIdentity::Owned(1), create_test_array(100))
-            .await
-            .unwrap();
-
-        // Identity 2 takes it over. Its bytes land before its index entry
-        // does, so the index still names 1 at write time.
-        let taking_over = create_test_array(200);
-        let CacheEntry::MemoryArrow(array) = &taking_over else {
-            unreachable!("create_test_array builds an arrow entry")
-        };
-        let bytes = arrow_to_bytes(array).unwrap();
-        store
-            .write_batch_to_disk(entry_id, WriteIdentity::Owned(2), &taking_over, bytes)
-            .await
-            .unwrap();
-
-        // The bytes must actually be there, or the entry installed next reads
-        // a missing object.
-        let read_back = store.read_disk_arrow_array(&entry_id, 2).await;
-        assert_eq!(
-            read_back.len(),
-            200,
-            "an owned write was dropped, so its entry would point at nothing"
-        );
-    }
-
-    /// A reset must delete the objects it forgets. The store key carries the
-    /// identity that wrote it, so everything written after a reset lands under
-    /// new keys — nothing would overwrite the old objects, and with their
-    /// records gone nothing would ever find them either.
-    #[tokio::test]
-    async fn reset_deletes_the_store_objects_it_forgets() {
-        let store = create_cache_store(1024 * 1024, Box::new(LiquidPolicy::new())).await;
-        let entry_id = EntryID::from(61usize);
-
-        store
-            .insert_inner(entry_id, WriteIdentity::Owned(1), create_test_array(100))
-            .await
-            .unwrap();
-        store.flush_all_to_disk().await.unwrap();
-        assert!(store.budget.disk_usage_bytes() > 0, "something spilled");
-        assert!(
-            store
-                .store
-                .get(&crate::cache::io_context::entry_id_to_key(&entry_id, 1))
-                .await
-                .is_ok(),
-            "the object is there before the reset"
-        );
-
-        store.reset().await;
-
-        assert!(
-            store
-                .store
-                .get(&crate::cache::io_context::entry_id_to_key(&entry_id, 1))
-                .await
-                .is_err(),
-            "reset left an object nothing can reach and nothing counts"
-        );
-        assert_eq!(store.budget.disk_usage_bytes(), 0);
-    }
-
-    /// A dropped write must hand back the disk it reserved. Nothing records
-    /// those bytes — no `DiskCopy` names them — so no later path would ever
-    /// release them, and repeated takeovers during squeezes would walk the
-    /// disk tally up to its limit while holding nothing.
-    #[tokio::test]
-    async fn a_dropped_stale_write_releases_its_reservation() {
-        let store = create_cache_store(1024 * 1024, Box::new(LiquidPolicy::new())).await;
-        let entry_id = EntryID::from(41usize);
-
-        // Identity 2 owns the key.
-        store
-            .insert_inner(entry_id, WriteIdentity::Owned(2), create_test_array(100))
-            .await
-            .unwrap();
-        let disk_before = store.budget.disk_usage_bytes();
-
-        // A rewrite for an identity that has since lost the key is dropped.
-        let stale_entry = create_test_array(50);
-        let CacheEntry::MemoryArrow(stale_array) = &stale_entry else {
-            unreachable!("create_test_array builds an arrow entry")
-        };
-        let stale_bytes = arrow_to_bytes(stale_array).unwrap();
-        store
-            .write_batch_to_disk(
-                entry_id,
-                WriteIdentity::Rewrite(1),
-                &stale_entry,
-                stale_bytes,
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(
-            store.budget.disk_usage_bytes(),
-            disk_before,
-            "a dropped write must not keep the disk it reserved"
-        );
-    }
-
-    /// Taking a key over must not strand the previous owner's object.
-    ///
-    /// Once the identity is part of the store key, a new owner's write lands
-    /// somewhere else rather than on top — so the old object survives its own
-    /// record. Releasing its reservation without deleting it leaves disk held
-    /// by a blob nothing can reach and the budget has stopped counting.
-    #[tokio::test]
-    async fn taking_a_key_over_removes_the_previous_owner_s_object() {
-        let store = create_cache_store(1024 * 1024, Box::new(LiquidPolicy::new())).await;
-        let entry_id = EntryID::from(31usize);
-
-        store
-            .insert_inner(entry_id, WriteIdentity::Owned(1), create_test_array(100))
-            .await
-            .unwrap();
-        store.flush_all_to_disk().await.unwrap();
-        let disk_after_first = store.budget.disk_usage_bytes();
-        assert!(disk_after_first > 0, "the first owner spilled to disk");
-
-        // A different owner takes the key and spills too.
-        store
-            .insert_inner(entry_id, WriteIdentity::Owned(2), create_test_array(100))
-            .await
-            .unwrap();
-        store.flush_all_to_disk().await.unwrap();
-
-        // The first owner's object is gone, not merely unaccounted.
-        assert!(
-            store
-                .store
-                .get(&crate::cache::io_context::entry_id_to_key(&entry_id, 1))
-                .await
-                .is_err(),
-            "the previous owner's object outlived its record"
-        );
-        assert_eq!(
-            store.budget.disk_usage_bytes(),
-            disk_after_first,
-            "disk accounting should track one object, not two"
-        );
-    }
-
-    /// The store object has to be owned too, not just the record naming it.
-    ///
-    /// A write is issued before the index rewrite that would have declined it,
-    /// so it can land *after* another owner has taken the key over and become
-    /// disk-backed. Addressed by the packed id alone, that write overwrites
-    /// bytes the new owner's index entry and `DiskCopy` record both agree are
-    /// its own — silent wrong data, past every check. The identity belongs in
-    /// the store key so the two never address one object.
-    #[tokio::test]
-    async fn a_late_write_for_a_previous_owner_cannot_reach_the_current_one() {
-        let store = create_cache_store(1024 * 1024, Box::new(LiquidPolicy::new())).await;
-        let entry_id = EntryID::from(21usize);
-
-        // Identity 2 owns the key and is disk-backed.
-        store
-            .insert_inner(entry_id, WriteIdentity::Owned(2), create_test_array(200))
-            .await
-            .unwrap();
-        store.flush_all_to_disk().await.unwrap();
-        let before = store.read_disk_arrow_array(&entry_id, 2).await;
-        assert_eq!(before.len(), 200);
-
-        // Identity 1's write lands late, carrying a different array.
-        let stale_entry = create_test_array(37);
-        let CacheEntry::MemoryArrow(stale_array) = &stale_entry else {
-            unreachable!("create_test_array builds an arrow entry")
-        };
-        let stale_bytes = arrow_to_bytes(stale_array).unwrap();
-        store
-            .write_batch_to_disk(
-                entry_id,
-                WriteIdentity::Rewrite(1),
-                &stale_entry,
-                stale_bytes,
-            )
-            .await
-            .unwrap();
-
-        // The current owner still reads its own rows.
-        let after = store.read_disk_arrow_array(&entry_id, 2).await;
-        assert_eq!(
-            after.len(),
-            200,
-            "a write for a previous owner reached the current owner's object"
-        );
-    }
-
-    /// A rewrite that is declined has already written its bytes, so the store
-    /// object and its record outlive the entry they were built for. If the
-    /// next owner of the key could see that record it would adopt the object
-    /// on kind and length alone and read the previous owner's rows as its own.
-    #[tokio::test]
-    async fn a_disk_copy_is_invisible_to_whoever_holds_the_key_next() {
-        let store = create_cache_store(1024 * 1024, Box::new(LiquidPolicy::new())).await;
-        let entry_id = EntryID::from(5usize);
-
-        // Identity 1 caches and spills, recording a store object for this key.
-        store
-            .insert_inner(entry_id, WriteIdentity::Owned(1), create_test_array(100))
-            .await
-            .unwrap();
-        store.flush_all_to_disk().await.unwrap();
-        assert!(
-            store.disk_copy(&entry_id, 1).is_some(),
-            "the owner sees the object it wrote"
-        );
-
-        // Identity 2 takes the key over. The object is still on disk, and the
-        // record still names identity 1.
-        store
-            .insert_inner(entry_id, WriteIdentity::Owned(2), create_test_array(200))
-            .await
-            .unwrap();
-
-        assert!(
-            store.disk_copy(&entry_id, 2).is_none(),
-            "the new owner must not adopt the object the previous one left"
-        );
-        assert!(
-            store.any_disk_copy(&entry_id).is_some(),
-            "the record is still there for the paths that reclaim it"
-        );
-    }
-
     #[tokio::test]
     async fn insert_returns_cache_full_when_memory_and_disk_are_saturated() {
         let cache = LiquidCacheBuilder::new()
             .with_max_memory_bytes(0)
             .with_max_disk_bytes(0)
-            .with_squeeze_policy(Box::new(TranscodeSqueezeEvict))
+            .with_eviction_policy(Box::new(TranscodeEvict))
             .build()
             .await;
         let array: ArrayRef = Arc::new(Int32Array::from_iter_values(0..16));
@@ -1945,7 +1811,7 @@ mod tests {
         let cache = LiquidCacheBuilder::new()
             .with_max_memory_bytes(1 << 20)
             .with_max_disk_bytes(first_bytes.max(second_bytes))
-            .with_squeeze_policy(Box::new(TranscodeSqueezeEvict))
+            .with_eviction_policy(Box::new(TranscodeEvict))
             .with_cache_policy(Box::new(LiquidPolicy::new()))
             .build()
             .await;
@@ -1974,7 +1840,7 @@ mod tests {
         let cache = LiquidCacheBuilder::new()
             .with_max_memory_bytes(1 << 20)
             .with_max_disk_bytes(disk_bytes)
-            .with_squeeze_policy(Box::new(TranscodeSqueezeEvict))
+            .with_eviction_policy(Box::new(TranscodeEvict))
             .with_cache_policy(Box::new(LiquidPolicy::new()))
             .build()
             .await;
@@ -1996,7 +1862,7 @@ mod tests {
         let cache = LiquidCacheBuilder::new()
             .with_max_memory_bytes(1 << 20)
             .with_max_disk_bytes(disk_bytes)
-            .with_squeeze_policy(Box::new(TranscodeSqueezeEvict))
+            .with_eviction_policy(Box::new(TranscodeEvict))
             .with_cache_policy(Box::new(LiquidPolicy::new()))
             .build()
             .await;
@@ -2005,7 +1871,7 @@ mod tests {
         cache.flush_all_to_disk().await.unwrap();
         let before = cache.stats().disk_usage_bytes;
 
-        cache.remove_disk_entry(entry).await;
+        cache.remove_disk_entry(entry, 0).await;
 
         assert_eq!(cache.stats().disk_usage_bytes, before - disk_bytes);
         assert!(!cache.is_cached(&entry, 0));
@@ -2016,7 +1882,7 @@ mod tests {
         let cache = LiquidCacheBuilder::new()
             .with_max_memory_bytes(1 << 20)
             .with_max_disk_bytes(0)
-            .with_squeeze_policy(Box::new(TranscodeSqueezeEvict))
+            .with_eviction_policy(Box::new(TranscodeEvict))
             .build()
             .await;
         let entry_id = EntryID::from(901usize);
@@ -2027,288 +1893,5 @@ mod tests {
 
         assert_eq!(result, Ok(()));
         assert!(!cache.is_cached(&entry_id, 0));
-    }
-
-    async fn hydrating_cache() -> Arc<LiquidCache> {
-        LiquidCacheBuilder::new()
-            .with_max_memory_bytes(1 << 20)
-            .with_max_disk_bytes(1 << 20)
-            .with_squeeze_policy(Box::new(TranscodeSqueezeEvict))
-            .with_cache_policy(Box::new(LiquidPolicy::new()))
-            .with_hydration_policy(Box::new(AlwaysHydrate::new()))
-            .build()
-            .await
-    }
-
-    /// Two squeezes take a fresh arrow entry through liquid to a disk stub.
-    async fn demote_to_disk(cache: &LiquidCache, id: EntryID) -> usize {
-        cache.squeeze_victims(vec![id]).await.unwrap();
-        cache.squeeze_victims(vec![id]).await.unwrap();
-        let entry = cache.index().get(&id).expect("entry present");
-        let CacheEntry::DiskLiquid { disk_bytes, .. } = entry.as_ref() else {
-            panic!("expected a disk stub, got {entry:?}");
-        };
-        *disk_bytes
-    }
-
-    /// Overwriting an entry that sits on disk must drop the disk copy of the
-    /// value it replaces: demoting the new value must not flip the index to a
-    /// stub over the old bytes, and the old reservation must be released.
-    #[tokio::test]
-    async fn overwrite_of_disk_stub_invalidates_disk_copy() {
-        let cache = hydrating_cache().await;
-        let id = EntryID::from(920usize);
-        let v1: ArrayRef = Arc::new(Int32Array::from_iter_values(0..16));
-        let v2: ArrayRef = Arc::new(Int32Array::from_iter_values(100..164));
-
-        cache.insert(id, 0, v1).await.unwrap();
-        let v1_disk_bytes = demote_to_disk(&cache, id).await;
-        assert_eq!(cache.budget().disk_usage_bytes(), v1_disk_bytes);
-
-        cache.insert(id, 0, v2.clone()).await.unwrap();
-        let disk_after_overwrite = cache.budget().disk_usage_bytes();
-
-        let v2_disk_bytes = demote_to_disk(&cache, id).await;
-        let read = cache.get(&id, 0).await.expect("present");
-        assert_eq!(read.as_ref(), v2.as_ref(), "read back the superseded value");
-        assert_eq!(
-            disk_after_overwrite, 0,
-            "the superseded object's reservation must be released"
-        );
-        assert_eq!(cache.budget().disk_usage_bytes(), v2_disk_bytes);
-    }
-
-    /// The same, for an entry that was hydrated back into memory before the
-    /// overwrite, so the index holds a memory entry and only the disk-copy
-    /// record points at the old bytes.
-    #[tokio::test]
-    async fn overwrite_of_hydrated_entry_invalidates_disk_copy() {
-        let cache = hydrating_cache().await;
-        let id = EntryID::from(921usize);
-        let v1: ArrayRef = Arc::new(Int32Array::from_iter_values(0..16));
-        let v2: ArrayRef = Arc::new(Int32Array::from_iter_values(100..164));
-
-        cache.insert(id, 0, v1.clone()).await.unwrap();
-        let v1_disk_bytes = demote_to_disk(&cache, id).await;
-        let read = cache.get(&id, 0).await.expect("present");
-        assert_eq!(read.as_ref(), v1.as_ref());
-        assert!(matches!(
-            cache.index().get(&id).unwrap().as_ref(),
-            CacheEntry::MemoryLiquid(_)
-        ));
-        assert_eq!(cache.budget().disk_usage_bytes(), v1_disk_bytes);
-
-        cache.insert(id, 0, v2.clone()).await.unwrap();
-        let disk_after_overwrite = cache.budget().disk_usage_bytes();
-
-        let v2_disk_bytes = demote_to_disk(&cache, id).await;
-        let read = cache.get(&id, 0).await.expect("present");
-        assert_eq!(read.as_ref(), v2.as_ref(), "read back the superseded value");
-        assert_eq!(disk_after_overwrite, 0);
-        assert_eq!(cache.budget().disk_usage_bytes(), v2_disk_bytes);
-    }
-
-    /// A flush writes an arrow entry as Arrow IPC and must record the copy as
-    /// such: once hydrated and transcoded, the entry is demoted through the
-    /// policy to freshly written liquid bytes, not flipped to a liquid stub
-    /// over the arrow bytes. The replaced object's reservation is released.
-    #[tokio::test]
-    async fn flushed_arrow_copy_is_not_reused_as_liquid() {
-        let cache = hydrating_cache().await;
-        let id = EntryID::from(922usize);
-        let array: ArrayRef = Arc::new(Int32Array::from_iter_values(0..64));
-
-        cache.insert(id, 0, array.clone()).await.unwrap();
-        cache.flush_all_to_disk().await.unwrap();
-        assert!(matches!(
-            cache.index().get(&id).unwrap().as_ref(),
-            CacheEntry::DiskArrow { .. }
-        ));
-        let read = cache.get(&id, 0).await.expect("present");
-        assert_eq!(read.as_ref(), array.as_ref());
-        assert!(matches!(
-            cache.index().get(&id).unwrap().as_ref(),
-            CacheEntry::MemoryArrow(_)
-        ));
-
-        let disk_bytes = demote_to_disk(&cache, id).await;
-        assert_eq!(cache.budget().disk_usage_bytes(), disk_bytes);
-        let read = cache.get(&id, 0).await.expect("present");
-        assert_eq!(read.as_ref(), array.as_ref());
-    }
-
-    /// A hinted entry rehydrated from its liquid disk copy must still reach
-    /// the squeezed tier on its next demotion, and must not rewrite the copy
-    /// its squeezed form reads back through.
-    #[tokio::test]
-    async fn rehydrated_hinted_entry_returns_to_squeezed_tier_without_rewrite() {
-        let cache = hydrating_cache().await;
-        let id = EntryID::from(923usize);
-        let dates: ArrayRef = Arc::new(Date32Array::from(vec![
-            Some(2),
-            Some(365 + 1),
-            None,
-            Some(365 + 100),
-        ]));
-        let expr = Arc::new(CacheExpression::extract_date32(Date32Field::Year));
-
-        cache
-            .insert(id, 0, dates.clone())
-            .with_squeeze_hint(expr.clone())
-            .await
-            .unwrap();
-        for _ in 0..3 {
-            cache.squeeze_victims(vec![id]).await.unwrap();
-        }
-        let entry = cache.index().get(&id).unwrap();
-        let CacheEntry::DiskLiquid { disk_bytes, .. } = entry.as_ref() else {
-            panic!("expected a disk stub, got {entry:?}");
-        };
-        let disk_bytes = *disk_bytes;
-        assert_eq!(cache.budget().disk_usage_bytes(), disk_bytes);
-        // Drain the IO counters so the count below covers only the re-eviction.
-        let _ = cache.observer().runtime_snapshot();
-
-        let read = cache.get(&id, 0).await.expect("present");
-        assert_eq!(read.as_ref(), dates.as_ref());
-        assert!(matches!(
-            cache.index().get(&id).unwrap().as_ref(),
-            CacheEntry::MemoryLiquid(_)
-        ));
-
-        cache.squeeze_victims(vec![id]).await.unwrap();
-        assert!(
-            matches!(
-                cache.index().get(&id).unwrap().as_ref(),
-                CacheEntry::MemorySqueezedLiquid(_)
-            ),
-            "the squeeze policy must run for a hinted entry"
-        );
-        assert_eq!(
-            cache.observer().runtime_snapshot().write_io_count,
-            0,
-            "the squeezed form's backing is already on disk"
-        );
-        assert_eq!(cache.budget().disk_usage_bytes(), disk_bytes);
-
-        let years = cache
-            .get(&id, 0)
-            .with_expression_hint(expr)
-            .read()
-            .await
-            .expect("present");
-        let years = years.as_any().downcast_ref::<Date32Array>().unwrap();
-        assert_eq!(years.value(0), 0);
-        assert_eq!(years.value(1), 365);
-        assert!(years.is_null(2));
-        assert_eq!(years.value(3), 365);
-    }
-
-    /// A policy with no eviction advice, so an insert that does not fit
-    /// falls straight through to the disk tier.
-    #[derive(Debug)]
-    struct NoVictims;
-
-    impl CachePolicy for NoVictims {
-        fn find_memory_victim(&self, _cnt: usize) -> Vec<EntryID> {
-            Vec::new()
-        }
-    }
-
-    /// Overwriting an entry that sits in the squeezed tier must take the
-    /// entry out of the index along with the object it reads through, even
-    /// when the new value then fails to insert: a squeezed entry left over a
-    /// deleted object would panic on its next read.
-    #[tokio::test]
-    async fn overwrite_of_squeezed_entry_that_fails_to_insert_leaves_no_entry() {
-        let dates: ArrayRef = Arc::new(Date32Array::from(vec![
-            Some(2),
-            Some(365 + 1),
-            None,
-            Some(365 + 100),
-        ]));
-        let expr = Arc::new(CacheExpression::extract_date32(Date32Field::Year));
-        let squeeze_to_tier = |cache: Arc<LiquidCache>, id| {
-            let dates = dates.clone();
-            let expr = expr.clone();
-            async move {
-                cache
-                    .insert(id, 0, dates)
-                    .with_squeeze_hint(expr)
-                    .await
-                    .unwrap();
-                cache.squeeze_victims(vec![id]).await.unwrap();
-                cache.squeeze_victims(vec![id]).await.unwrap();
-                assert!(matches!(
-                    cache.index().get(&id).unwrap().as_ref(),
-                    CacheEntry::MemorySqueezedLiquid(_)
-                ));
-            }
-        };
-        // Learn the backing size, then size the disk tier to exactly it.
-        let probe = hydrating_cache().await;
-        squeeze_to_tier(probe.clone(), EntryID::from(1usize)).await;
-        let backing_bytes = probe.budget().disk_usage_bytes();
-        assert!(backing_bytes > 0);
-
-        let cache = LiquidCacheBuilder::new()
-            .with_max_memory_bytes(64 * 1024)
-            .with_max_disk_bytes(backing_bytes)
-            .with_squeeze_policy(Box::new(TranscodeSqueezeEvict))
-            .with_cache_policy(Box::new(NoVictims))
-            .build()
-            .await;
-        let id = EntryID::from(924usize);
-        squeeze_to_tier(cache.clone(), id).await;
-        assert_eq!(cache.budget().disk_usage_bytes(), backing_bytes);
-
-        // Too big for memory, and the disk tier is full with no victims.
-        let too_big: ArrayRef = Arc::new(Int32Array::from_iter_values(0..(1 << 16)));
-        let result = cache.insert(id, 0, too_big).await;
-        assert_eq!(result, Err(CacheFull));
-
-        assert!(!cache.is_cached(&id, 0));
-        assert!(cache.get(&id, 0).await.is_none());
-        assert_eq!(cache.budget().disk_usage_bytes(), 0);
-        assert_eq!(cache.budget().memory_usage_bytes(), 0);
-    }
-
-    /// A flush that cannot write an entry drops it; if that entry still held
-    /// a disk copy, the object and its reservation must go with it, or the
-    /// disk tier shrinks by that much for good.
-    #[tokio::test]
-    async fn flush_dropping_hydrated_entry_releases_its_disk_copy() {
-        let array: ArrayRef = Arc::new(Int32Array::from_iter_values(0..64));
-        let disk_bytes = arrow_to_bytes(&array).unwrap().len();
-        let cache = LiquidCacheBuilder::new()
-            .with_max_memory_bytes(1 << 20)
-            .with_max_disk_bytes(disk_bytes)
-            .with_squeeze_policy(Box::new(TranscodeSqueezeEvict))
-            .with_cache_policy(Box::new(LiquidPolicy::new()))
-            .with_hydration_policy(Box::new(AlwaysHydrate::new()))
-            .build()
-            .await;
-        let id = EntryID::from(925usize);
-
-        cache.insert(id, 0, array.clone()).await.unwrap();
-        cache.flush_all_to_disk().await.unwrap();
-        let read = cache.get(&id, 0).await.expect("present");
-        assert_eq!(read.as_ref(), array.as_ref());
-        assert!(matches!(
-            cache.index().get(&id).unwrap().as_ref(),
-            CacheEntry::MemoryArrow(_)
-        ));
-        assert_eq!(cache.budget().disk_usage_bytes(), disk_bytes);
-
-        // The second flush wants to write the arrow bytes again into a tier
-        // that is full with the entry's own copy, so the entry is dropped.
-        cache.flush_all_to_disk().await.unwrap();
-
-        assert!(!cache.is_cached(&id, 0));
-        assert_eq!(
-            cache.budget().disk_usage_bytes(),
-            0,
-            "the dropped entry's disk copy must be released"
-        );
     }
 }

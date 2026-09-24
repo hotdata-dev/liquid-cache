@@ -1,7 +1,4 @@
-use std::{
-    collections::{HashMap, HashSet},
-    ptr::NonNull,
-};
+use std::{collections::HashMap, ptr::NonNull};
 
 use crate::{
     cache::{CachePolicy, EntryID, cached_batch::CachedBatchType},
@@ -14,7 +11,6 @@ use super::doubly_linked_list::{DoublyLinkedList, DoublyLinkedNode, drop_boxed_n
 enum QueueKind {
     Arrow,
     Liquid,
-    Squeezed,
     Disk,
 }
 
@@ -22,12 +18,6 @@ enum QueueKind {
 struct QueueNode {
     entry_id: EntryID,
     queue: QueueKind,
-    /// Second-chance (CLOCK) reference bit. Set when the entry is accessed
-    /// (a cache hit); cleared when it is passed over during victim search.
-    /// A fresh insert starts cold (`false`), so a batch read exactly once —
-    /// e.g. every batch of a large one-pass scan — is evicted before any
-    /// batch that has been reused, keeping the working set scan-resistant.
-    referenced: bool,
 }
 
 type NodePtr = NonNull<DoublyLinkedNode<QueueNode>>;
@@ -37,7 +27,6 @@ struct LiquidQueueInternalState {
     map: HashMap<EntryID, NodePtr>,
     arrow: DoublyLinkedList<QueueNode>,
     liquid: DoublyLinkedList<QueueNode>,
-    squeezed: DoublyLinkedList<QueueNode>,
     disk: DoublyLinkedList<QueueNode>,
 }
 
@@ -46,7 +35,6 @@ impl LiquidQueueInternalState {
         match queue {
             QueueKind::Arrow => &mut self.arrow,
             QueueKind::Liquid => &mut self.liquid,
-            QueueKind::Squeezed => &mut self.squeezed,
             QueueKind::Disk => &mut self.disk,
         }
     }
@@ -77,7 +65,6 @@ impl LiquidQueueInternalState {
         let node = DoublyLinkedNode::new(QueueNode {
             entry_id,
             queue: target,
-            referenced: false,
         });
         let node_ptr = NonNull::from(Box::leak(node));
 
@@ -91,7 +78,6 @@ impl LiquidQueueInternalState {
         let list = match queue {
             QueueKind::Arrow => &mut self.arrow,
             QueueKind::Liquid => &mut self.liquid,
-            QueueKind::Squeezed => &mut self.squeezed,
             QueueKind::Disk => &mut self.disk,
         };
 
@@ -117,46 +103,6 @@ impl LiquidQueueInternalState {
         }
         Some(removed)
     }
-
-    /// Entry id and reference bit of the queue's front node, if any.
-    fn head_info(&self, queue: QueueKind) -> Option<(EntryID, bool)> {
-        let list = match queue {
-            QueueKind::Arrow => &self.arrow,
-            QueueKind::Liquid => &self.liquid,
-            QueueKind::Squeezed => &self.squeezed,
-            QueueKind::Disk => &self.disk,
-        };
-        let head_ptr = list.head()?;
-        let data = unsafe { &head_ptr.as_ref().data };
-        Some((data.entry_id, data.referenced))
-    }
-
-    /// Set the reference bit of an entry, if present.
-    fn set_referenced(&mut self, entry_id: &EntryID, value: bool) {
-        if let Some(node_ptr) = self.map.get(entry_id).copied() {
-            unsafe {
-                (*node_ptr.as_ptr()).data.referenced = value;
-            }
-        }
-    }
-
-    /// Give the queue's front node a second chance: clear its reference bit and
-    /// move it to the back. Caller has already confirmed the queue is non-empty.
-    fn second_chance_head(&mut self, queue: QueueKind) {
-        let head_ptr = match queue {
-            QueueKind::Arrow => self.arrow.head(),
-            QueueKind::Liquid => self.liquid.head(),
-            QueueKind::Squeezed => self.squeezed.head(),
-            QueueKind::Disk => self.disk.head(),
-        };
-        if let Some(head_ptr) = head_ptr {
-            unsafe {
-                (*head_ptr.as_ptr()).data.referenced = false;
-                self.detach(head_ptr);
-                self.push_back(queue, head_ptr);
-            }
-        }
-    }
 }
 
 impl Drop for LiquidQueueInternalState {
@@ -167,7 +113,6 @@ impl Drop for LiquidQueueInternalState {
                 match node_ptr.as_ref().data.queue {
                     QueueKind::Arrow => self.arrow.unlink(node_ptr),
                     QueueKind::Liquid => self.liquid.unlink(node_ptr),
-                    QueueKind::Squeezed => self.squeezed.unlink(node_ptr),
                     QueueKind::Disk => self.disk.unlink(node_ptr),
                 }
                 drop_boxed_node(node_ptr);
@@ -177,7 +122,6 @@ impl Drop for LiquidQueueInternalState {
         unsafe {
             self.arrow.drop_all();
             self.liquid.drop_all();
-            self.squeezed.drop_all();
             self.disk.drop_all();
         }
     }
@@ -208,7 +152,6 @@ impl CachePolicy for LiquidPolicy {
         let target = match batch_type {
             CachedBatchType::MemoryArrow => QueueKind::Arrow,
             CachedBatchType::MemoryLiquid => QueueKind::Liquid,
-            CachedBatchType::MemorySqueezedLiquid => QueueKind::Squeezed,
             CachedBatchType::DiskLiquid | CachedBatchType::DiskArrow => QueueKind::Disk,
         };
 
@@ -223,29 +166,18 @@ impl CachePolicy for LiquidPolicy {
         let mut inner = self.inner.lock().unwrap();
         let mut victims = Vec::with_capacity(cnt);
 
-        // Evict decoded (Arrow) first, then Liquid, then Squeezed — cheapest to
-        // reconstruct first. Within each queue apply CLOCK/second-chance: a
-        // referenced entry is passed over once (bit cleared, moved to the back)
-        // before it can be evicted, so a reused batch outlives a read-once one.
-        // `chanced` bounds each entry to a single second chance, so the loop
-        // always terminates (at most one pass of reprieves, then eviction).
-        for queue in [QueueKind::Arrow, QueueKind::Liquid, QueueKind::Squeezed] {
-            let mut chanced: HashSet<EntryID> = HashSet::new();
-            while victims.len() < cnt {
-                let Some((entry_id, referenced)) = inner.head_info(queue) else {
-                    break;
-                };
-                if referenced && chanced.insert(entry_id) {
-                    inner.second_chance_head(queue);
-                } else {
-                    let popped = inner.pop_front(queue);
-                    debug_assert_eq!(popped, Some(entry_id));
-                    victims.push(entry_id);
-                }
+        while victims.len() < cnt {
+            if let Some(entry) = inner.pop_front(QueueKind::Arrow) {
+                victims.push(entry);
+                continue;
             }
-            if victims.len() >= cnt {
-                break;
+
+            if let Some(entry) = inner.pop_front(QueueKind::Liquid) {
+                victims.push(entry);
+                continue;
             }
+
+            break;
         }
 
         victims
@@ -269,24 +201,7 @@ impl CachePolicy for LiquidPolicy {
         victims
     }
 
-    fn notify_access(&self, entry_id: &EntryID, batch_type: CachedBatchType) {
-        // Only a memory-resident hit counts as reuse for CLOCK. A disk hit must
-        // not set the bit: the disk read path calls `notify_access` before
-        // hydration, and the subsequent Disk->Memory `notify_insert` preserves
-        // the bit — so a batch read once from disk would arrive in memory
-        // looking hot and could evict a genuinely reused memory batch during a
-        // large one-pass scan.
-        let is_memory = matches!(
-            batch_type,
-            CachedBatchType::MemoryArrow
-                | CachedBatchType::MemoryLiquid
-                | CachedBatchType::MemorySqueezedLiquid
-        );
-        if is_memory {
-            let mut inner = self.inner.lock().unwrap();
-            inner.set_referenced(entry_id, true);
-        }
-    }
+    fn notify_access(&self, _entry_id: &EntryID, _batch_type: CachedBatchType) {}
 
     fn notify_remove(&self, entry_id: &EntryID) {
         let mut inner = self.inner.lock().unwrap();
@@ -323,80 +238,18 @@ mod tests {
     }
 
     #[test]
-    fn test_accessed_entry_gets_second_chance() {
-        let policy = LiquidPolicy::new();
-        let a = entry(1);
-        let b = entry(2);
-        let c = entry(3);
-        policy.notify_insert(&a, CachedBatchType::MemoryArrow);
-        policy.notify_insert(&b, CachedBatchType::MemoryArrow);
-        policy.notify_insert(&c, CachedBatchType::MemoryArrow);
-
-        // `a` is reused, so it should be spared on the next victim search even
-        // though it was inserted first (plain FIFO would evict it).
-        policy.notify_access(&a, CachedBatchType::MemoryArrow);
-
-        assert_eq!(policy.find_memory_victim(1), vec![b]);
-        assert_eq!(policy.find_memory_victim(1), vec![c]);
-        // `a` survived the longest and is evicted last (its bit was cleared when
-        // it was passed over, so it gets no further reprieve).
-        assert_eq!(policy.find_memory_victim(1), vec![a]);
-    }
-
-    #[test]
-    fn test_disk_hit_does_not_protect_only_memory_hit_does() {
-        // A hit served from disk must NOT protect the entry — otherwise a
-        // one-pass disk-backed scan arrives hot on hydration and evicts the
-        // real working set. Only a memory hit grants a second chance.
-        let policy = LiquidPolicy::new();
-        let a = entry(1);
-        let b = entry(2);
-        let c = entry(3);
-        for id in [&a, &b, &c] {
-            policy.notify_insert(id, CachedBatchType::MemoryArrow);
-        }
-        policy.notify_access(&a, CachedBatchType::DiskArrow); // must not protect
-        policy.notify_access(&b, CachedBatchType::MemoryArrow); // protects
-
-        // `a` (disk hit) and `c` (untouched) evicted; `b` (memory hit) survives.
-        assert_eq!(policy.find_memory_victim(2), vec![a, c]);
-        assert_eq!(policy.find_memory_victim(1), vec![b]);
-    }
-
-    #[test]
-    fn test_read_once_entries_evicted_before_reused() {
-        // Simulates a large one-pass scan (read-once batches) alongside a single
-        // reused batch: the scan batches must all be evicted before the reused
-        // one, so the scan cannot displace the working set.
-        let policy = LiquidPolicy::new();
-        let ids: Vec<_> = (1..=5).map(entry).collect();
-        for id in &ids {
-            policy.notify_insert(id, CachedBatchType::MemoryArrow);
-        }
-        // ids[2] (entry 3) is reused.
-        policy.notify_access(&ids[2], CachedBatchType::MemoryArrow);
-
-        let victims = policy.find_memory_victim(4);
-        assert_eq!(victims, vec![ids[0], ids[1], ids[3], ids[4]]);
-        // The reused entry is the sole survivor.
-        assert_eq!(policy.find_memory_victim(4), vec![ids[2]]);
-    }
-
-    #[test]
     fn test_queue_priority_order() {
         let policy = LiquidPolicy::new();
 
         let arrow_entry = entry(1);
         let liquid_entry = entry(2);
-        let hybrid_entry = entry(3);
 
         policy.notify_insert(&liquid_entry, CachedBatchType::MemoryLiquid);
-        policy.notify_insert(&hybrid_entry, CachedBatchType::MemorySqueezedLiquid);
         policy.notify_insert(&arrow_entry, CachedBatchType::MemoryArrow);
 
         // Request more victims than available to ensure we only get what exists.
         let victims = policy.find_memory_victim(5);
-        assert_eq!(victims, vec![arrow_entry, liquid_entry, hybrid_entry]);
+        assert_eq!(victims, vec![arrow_entry, liquid_entry]);
     }
 
     #[test]

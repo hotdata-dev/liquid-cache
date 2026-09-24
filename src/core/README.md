@@ -1,6 +1,6 @@
 # liquid-cache
 
-Storage layer providing byte caching and liquid array data structures.
+Storage layer providing byte caching with a Vortex-backed encoded cache tier.
 
 This library provides one way to insert into the cache and three ways to read from it:
 - read as Arrow array
@@ -22,16 +22,16 @@ tokio_test::block_on(async {
 let storage = LiquidCacheBuilder::new().build().await;
 
 let entry_id = EntryID::from(42);
-// Names whose data this is. Entry ids are packed and can alias between
-// sources, so the cache compares this on every read and treats a mismatch as
-// a miss — a caller only ever reads back what it put in.
-let identity = 1;
 let arrow_array = Arc::new(UInt64Array::from_iter_values(0..1000));
 
 // Insert once; replacement/placement is handled by the cache policy
-storage.insert(entry_id, identity, arrow_array.clone()).await;
+// `0` is the file identity: the unnarrowed name of the source this data
+// belongs to. Cache keys pack their fields into fixed widths, so two sources
+// can compute one key; the identity is what keeps a read from being served
+// the other's data. One source here, so any constant will do.
+storage.insert(entry_id, 0, arrow_array.clone()).await;
 
-assert!(storage.is_cached(&entry_id, identity));
+assert!(storage.is_cached(&entry_id, 0));
 });
 ```
 
@@ -46,15 +46,14 @@ tokio_test::block_on(async {
 let storage = LiquidCacheBuilder::new().build().await;
 
 let entry_id = EntryID::from(7);
-let identity = 1;
 let arrow_array = Arc::new(UInt64Array::from_iter_values(0..16));
-storage.insert(entry_id, identity, arrow_array.clone()).await;
+storage.insert(entry_id, 0, arrow_array.clone()).await;
 
 // Move data to disk so the read will demonstrate async I/O
 storage.flush_all_to_disk().await;
 
 // Read asynchronously
-let retrieved = storage.get(&entry_id, identity).await.unwrap();
+let retrieved = storage.get(&entry_id, 0).await.unwrap();
 assert_eq!(retrieved.as_ref(), arrow_array.as_ref());
 });
 ```
@@ -76,11 +75,10 @@ tokio_test::block_on(async {
 let storage = LiquidCacheBuilder::new().build().await;
 
 let entry_id = EntryID::from(8);
-let identity = 1;
 let data = Arc::new(StringArray::from(vec![
     Some("apple"), Some("banana"), None, Some("apple"), Some("cherry"),
 ]));
-storage.insert(entry_id, identity, data.clone()).await;
+storage.insert(entry_id, 0, data.clone()).await;
 
 // Move data to disk so the read will demonstrate async I/O
 storage.flush_all_to_disk().await;
@@ -94,13 +92,12 @@ let expr: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
 let liquid_expr = liquid_cache::cache::LiquidExpr::try_new(
     expr,
     &DataType::Utf8,
-    Some(&liquid_cache::cache::CacheExpression::PredicateColumn),
 )
 .unwrap();
 
 // Read with predicate pushdown
 let mask = storage
-    .eval_predicate(&entry_id, identity, &liquid_expr)
+    .eval_predicate(&entry_id, 0, &liquid_expr)
     .with_selection(&selection)
     .await
     .unwrap();

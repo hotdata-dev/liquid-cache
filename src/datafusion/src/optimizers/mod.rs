@@ -1,6 +1,6 @@
 //! Optimizers for the Parquet module
 
-mod squeeze_hint;
+mod lineage;
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -26,13 +26,10 @@ use datafusion::{
     physical_plan::ExecutionPlan,
 };
 
-pub(crate) use squeeze_hint::HintAnalyzer;
-pub use squeeze_hint::SqueezeHintMap;
+pub(crate) use lineage::HintAnalyzer;
+pub use lineage::LineageHints;
 
-use crate::{
-    LiquidCacheParquetRef, LiquidParquetSource, cache::ColumnSqueezeHints,
-    reader::unevaluable_conjunct,
-};
+use crate::{LiquidCacheParquetRef, LiquidParquetSource, cache::ColumnLineages};
 
 /// Parameters for the footprint-based admission gate.
 ///
@@ -42,21 +39,14 @@ use crate::{
 /// from it).
 ///
 /// The threshold spans both cache tiers, weighted differently:
-/// `memory × tolerance + disk`. A scan that overflows
-/// RAM spills to the on-disk liquid tier rather than thrashing, so disk capacity
-/// counts toward what fits — at face value, since only the RAM tier has the
-/// measured compaction overcommit. With the disk tier off it is just
-/// `memory × tolerance`.
+/// `memory × tolerance + disk`. A scan that overflows RAM spills to the on-disk
+/// liquid tier rather than thrashing, so disk capacity counts toward what fits —
+/// at face value, since only the RAM tier has the measured compaction
+/// overcommit. With the disk tier off it is just `memory × tolerance`.
 ///
 /// The estimate multiplies the raw required parquet bytes by `expansion`
 /// (parquet -> liquid in-memory blow-up) and `safety` (extra margin); both are
 /// `>= 1.0` so the estimate is conservative (over-counts).
-///
-/// The budget assumes the bytes the cache counts are the bytes actually
-/// resident, which holds only under DIRECT I/O. Off Linux the store falls back
-/// to buffered I/O (see [`liquid_cache::store`]) and the kernel keeps an
-/// uncounted second copy, so real residency exceeds the figure this gate is
-/// measured against. Tune these knobs on Linux.
 #[derive(Debug, Clone, Copy)]
 pub struct AdmissionGate {
     /// Parquet-bytes -> liquid-in-memory-bytes multiplier (>= 1.0). Inflates the
@@ -82,11 +72,12 @@ pub struct AdmissionGate {
 /// Physical optimizer rule for local mode liquid cache.
 ///
 /// Rewrites `DataSourceExec` parquet scans to use [`LiquidParquetSource`], and
-/// in the same pass derives typed squeeze hints from the full physical plan
-/// (via the squeeze-hint analyzer) and attaches each scan's hints to its source.
+/// in the same pass derives typed lineage expressions from the full physical plan
+/// (via the lineage analyzer) and attaches each scan's hints to its source.
 #[derive(Debug)]
 pub struct LocalModeOptimizer {
     cache: LiquidCacheParquetRef,
+    prefetch: bool,
     /// When set, a scan whose estimated footprint exceeds the cache budget is
     /// left as a vanilla parquet read instead of being wrapped by LiquidCache.
     /// `None` means cache every scan.
@@ -98,16 +89,20 @@ impl LocalModeOptimizer {
     pub fn new(cache: LiquidCacheParquetRef) -> Self {
         Self {
             cache,
+            prefetch: true,
             admission: None,
         }
     }
 
     /// Create an optimizer with an existing cache instance
     pub fn with_cache(cache: LiquidCacheParquetRef) -> Self {
-        Self {
-            cache,
-            admission: None,
-        }
+        Self::new(cache)
+    }
+
+    /// Enable or disable row-group prefetching.
+    pub fn with_prefetch(mut self, prefetch: bool) -> Self {
+        self.prefetch = prefetch;
+        self
     }
 
     /// Enable the footprint-based admission gate. A parquet scan is cached only
@@ -154,6 +149,7 @@ impl PhysicalOptimizerRule for LocalModeOptimizer {
     ) -> Result<Arc<dyn ExecutionPlan>, datafusion::error::DataFusionError> {
         let analysis = HintAnalyzer::analyze(&plan);
         let cache = self.cache.clone();
+        let prefetch = self.prefetch;
         let admission = self.admission;
         // The gate sizes against both cache tiers, not just RAM: when a scan
         // overflows memory its entries spill to the on-disk liquid tier (NVMe)
@@ -164,7 +160,7 @@ impl PhysicalOptimizerRule for LocalModeOptimizer {
         // budget, so gate behaviour is unchanged there.
         let memory_budget = self.cache.max_memory_bytes() as u64;
         let disk_budget = self.cache.max_disk_bytes() as u64;
-        let mut convert = |node: &Arc<dyn ExecutionPlan>, hints: ColumnSqueezeHints| {
+        let mut convert = |node: &Arc<dyn ExecutionPlan>, hints: ColumnLineages| {
             // Leave scans whose estimated liquid footprint exceeds the budget as
             // vanilla parquet reads, so oversized scans don't thrash the cache.
             if let Some(gate) = admission
@@ -173,13 +169,9 @@ impl PhysicalOptimizerRule for LocalModeOptimizer {
             {
                 return None;
             }
-            convert_parquet_scan(node, &cache, hints)
+            convert_parquet_scan(node, &cache, hints, prefetch)
         };
-        Ok(squeeze_hint::rewrite_with_hints(
-            plan,
-            &mut convert,
-            &analysis,
-        ))
+        Ok(lineage::rewrite_with_hints(plan, &mut convert, &analysis))
     }
 
     fn name(&self) -> &str {
@@ -200,10 +192,10 @@ impl PhysicalOptimizerRule for LocalModeOptimizer {
 pub fn rewrite_data_source_plan_with_hints(
     plan: Arc<dyn ExecutionPlan>,
     cache: &LiquidCacheParquetRef,
-    hints: &ColumnSqueezeHints,
+    hints: &ColumnLineages,
 ) -> Arc<dyn ExecutionPlan> {
     plan.transform_up(
-        |node| match convert_parquet_scan(&node, cache, hints.clone()) {
+        |node| match convert_parquet_scan(&node, cache, hints.clone(), true) {
             Some(new_node) => Ok(Transformed::new(
                 new_node,
                 true,
@@ -216,12 +208,12 @@ pub fn rewrite_data_source_plan_with_hints(
     .data
 }
 
-/// Rewrite the data source plan to use liquid cache (no squeeze hints).
+/// Rewrite the data source plan to use liquid cache (no lineage expressions).
 pub fn rewrite_data_source_plan(
     plan: Arc<dyn ExecutionPlan>,
     cache: &LiquidCacheParquetRef,
 ) -> Arc<dyn ExecutionPlan> {
-    rewrite_data_source_plan_with_hints(plan, cache, &ColumnSqueezeHints::default())
+    rewrite_data_source_plan_with_hints(plan, cache, &ColumnLineages::default())
 }
 
 /// If `node` is a parquet `DataSourceExec`, return its `FileScanConfig` and
@@ -247,9 +239,8 @@ struct FootprintEstimate {
     partitioned_files: usize,
     /// Surviving files charged the *whole file* size because they lacked
     /// per-column byte sizes. A non-zero count means the catalog has no
-    /// `column_size_bytes` for this table, so the estimate is coarse and
-    /// over-counts — the signal that the DuckLake write-side size stat is
-    /// missing for this table.
+    /// per-column size stat for this table, so the estimate is coarse and
+    /// over-counts.
     fallback_files: usize,
 }
 
@@ -261,10 +252,9 @@ struct FootprintEstimate {
 ///
 /// "Required columns" is the output projection **unioned with the predicate
 /// columns**, since LiquidCache materializes both. Byte sizing uses `Exact` or
-/// `Inexact` per-column sizes (DuckLake records real column sizes but labels
-/// them `Inexact`); a column with an `Absent` size or a file with no stats
-/// falls back to the whole file size. The sum saturates rather than overflowing
-/// on pathological file lists.
+/// `Inexact` per-column sizes; a column with an `Absent` size or a file with no
+/// stats falls back to the whole file size. The sum saturates rather than
+/// overflowing on pathological file lists.
 fn estimate_required_bytes(cfg: &FileScanConfig, src: &ParquetSource) -> FootprintEstimate {
     let num_file_cols = cfg.file_schema().fields().len();
     // Full table schema (file + partition columns). The pushed-down predicate
@@ -274,9 +264,7 @@ fn estimate_required_bytes(cfg: &FileScanConfig, src: &ParquetSource) -> Footpri
 
     // Columns the scan projects. `column_indices()` collects the source columns
     // referenced by each projection expression, so it is correct for compound
-    // projections (e.g. `a * b` reads a and b) and — unlike the deprecated
-    // `FileScanConfig::file_column_projection_indices` /
-    // `ProjectionExprs::ordered_column_indices` — does not panic on a
+    // projections (e.g. `a * b` reads a and b) and does not panic on a
     // non-column projection expression. Indices are table-schema-relative; keep
     // only file columns (partition columns are literals, never materialized).
     let mut required: Vec<usize> = match src.projection() {
@@ -427,9 +415,8 @@ fn should_bypass(
 ///
 /// The gate is a pure performance optimization: caching a scan or reading it as
 /// vanilla parquet yields identical results. So if footprint estimation ever
-/// panics — e.g. a DataFusion API that panics on an unusual plan shape, the
-/// class of bug that `ordered_column_indices` was — a non-strict gate must not
-/// let it abort the query.
+/// panics — e.g. a DataFusion API that panics on an unusual plan shape — a
+/// non-strict gate must not let it abort the query.
 ///
 /// Either way the panic is caught and logged at ERROR with its message (never
 /// silently swallowed), and the log advises flipping the admission gate's
@@ -516,22 +503,20 @@ fn surviving_files(
 
 /// Bytes the `required` columns of one file contribute to the footprint.
 ///
-/// Uses per-column byte sizes that are either `Exact` or `Inexact`. DuckLake
-/// records the real compressed on-disk column size but always labels it
-/// `Inexact` (catalog stats can go stale after deletes/compaction), so
-/// rejecting `Inexact` would make the gate fall back to the whole-file size on
-/// *every* DuckLake scan — charging all columns for a single-column read and
-/// bypassing everything. `Inexact` is a real measurement, not a guess; the
-/// caller's `expansion`/`safety` margin absorbs modest drift, and even a large
-/// stale-low under-count only risks a too-eager admit (perf), never wrong
-/// results.
+/// Uses per-column byte sizes that are either `Exact` or `Inexact`. A catalog
+/// may record the real compressed on-disk column size and still label it
+/// `Inexact` (stats can go stale after deletes/compaction), so rejecting
+/// `Inexact` would make the gate fall back to the whole-file size on every such
+/// scan — charging all columns for a single-column read and bypassing
+/// everything. `Inexact` is a real measurement, not a guess; the caller's
+/// `expansion`/`safety` margin absorbs modest drift, and even a large stale-low
+/// under-count only risks a too-eager admit (perf), never wrong results.
 ///
 /// If the file has no stats, or any required column's size is `Absent`, fall
 /// back to the whole-file size — a deliberate over-estimate.
 ///
 /// Returns `(bytes, fell_back)`, where `fell_back` is `true` when the whole-file
-/// over-estimate was used (surfaced in the decision log as the "no per-column
-/// sizes in the catalog" signal).
+/// over-estimate was used.
 fn file_required_bytes(
     stats: Option<&Statistics>,
     object_size: u64,
@@ -561,12 +546,12 @@ fn file_required_bytes(
 /// to stay on `ParquetSource`, which derives virtual columns from the parquet
 /// reader.
 ///
-/// Declining a scan costs it the cache, so this stays as narrow as the row
-/// filter's own refusal: a virtual column the scan actually reads, not the mere
-/// presence of one on the table. A provider that declares a row-position column on
-/// every table keeps the cache for the queries that never project it. No
-/// projection at all is the one broad case, and it is not a guess — the scan then
-/// reads the whole table schema, virtual columns included.
+/// Declining a scan costs it the cache, so this stays narrow: a virtual column the
+/// scan actually reads, not the mere presence of one on the table. A provider that
+/// declares a row-position column on every table keeps the cache for the queries
+/// that never project one. No projection at all is the one broad case, and it is
+/// not a guess — the scan then reads the whole table schema, virtual columns
+/// included.
 ///
 /// Positional reads are what reaches here: applying positional deletes, and row
 /// lineage, both project a reader-produced physical row position, which is an
@@ -593,7 +578,7 @@ fn unproducible_virtual_columns(
                 .map(|column| column.name().to_string())
                 .collect();
             // The pushed-down predicate is rewritten against the file schemas in
-            // the opener too, so a conjunct over a virtual column fails exactly as
+            // the reader too, so a conjunct over a virtual column fails exactly as
             // a projection over one does. The row filter's own check cannot catch
             // it: that resolves against the table schema, which does hold the
             // virtual columns.
@@ -621,69 +606,15 @@ fn unproducible_virtual_columns(
 
 /// If `node` is a `DataSourceExec` over a `ParquetSource`, return an equivalent
 /// node backed by [`LiquidParquetSource`] carrying `hints`.
-///
-/// Returns `None` — leaving the scan a vanilla parquet read — when the pushed-down
-/// predicate holds a conjunct the liquid row filter cannot evaluate. By the time
-/// this rule runs, DataFusion has already removed the `FilterExec` on the
-/// strength of `ParquetSource` accepting the whole predicate (both entry points
-/// force `execution.parquet.pushdown_filters`, so that removal always happens),
-/// and the scan is the only place the predicate is applied. The liquid row filter
-/// is stricter than DataFusion's own — it refuses nested columns, which upstream
-/// handles — and it used to drop what it could not evaluate, running the scan
-/// with a strictly weaker filter than the query asked for (issues #21, #23).
-/// Declining the scan hands the predicate back to the reader that planned it,
-/// which applies all of it.
-///
-/// Two things this is not, and why:
-///
-/// - **Not `FileSource::try_pushdown_filters`.** Declining per conjunct there is
-///   how DataFusion expects a source to say no, and it would keep the cache *and*
-///   leave a real `FilterExec`. It needs this rewrite to run before the
-///   `FilterPushdown` rule, and this rule cannot move: the admission gate sizes a
-///   scan from the pushed-down projection and predicate, neither of which exists
-///   that early, and the squeeze-hint analyzer reads the optimized plan. Splitting
-///   conversion from gating would fix local mode — but not the server, which
-///   receives a fragment whose `FilterExec` the *client* already removed. The
-///   server has no pushdown negotiation to join, so this gate is needed either way.
-/// - **Not teaching the row filter about nested columns.** Upstream evaluates
-///   `st.a = 3` by building a leaf-level `ProjectionMask` from struct field paths.
-///   Liquid masks by root (`ProjectionMask::roots`) and `get_predicate_column_id`
-///   reads the mask's leaf bits back as cache column ids, so a struct root — one
-///   column, several leaves — would address several cache entries. Lifting that
-///   means changing the cache's column-id model, well past a correctness fix.
 fn convert_parquet_scan(
     node: &Arc<dyn ExecutionPlan>,
     cache: &LiquidCacheParquetRef,
-    hints: ColumnSqueezeHints,
+    hints: ColumnLineages,
+    prefetch: bool,
 ) -> Option<Arc<dyn ExecutionPlan>> {
     let data_source_exec = node.downcast_ref::<DataSourceExec>()?;
     let (file_scan_config, parquet_source) =
         data_source_exec.downcast_to_file_source::<ParquetSource>()?;
-
-    if let Some(predicate) = parquet_source.filter() {
-        // Checked against the table schema, which is what the row filter
-        // effectively sees: the opener's physical-expr adapter resolves partition
-        // columns and columns missing from an individual file to literals before
-        // the filter is built. See `unevaluable_conjunct`.
-        let table_schema = parquet_source.table_schema().table_schema();
-        // At `info`, like the admission gate's BYPASS line: this silently turns
-        // the cache off for a scan, and the only symptom is that queries stop
-        // getting faster.
-        match unevaluable_conjunct(&predicate, table_schema) {
-            Ok(Some(conjunct)) => {
-                log::info!(
-                    "liquid_cache scan BYPASS: the row filter cannot evaluate `{conjunct}`, \
-                     a conjunct of the pushed-down predicate `{predicate}`"
-                );
-                return None;
-            }
-            Ok(None) => {}
-            Err(e) => {
-                log::info!("liquid_cache scan BYPASS: `{predicate}` could not be checked: {e}");
-                return None;
-            }
-        }
-    }
 
     let pushed_filter = parquet_source.filter();
     if let Some(names) = unproducible_virtual_columns(
@@ -691,6 +622,9 @@ fn convert_parquet_scan(
         parquet_source.projection(),
         pushed_filter.as_ref(),
     ) {
+        // At info, like the admission gate's BYPASS line: this silently turns the
+        // cache off for a scan, and the only symptom is that queries stop getting
+        // faster.
         log::info!(
             "liquid_cache scan BYPASS: the read path cannot produce virtual column(s) `{names}`"
         );
@@ -699,7 +633,8 @@ fn convert_parquet_scan(
 
     let new_source =
         LiquidParquetSource::from_parquet_source(parquet_source.clone(), cache.clone())
-            .with_squeeze_hints(Arc::new(hints));
+            .with_lineages(Arc::new(hints))
+            .with_prefetch(prefetch);
 
     let mut new_config = file_scan_config.clone();
     new_config.file_source = Arc::new(new_source);
@@ -709,15 +644,92 @@ fn convert_parquet_scan(
 
 #[cfg(test)]
 mod tests {
-    use datafusion::{datasource::physical_plan::FileScanConfig, prelude::SessionContext};
+    use std::{fs::File, path::Path};
+
+    use arrow::{array::Int32Array, record_batch::RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
+    use datafusion::{
+        common::{ScalarValue, stats::Precision},
+        datasource::physical_plan::{FileScanConfig, FileSource},
+        logical_expr::Operator,
+        physical_expr::expressions::{BinaryExpr, Column, Literal},
+        physical_plan::{
+            PhysicalExpr, collect, display::DisplayableExecutionPlan, filter_pushdown::PushedDown,
+        },
+        prelude::SessionContext,
+    };
     use liquid_cache::{
-        cache::{AlwaysHydrate, squeeze_policies::TranscodeSqueezeEvict},
+        cache::{AlwaysHydrate, TranscodeEvict},
         cache_policies::LiquidPolicy,
     };
+    use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
 
     use crate::LiquidCacheParquet;
 
     use super::*;
+
+    async fn make_cache(path: &Path) -> LiquidCacheParquetRef {
+        make_cache_with_mem_disk(path, 1000000, usize::MAX).await
+    }
+
+    /// The admission gate reads both tier budgets off the cache, so its tests
+    /// need them set independently rather than via [`make_cache`]'s defaults.
+    async fn make_cache_with_mem_disk(
+        path: &Path,
+        max_memory_bytes: usize,
+        max_disk_bytes: usize,
+    ) -> LiquidCacheParquetRef {
+        let store = t4::mount(path.join("liquid_cache.t4")).await.unwrap();
+        Arc::new(
+            LiquidCacheParquet::new(
+                8192,
+                max_memory_bytes,
+                max_disk_bytes,
+                store,
+                Box::new(LiquidPolicy::new()),
+                Box::new(TranscodeEvict),
+                Box::new(AlwaysHydrate::new()),
+            )
+            .await,
+        )
+    }
+
+    /// True if any parquet scan in `plan` was rewritten to `LiquidParquetSource`.
+    fn has_liquid_source(plan: &Arc<dyn ExecutionPlan>) -> bool {
+        let mut found = false;
+        plan.apply(|node| {
+            if let Some(exec) = node.downcast_ref::<DataSourceExec>()
+                && let Some(cfg) = exec.data_source().downcast_ref::<FileScanConfig>()
+                && cfg
+                    .file_source()
+                    .downcast_ref::<LiquidParquetSource>()
+                    .is_some()
+            {
+                found = true;
+                return Ok(TreeNodeRecursion::Stop);
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })
+        .unwrap();
+        found
+    }
+
+    async fn nano_hits_plan() -> Arc<dyn ExecutionPlan> {
+        let ctx = SessionContext::new();
+        ctx.register_parquet(
+            "nano_hits",
+            "../../examples/nano_hits.parquet",
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        ctx.sql("SELECT * FROM nano_hits WHERE \"URL\" like 'https://%' limit 10")
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap()
+    }
 
     /// Declining a scan costs it the cache, so the guard must key on what the scan
     /// reads, not on what the table declares. A row-position column present on the
@@ -725,12 +737,11 @@ mod tests {
     /// reads the whole table schema and does not.
     #[test]
     fn only_a_virtual_column_the_scan_reads_costs_the_cache() {
-        use arrow_schema::{DataType, Field, Fields};
-        use datafusion::logical_expr::Operator;
+        use arrow_schema::Fields;
         use datafusion::physical_expr::expressions::{BinaryExpr, col, lit};
         use datafusion::physical_expr::projection::ProjectionExpr;
 
-        let file_schema = Arc::new(arrow_schema::Schema::new(vec![
+        let file_schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("val", DataType::Int64, true),
         ]));
@@ -769,7 +780,7 @@ mod tests {
             Some("__ducklake_row_pos")
         );
 
-        // Read only by the pushed-down predicate: refused too. The opener rewrites
+        // Read only by the pushed-down predicate: refused too. The reader rewrites
         // the predicate against the file schemas as well, and the row filter's own
         // check passes it because that resolves against the table schema.
         let pos_predicate: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
@@ -784,20 +795,16 @@ mod tests {
         );
     }
 
-    /// The guard has to hold at the call site, not only in the helper, so that
-    /// removing the bypass from `convert_parquet_scan` fails a test rather than
-    /// silently restoring the broken plan.
+    /// The guard at its call site, with an ordinary scan as a positive control, so
+    /// deleting it from `convert_parquet_scan` fails a test instead of silently
+    /// restoring a plan that cannot execute.
     #[tokio::test]
     async fn a_scan_reading_a_virtual_column_stays_on_parquet_source() {
-        use arrow_schema::{DataType, Field, Fields};
+        use arrow_schema::Fields;
         use datafusion::datasource::physical_plan::FileScanConfigBuilder;
         use datafusion::execution::object_store::ObjectStoreUrl;
 
-        let file_schema = Arc::new(arrow_schema::Schema::new(vec![Field::new(
-            "id",
-            DataType::Int64,
-            false,
-        )]));
+        let file_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
 
         let scan = |table_schema: TableSchema| -> Arc<dyn ExecutionPlan> {
             let source = Arc::new(ParquetSource::new(table_schema)) as Arc<dyn FileSource>;
@@ -807,12 +814,13 @@ mod tests {
             Arc::new(DataSourceExec::new(Arc::new(config)))
         };
 
-        let cache = build_cache().await;
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let cache = make_cache(tmp_dir.path()).await;
 
         // Positive control: an ordinary scan is still handed to the cache.
         let plain = scan(TableSchema::builder(Arc::clone(&file_schema)).build());
         assert!(
-            convert_parquet_scan(&plain, &cache, ColumnSqueezeHints::default()).is_some(),
+            convert_parquet_scan(&plain, &cache, ColumnLineages::default(), true).is_some(),
             "an ordinary scan must still convert to the liquid source"
         );
 
@@ -828,69 +836,99 @@ mod tests {
                 .build(),
         );
         assert!(
-            convert_parquet_scan(&positional, &cache, ColumnSqueezeHints::default()).is_none(),
+            convert_parquet_scan(&positional, &cache, ColumnLineages::default(), true).is_none(),
             "a scan reading a virtual column must stay on ParquetSource"
         );
     }
 
-    async fn rewrite_plan_inner(plan: Arc<dyn ExecutionPlan>) {
-        let expected_schema = plan.schema();
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let store = crate::test_utils::mount_test_store(tmp_dir.path()).await;
-        let liquid_cache = Arc::new(
-            LiquidCacheParquet::new(
-                8192,
-                1000000,
-                usize::MAX,
-                store,
-                Box::new(LiquidPolicy::new()),
-                Box::new(TranscodeSqueezeEvict),
-                Box::new(AlwaysHydrate::new()),
-            )
-            .await,
-        );
-        let rewritten = rewrite_data_source_plan(plan, &liquid_cache);
+    /// The admission gate bypasses a scan whose estimated footprint exceeds the
+    /// budget (large expansion here forces that), and caches one that fits.
+    #[tokio::test]
+    async fn admission_gate_bypasses_an_oversized_scan() {
+        let plan = nano_hits_plan().await;
+        let config = ConfigOptions::default();
+        let capped_dir = tempfile::tempdir().unwrap();
+        let uncapped_dir = tempfile::tempdir().unwrap();
 
-        rewritten
-            .apply(|node| {
-                if let Some(plan) = node.downcast_ref::<DataSourceExec>() {
-                    let data_source = plan.data_source();
-                    let source = data_source.downcast_ref::<FileScanConfig>().unwrap();
-                    let file_source = source.file_source();
-                    let _parquet_source =
-                        file_source.downcast_ref::<LiquidParquetSource>().unwrap();
-                    let schema = source.file_schema().as_ref();
-                    assert_eq!(schema, expected_schema.as_ref());
-                }
-                Ok(TreeNodeRecursion::Continue)
-            })
-            .unwrap();
+        // A huge expansion inflates the estimate past the 1 MB budget → bypass.
+        let capped = LocalModeOptimizer::new(
+            make_cache_with_mem_disk(capped_dir.path(), 1_000_000, 0).await,
+        )
+        .with_admission_gate(1e9, 1.0, 1.0, false)
+        .optimize(plan.clone(), &config)
+        .unwrap();
+        assert!(
+            !has_liquid_source(&capped),
+            "oversized estimate should stay a plain ParquetSource"
+        );
+
+        // With a large budget the footprint fits (expansion 1.0) → cached.
+        let uncapped = LocalModeOptimizer::new(
+            make_cache_with_mem_disk(uncapped_dir.path(), usize::MAX, 0).await,
+        )
+        .with_admission_gate(1.0, 1.0, 1.0, false)
+        .optimize(plan, &config)
+        .unwrap();
+        assert!(
+            has_liquid_source(&uncapped),
+            "fitting scan should be wrapped in LiquidParquetSource"
+        );
     }
 
-    /// Regression: a `get_field` on a struct column is pushed into the scan
-    /// projection as a non-`Column` expression (via
-    /// `enable_leaf_expression_pushdown`). The footprint gate must estimate such
-    /// a scan without panicking (the old code called the deprecated
-    /// `ordered_column_indices`, which `.expect`s a bare column and killed the
-    /// query). Runs everywhere: it builds a physical plan and calls the estimate
-    /// directly, so it needs no cache / t4 mount.
+    /// The budget counts the on-disk liquid tier, not just memory: the same scan
+    /// that a memory-only budget bypasses is admitted once the disk tier has room
+    /// for it (evicted entries spill to disk instead of thrashing).
+    #[tokio::test]
+    async fn admission_gate_counts_the_disk_tier() {
+        let plan = nano_hits_plan().await;
+        let config = ConfigOptions::default();
+        let mem_only_dir = tempfile::tempdir().unwrap();
+        let with_disk_dir = tempfile::tempdir().unwrap();
+
+        // A huge expansion inflates the estimate past the 1 MB memory budget, and
+        // with no disk tier there is nowhere else for it to fit → bypass.
+        let mem_only = LocalModeOptimizer::new(
+            make_cache_with_mem_disk(mem_only_dir.path(), 1_000_000, 0).await,
+        )
+        .with_admission_gate(1e9, 1.0, 1.0, false)
+        .optimize(plan.clone(), &config)
+        .unwrap();
+        assert!(
+            !has_liquid_source(&mem_only),
+            "with a memory-only budget the oversized estimate should bypass"
+        );
+
+        // Same 1 MB memory and same estimate, but now a large disk tier — the
+        // threshold is memory × tolerance + disk, so the scan fits and is cached.
+        let with_disk = LocalModeOptimizer::new(
+            make_cache_with_mem_disk(with_disk_dir.path(), 1_000_000, usize::MAX).await,
+        )
+        .with_admission_gate(1e9, 1.0, 1.0, false)
+        .optimize(plan, &config)
+        .unwrap();
+        assert!(
+            has_liquid_source(&with_disk),
+            "the disk tier's capacity should count toward the budget and admit the scan"
+        );
+    }
+
+    /// A scan projection can hold a non-column expression (`SELECT s.a` pushes a
+    /// struct field access into the scan). The estimator must read it without
+    /// panicking — the class of bug that made the gate's panic guard necessary.
     #[tokio::test]
     async fn estimate_survives_non_column_scan_projection() {
-        use arrow::array::{ArrayRef, Int64Array, RecordBatch, StructArray};
-        use arrow_schema::{DataType, Field, Fields};
-        use datafusion::physical_expr::expressions::Column;
-        use parquet::arrow::ArrowWriter;
+        use arrow::array::{ArrayRef, Int64Array, StructArray};
+        use arrow_schema::Fields;
 
-        // A struct column `s {a, b}` plus a flat column `p`.
         let struct_fields = Fields::from(vec![
             Field::new("a", DataType::Int64, false),
             Field::new("b", DataType::Int64, false),
         ]);
-        let schema = Arc::new(arrow_schema::Schema::new(vec![
+        let schema = Arc::new(Schema::new(vec![
             Field::new("s", DataType::Struct(struct_fields.clone()), false),
             Field::new("p", DataType::Int64, false),
         ]));
-        let s = StructArray::new(
+        let struct_array = StructArray::new(
             struct_fields,
             vec![
                 Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
@@ -901,7 +939,7 @@ mod tests {
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(s) as ArrayRef,
+                Arc::new(struct_array) as ArrayRef,
                 Arc::new(Int64Array::from(vec![7, 8, 9])),
             ],
         )
@@ -909,8 +947,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("structs.parquet");
-        let file = std::fs::File::create(&path).unwrap();
-        let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+        let mut writer = ArrowWriter::try_new(File::create(&path).unwrap(), schema, None).unwrap();
         writer.write(&batch).unwrap();
         writer.close().unwrap();
 
@@ -951,8 +988,50 @@ mod tests {
         // The call that used to panic. It must return a finite estimate; `s`
         // (the struct column read by `s.a`) is the one required file column.
         let est = estimate_required_bytes(&cfg, &src);
-        // Whole-file fallback (no per-column Exact stats here) → non-zero, finite.
         assert!(est.raw_bytes > 0, "estimate should be a real byte count");
+    }
+
+    fn liquid_source(plan: &Arc<dyn ExecutionPlan>) -> LiquidParquetSource {
+        let mut source = None;
+        plan.apply(|node| {
+            if let Some(plan) = node.downcast_ref::<DataSourceExec>() {
+                let config = plan.data_source().downcast_ref::<FileScanConfig>().unwrap();
+                source = Some(
+                    config
+                        .file_source()
+                        .downcast_ref::<LiquidParquetSource>()
+                        .unwrap()
+                        .clone(),
+                );
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })
+        .unwrap();
+        source.unwrap()
+    }
+
+    async fn rewrite_plan_inner(plan: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+        let expected_schema = plan.schema();
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let liquid_cache = make_cache(tmp_dir.path()).await;
+        let rewritten = rewrite_data_source_plan(plan, &liquid_cache);
+
+        rewritten
+            .apply(|node| {
+                if let Some(plan) = node.downcast_ref::<DataSourceExec>() {
+                    let data_source = plan.data_source();
+                    let source = data_source.downcast_ref::<FileScanConfig>().unwrap();
+                    let file_source = source.file_source();
+                    let _parquet_source =
+                        file_source.downcast_ref::<LiquidParquetSource>().unwrap();
+                    let schema = source.file_schema().as_ref();
+                    assert_eq!(schema, expected_schema.as_ref());
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+            .unwrap();
+
+        rewritten
     }
 
     #[tokio::test]
@@ -970,143 +1049,116 @@ mod tests {
             .await
             .unwrap();
         let plan = df.create_physical_plan().await.unwrap();
-        rewrite_plan_inner(plan.clone()).await;
-    }
+        let rewritten = rewrite_plan_inner(plan).await;
 
-    async fn build_cache() -> LiquidCacheParquetRef {
-        build_cache_with_budget(1_000_000).await
-    }
+        let displayed = DisplayableExecutionPlan::new(rewritten.as_ref())
+            .indent(true)
+            .to_string();
+        assert!(displayed.contains("predicate="), "{displayed}");
 
-    async fn build_cache_with_budget(max_memory_bytes: usize) -> LiquidCacheParquetRef {
-        build_cache_with_mem_disk(max_memory_bytes, 0).await
-    }
+        rewritten
+            .apply(|node| {
+                if let Some(plan) = node.downcast_ref::<DataSourceExec>() {
+                    let statistics = plan.data_source().partition_statistics(None)?;
+                    assert!(!matches!(statistics.num_rows, Precision::Exact(_)));
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+            .unwrap();
 
-    async fn build_cache_with_mem_disk(
-        max_memory_bytes: usize,
-        max_disk_bytes: usize,
-    ) -> LiquidCacheParquetRef {
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let store = crate::test_utils::mount_test_store(tmp_dir.path()).await;
-        Arc::new(
-            LiquidCacheParquet::new(
-                8192,
-                max_memory_bytes,
-                max_disk_bytes,
-                store,
-                Box::new(LiquidPolicy::new()),
-                Box::new(TranscodeSqueezeEvict),
-                Box::new(AlwaysHydrate::new()),
+        // Supported filters are conjoined onto the predicate; unsupported ones
+        // are handed back to the parent.
+        let source = liquid_source(&rewritten);
+        let url_index = source.table_schema().file_schema().index_of("URL").unwrap();
+        let supported: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("URL", url_index)),
+            Operator::Eq,
+            Arc::new(Literal::new(ScalarValue::Utf8(Some(
+                "https://example.com".into(),
+            )))),
+        ));
+        let unsupported: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("missing", 0)),
+            Operator::Eq,
+            Arc::new(Literal::new(ScalarValue::Utf8(Some("value".into())))),
+        ));
+        let result = source
+            .try_pushdown_filters(
+                vec![supported, unsupported],
+                &datafusion::config::ConfigOptions::new(),
             )
-            .await,
-        )
+            .unwrap();
+        assert!(matches!(
+            result.filters.as_slice(),
+            [PushedDown::Yes, PushedDown::No]
+        ));
+        let predicate = result.updated_node.unwrap().filter().unwrap().to_string();
+        assert!(predicate.contains(" AND "), "{predicate}");
+        assert!(predicate.contains("https://example.com"), "{predicate}");
+        assert!(!predicate.contains("missing"), "{predicate}");
     }
 
-    /// True if any parquet scan in `plan` was rewritten to `LiquidParquetSource`.
-    fn has_liquid_source(plan: &Arc<dyn ExecutionPlan>) -> bool {
-        let mut found = false;
-        plan.apply(|node| {
-            if let Some(exec) = node.downcast_ref::<DataSourceExec>()
-                && let Some(cfg) = exec.data_source().downcast_ref::<FileScanConfig>()
-                && cfg
-                    .file_source()
-                    .downcast_ref::<LiquidParquetSource>()
-                    .is_some()
-            {
-                found = true;
-                return Ok(TreeNodeRecursion::Stop);
-            }
-            Ok(TreeNodeRecursion::Continue)
-        })
-        .unwrap();
-        found
-    }
-
-    /// The admission gate bypasses a scan whose estimated footprint exceeds the
-    /// budget (large expansion here forces that), and caches one that fits.
-    #[tokio::test]
-    async fn test_admission_gate_pass_through() {
-        let ctx = SessionContext::new();
-        ctx.register_parquet(
-            "nano_hits",
-            "../../examples/nano_hits.parquet",
-            Default::default(),
+    fn write_bloom_file(path: &Path) {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let properties = WriterProperties::builder()
+            .set_bloom_filter_enabled(true)
+            .build();
+        let mut writer = ArrowWriter::try_new(
+            File::create(path).unwrap(),
+            schema.clone(),
+            Some(properties),
         )
-        .await
         .unwrap();
-        let plan = ctx
-            .sql("SELECT * FROM nano_hits WHERE \"URL\" like 'https://%' limit 10")
-            .await
-            .unwrap()
-            .create_physical_plan()
-            .await
-            .unwrap();
-        let config = ConfigOptions::default();
-
-        // A huge expansion inflates the estimate past the 1 MB budget → bypass.
-        let capped = LocalModeOptimizer::new(build_cache().await)
-            .with_admission_gate(1e9, 1.0, 1.0, false)
-            .optimize(plan.clone(), &config)
-            .unwrap();
-        assert!(
-            !has_liquid_source(&capped),
-            "oversized estimate should stay a plain ParquetSource"
-        );
-
-        // With a large budget the footprint fits (expansion 1.0) → cached.
-        let uncapped = LocalModeOptimizer::new(build_cache_with_budget(usize::MAX).await)
-            .with_admission_gate(1.0, 1.0, 1.0, false)
-            .optimize(plan, &config)
-            .unwrap();
-        assert!(
-            has_liquid_source(&uncapped),
-            "fitting scan should be wrapped in LiquidParquetSource"
-        );
-    }
-
-    /// The budget counts the on-disk liquid tier, not just memory: the same scan
-    /// that a memory-only budget bypasses is admitted once the disk tier has room
-    /// for it (evicted entries spill to disk instead of thrashing).
-    #[tokio::test]
-    async fn test_admission_gate_counts_disk_tier() {
-        let ctx = SessionContext::new();
-        ctx.register_parquet(
-            "nano_hits",
-            "../../examples/nano_hits.parquet",
-            Default::default(),
-        )
-        .await
-        .unwrap();
-        let plan = ctx
-            .sql("SELECT * FROM nano_hits WHERE \"URL\" like 'https://%' limit 10")
-            .await
-            .unwrap()
-            .create_physical_plan()
-            .await
-            .unwrap();
-        let config = ConfigOptions::default();
-
-        // A huge expansion inflates the estimate past the 1 MB memory budget, and
-        // with no disk tier there is nowhere else for it to fit → bypass.
-        let mem_only = LocalModeOptimizer::new(build_cache_with_mem_disk(1_000_000, 0).await)
-            .with_admission_gate(1e9, 1.0, 1.0, false)
-            .optimize(plan.clone(), &config)
-            .unwrap();
-        assert!(
-            !has_liquid_source(&mem_only),
-            "with a memory-only budget the oversized estimate should bypass"
-        );
-
-        // Same 1 MB memory and same estimate, but now a large disk tier — the
-        // budget is memory + disk, so the scan fits and is cached.
-        let with_disk =
-            LocalModeOptimizer::new(build_cache_with_mem_disk(1_000_000, usize::MAX).await)
-                .with_admission_gate(1e9, 1.0, 1.0, false)
-                .optimize(plan, &config)
+        for values in [[1, 2, 4], [1, 3, 4]] {
+            writer
+                .write(
+                    &RecordBatch::try_new(
+                        schema.clone(),
+                        vec![Arc::new(Int32Array::from(values.to_vec()))],
+                    )
+                    .unwrap(),
+                )
                 .unwrap();
-        assert!(
-            has_liquid_source(&with_disk),
-            "the disk tier's capacity should count toward the budget and admit the scan"
-        );
+            writer.flush().unwrap();
+        }
+        writer.close().unwrap();
+    }
+
+    #[tokio::test]
+    async fn prunes_row_group_with_bloom_filter() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let parquet_path = tmp_dir.path().join("bloom.parquet");
+        write_bloom_file(&parquet_path);
+
+        let ctx = SessionContext::new();
+        ctx.register_parquet("t", parquet_path.to_str().unwrap(), Default::default())
+            .await
+            .unwrap();
+        let plan = ctx
+            .sql("SELECT * FROM t WHERE a = 2")
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let cache = make_cache(tmp_dir.path()).await;
+        let rewritten = rewrite_data_source_plan(plan, &cache);
+        let metrics = liquid_source(&rewritten).metrics().clone();
+
+        let batches = collect(rewritten, ctx.task_ctx()).await.unwrap();
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+
+        let metric = metrics
+            .clone_inner()
+            .sum_by_name("row_groups_pruned_bloom_filter")
+            .unwrap();
+        let datafusion::physical_plan::metrics::MetricValue::PruningMetrics {
+            pruning_metrics, ..
+        } = metric
+        else {
+            panic!("unexpected metric: {metric:?}");
+        };
+        assert_eq!(pruning_metrics.pruned(), 1);
     }
 }
 
@@ -1156,7 +1208,8 @@ mod footprint_tests {
             col(Precision::Inexact(200)),
         ]);
         // Inexact is a real (possibly-stale) size, so it counts (no fallback).
-        // DuckLake always labels byte_size Inexact; rejecting it would bypass all.
+        // A catalog that always labels byte_size Inexact would otherwise make
+        // every scan fall back to the whole file and bypass the cache.
         assert_eq!(file_required_bytes(Some(&s), 7000, &[0, 1]), (300, false));
         assert_eq!(file_required_bytes(Some(&s), 7000, &[1]), (200, false));
     }
@@ -1192,7 +1245,7 @@ mod footprint_tests {
 }
 
 /// Pure unit tests for the admission threshold arithmetic (no cache / no t4
-/// mount, so they run everywhere — including where `direct_io` is unavailable).
+/// mount, so they run everywhere).
 #[cfg(test)]
 mod threshold_tests {
     use super::admission_threshold;

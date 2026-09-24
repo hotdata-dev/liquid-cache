@@ -5,12 +5,14 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use arrow_schema::{ArrowError, Field, Schema};
-use liquid_cache::cache::{CacheExpression, CacheFull, LiquidCache, LiquidExpr};
+use liquid_cache::cache::{
+    CacheEntry, CacheExpression, CacheFull, LiquidCache, LiquidExpr, PrefetchResult,
+};
 use parquet::arrow::arrow_reader::ArrowPredicate;
 
 use crate::{
     LiquidPredicate,
-    cache::{BatchID, ColumnAccessPath, ParquetArrayID, file_id::FileId},
+    cache::{BatchID, ColumnAccessPath, ParquetArrayID, RowGroupSnapshots},
 };
 use std::sync::Arc;
 
@@ -18,18 +20,14 @@ use std::sync::Arc;
 #[derive(Debug)]
 pub struct CachedColumn {
     cache_store: Arc<LiquidCache>,
+    /// The lease its keys are built from. Held so the id cannot be recycled
+    /// while this column can still compute keys from it; `identity()` is what
+    /// every cache read and write is checked against.
+    file_id: Arc<crate::cache::file_id::FileId>,
     field: Arc<Field>,
     column_path: ColumnAccessPath,
-    /// The file id before it is narrowed into `column_path`. Two files whose
-    /// ids differ only in the bits `ColumnAccessPath` drops share every
-    /// `EntryID` this column computes; the cache compares this value to tell
-    /// them apart and treat the other file's data as a miss.
-    ///
-    /// Held as a lease rather than copied: a row group outlives the
-    /// `CachedFile` it came from, and the id must stay allocated for as long
-    /// as anything can still compute a key from it.
-    file_id: Arc<FileId>,
     expression: Option<Arc<CacheExpression>>,
+    snapshots: Arc<RowGroupSnapshots>,
 }
 
 /// A reference to a cached column.
@@ -44,6 +42,12 @@ pub enum InsertArrowArrayError {
     CacheFull,
 }
 
+pub(crate) enum PrefetchOutcome {
+    Snapshotted,
+    AlreadySnapshotted,
+    Missing,
+}
+
 impl From<CacheFull> for InsertArrowArrayError {
     fn from(_: CacheFull) -> Self {
         Self::CacheFull
@@ -54,49 +58,56 @@ impl CachedColumn {
     pub(crate) fn new(
         field: Arc<Field>,
         cache_store: Arc<LiquidCache>,
+        file_id: Arc<crate::cache::file_id::FileId>,
         column_access_path: ColumnAccessPath,
-        file_id: Arc<FileId>,
         expression: Option<Arc<CacheExpression>>,
         is_predicate_column: bool,
+        snapshots: Arc<RowGroupSnapshots>,
     ) -> Self {
-        // Register the column's squeeze hint. Squeeze hints are column-scoped;
+        // Register the column's lineage expression. Lineage expressions are column-scoped;
         // `ParquetCacheMetadata` keys them by column (the batch id is masked
         // off), so registering once on any batch covers every batch.
         //
         // The read-path `expression` is the typed lineage hint derived from the
         // plan (date/variant/substring). A pure predicate column carries no such
-        // hint, but still registers `PredicateColumn` to guide squeezing — it is
+        // hint, but still registers `PredicateColumn` to describe its usage — it is
         // deliberately *not* stored as `expression`, since it does not change how
         // the column is materialized on read.
-        let squeeze_hint = expression
+        let lineage = expression
             .clone()
             .or_else(|| is_predicate_column.then(|| Arc::new(CacheExpression::PredicateColumn)));
-        if let Some(hint) = squeeze_hint {
+        if let Some(hint) = lineage {
             let hint_entry_id = column_access_path.entry_id(BatchID::from_raw(0)).into();
-            cache_store.add_squeeze_hint(&hint_entry_id, hint);
+            cache_store.add_lineage(&hint_entry_id, hint);
         }
         Self {
             field,
             cache_store,
-            column_path: column_access_path,
             file_id,
+            column_path: column_access_path,
             expression,
+            snapshots,
         }
     }
 
     /// row_id must be on a batch boundary.
-    pub(crate) fn entry_id(&self, batch_id: BatchID) -> ParquetArrayID {
-        self.column_path.entry_id(batch_id)
-    }
-
-    /// The never-reused name of the file this column belongs to.
+    /// The unnarrowed name of the file this column reads, recorded with every
+    /// entry it caches and checked on every read.
     pub(crate) fn identity(&self) -> u64 {
         self.file_id.identity()
     }
 
-    pub(crate) fn is_cached(&self, batch_id: BatchID) -> bool {
+    pub(crate) fn entry_id(&self, batch_id: BatchID) -> ParquetArrayID {
+        self.column_path.entry_id(batch_id)
+    }
+
+    pub(crate) fn contains(&self, batch_id: BatchID) -> bool {
         self.cache_store
             .is_cached(&self.entry_id(batch_id).into(), self.identity())
+    }
+
+    pub(crate) fn snapshot_entry(&self, batch_id: BatchID) -> Option<Arc<CacheEntry>> {
+        self.snapshots.get(&self.entry_id(batch_id).into())
     }
 
     /// Returns the Arrow field metadata for this cached column.
@@ -109,12 +120,9 @@ impl CachedColumn {
         self.expression.clone()
     }
 
-    /// `None` when the array does not match this column's field — the cache
-    /// returned something built for a different column. The caller treats that
-    /// as "cannot answer from cache" and reads the source instead.
-    fn array_to_record_batch(&self, array: ArrayRef) -> Option<RecordBatch> {
+    fn array_to_record_batch(&self, array: ArrayRef) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![self.field.clone()]));
-        RecordBatch::try_new(schema, vec![array]).ok()
+        RecordBatch::try_new(schema, vec![array]).unwrap()
     }
 
     /// Evaluates a predicate on a cached column.
@@ -128,15 +136,28 @@ impl CachedColumn {
         let liquid_expr = LiquidExpr::try_new(
             Arc::clone(predicate.physical_expr()),
             self.field.data_type(),
-            self.expression.as_deref(),
         );
 
         if let Some(liquid_expr) = liquid_expr
-            && let Some(boolean_array) = self
-                .cache_store
-                .eval_predicate(&entry_id, self.identity(), &liquid_expr)
-                .with_selection(filter)
-                .await
+            && let Some(boolean_array) = match self.snapshots.get(&entry_id) {
+                Some(entry) => {
+                    self.cache_store
+                        .eval_predicate_on_entry(
+                            &entry_id,
+                            self.identity(),
+                            entry.as_ref(),
+                            Some(filter),
+                            &liquid_expr,
+                        )
+                        .await
+                }
+                None => {
+                    self.cache_store
+                        .eval_predicate(&entry_id, self.identity(), &liquid_expr)
+                        .with_selection(filter)
+                        .await
+                }
+            }
         {
             let predicate_filter = match boolean_array.null_count() {
                 0 => boolean_array,
@@ -146,7 +167,7 @@ impl CachedColumn {
         }
 
         let array = self.get_arrow_array_with_filter(batch_id, filter).await?;
-        let record_batch = self.array_to_record_batch(array)?;
+        let record_batch = self.array_to_record_batch(array);
         let boolean_array = match predicate.evaluate(record_batch) {
             Ok(arr) => arr,
             Err(err) => return Some(Err(err)),
@@ -162,7 +183,7 @@ impl CachedColumn {
         &self,
         expr: Arc<dyn datafusion::physical_plan::PhysicalExpr>,
     ) -> Option<LiquidExpr> {
-        LiquidExpr::try_new(expr, self.field.data_type(), self.expression.as_deref())
+        LiquidExpr::try_new(expr, self.field.data_type())
     }
 
     pub(crate) fn liquid_expr_for_predicate(
@@ -179,6 +200,18 @@ impl CachedColumn {
         filter: &BooleanBuffer,
     ) -> Option<ArrayRef> {
         let entry_id = self.entry_id(batch_id).into();
+        if let Some(entry) = self.snapshots.get(&entry_id) {
+            return self
+                .cache_store
+                .read_entry(
+                    &entry_id,
+                    self.identity(),
+                    entry.as_ref(),
+                    Some(filter),
+                    self.expression.as_deref(),
+                )
+                .await;
+        }
         self.cache_store
             .get(&entry_id, self.identity())
             .with_selection(filter)
@@ -199,7 +232,7 @@ impl CachedColumn {
         batch_id: BatchID,
         array: ArrayRef,
     ) -> Result<(), InsertArrowArrayError> {
-        if self.is_cached(batch_id) {
+        if self.contains(batch_id) {
             return Err(InsertArrowArrayError::AlreadyCached);
         }
 
@@ -207,5 +240,26 @@ impl CachedColumn {
             .insert(self.entry_id(batch_id).into(), self.identity(), array)
             .await?;
         Ok(())
+    }
+
+    pub(crate) fn insert_snapshot(&self, batch_id: BatchID, array: ArrayRef) {
+        self.snapshots.insert(
+            self.entry_id(batch_id).into(),
+            Arc::new(CacheEntry::memory_arrow(array)),
+        );
+    }
+
+    pub(crate) async fn prefetch_snapshot(&self, batch_id: BatchID) -> PrefetchOutcome {
+        let entry_id = self.entry_id(batch_id).into();
+        if self.snapshots.get(&entry_id).is_some() {
+            return PrefetchOutcome::AlreadySnapshotted;
+        }
+        match self.cache_store.prefetch(&entry_id, self.identity()).await {
+            PrefetchResult::Snapshot(entry) => {
+                self.snapshots.insert(entry_id, entry);
+                PrefetchOutcome::Snapshotted
+            }
+            PrefetchResult::Absent => PrefetchOutcome::Missing,
+        }
     }
 }

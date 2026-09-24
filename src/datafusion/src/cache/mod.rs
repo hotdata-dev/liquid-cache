@@ -3,13 +3,21 @@
 
 use crate::io::ParquetCacheMetadata;
 use crate::reader::{LiquidPredicate, extract_multi_column_or};
+use crate::sync::RwLock;
+mod file_id;
+
 use ahash::AHashMap;
 use arrow::array::{BooleanArray, RecordBatch, RecordBatchOptions};
 use arrow::buffer::BooleanBuffer;
 use arrow_schema::{ArrowError, Field, Schema, SchemaRef};
-use liquid_cache::cache::squeeze_policies::SqueezePolicy;
+use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::execution::object_store::ObjectStoreUrl;
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_expr::expressions::Column;
+use liquid_cache::cache::EvictionPolicy;
 use liquid_cache::cache::{
-    CacheExpression, CachePolicy, EventTrace, HydrationPolicy, LiquidCache, LiquidCacheBuilder,
+    CacheEntry, CacheExpression, CachePolicy, EntryID, EventTrace, HydrationPolicy, LiquidCache,
+    LiquidCacheBuilder,
 };
 use parquet::arrow::arrow_reader::ArrowPredicate;
 use std::collections::HashMap;
@@ -17,26 +25,76 @@ use std::path::Path;
 use std::sync::Arc;
 
 mod column;
-mod file_id;
 mod id;
 mod stats;
 
-use file_id::{FileId, FileIdPool};
-
-pub(crate) use column::InsertArrowArrayError;
 pub use column::{CachedColumn, CachedColumnRef};
+pub(crate) use column::{InsertArrowArrayError, PrefetchOutcome};
 pub(crate) use id::ColumnAccessPath;
 pub use id::{BatchID, ParquetArrayID};
 
-/// Typed squeeze hints for a single file, keyed by file-schema column name.
+/// Typed lineage expressions for a single file, keyed by file-schema column name.
 ///
-/// Produced by the physical squeeze-hint analyzer (local mode) or shipped from
+/// Produced by the physical lineage analyzer (local mode) or shipped from
 /// the client (Flight mode), and attached to the
 /// [`LiquidParquetSource`](crate::LiquidParquetSource) that opens the file.
-pub type ColumnSqueezeHints = HashMap<String, Arc<CacheExpression>>;
+pub type ColumnLineages = HashMap<String, Arc<CacheExpression>>;
 
-/// One column of a row group: (file column index, field, squeeze hint, is-predicate).
+/// The identity of a Parquet object within an object store.
+///
+/// Object paths are only unique within their object store, so both components
+/// are required to keep cached data from different stores isolated.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct ParquetFileIdentity {
+    object_store_url: ObjectStoreUrl,
+    path: String,
+}
+
+impl ParquetFileIdentity {
+    /// The key a file id is leased against.
+    ///
+    /// Both components, for the same reason the identity carries both: a path
+    /// is unique only within its object store, so keying on it alone would let
+    /// two stores share one lease and therefore one set of cache keys.
+    pub(crate) fn lease_key(&self) -> String {
+        format!("{}{}", self.object_store_url.as_str(), self.path)
+    }
+
+    /// Create an identity from an object store URL and an object path.
+    pub fn new(object_store_url: ObjectStoreUrl, path: String) -> Self {
+        Self {
+            object_store_url,
+            path,
+        }
+    }
+}
+
+/// One column of a row group: (file column index, field, lineage expression, is-predicate).
 type CachedColumnSpec = (u64, Arc<Field>, Option<Arc<CacheExpression>>, bool);
+
+#[derive(Default, Debug)]
+pub(crate) struct RowGroupSnapshots {
+    entries: RwLock<AHashMap<EntryID, Arc<CacheEntry>>>,
+    selections: RwLock<AHashMap<BatchID, BooleanBuffer>>,
+}
+
+impl RowGroupSnapshots {
+    pub(crate) fn get(&self, entry_id: &EntryID) -> Option<Arc<CacheEntry>> {
+        self.entries.read().unwrap().get(entry_id).cloned()
+    }
+
+    pub(crate) fn insert(&self, entry_id: EntryID, entry: Arc<CacheEntry>) {
+        self.entries.write().unwrap().insert(entry_id, entry);
+    }
+
+    pub(crate) fn selection(&self, batch_id: BatchID) -> Option<BooleanBuffer> {
+        self.selections.read().unwrap().get(&batch_id).cloned()
+    }
+
+    pub(crate) fn insert_selection(&self, batch_id: BatchID, selection: BooleanBuffer) {
+        self.selections.write().unwrap().insert(batch_id, selection);
+    }
+}
 
 #[derive(Default, Debug)]
 struct ColumnMaps {
@@ -50,6 +108,7 @@ struct ColumnMaps {
 pub struct CachedRowGroup {
     columns: ColumnMaps,
     cache_store: Arc<LiquidCache>,
+    snapshots: Arc<RowGroupSnapshots>,
 }
 
 impl CachedRowGroup {
@@ -59,8 +118,9 @@ impl CachedRowGroup {
     fn new(
         cache_store: Arc<LiquidCache>,
         row_group_idx: u64,
-        file_id: Arc<FileId>,
+        file_id: Arc<file_id::FileId>,
         columns: &[CachedColumnSpec],
+        snapshots: Arc<RowGroupSnapshots>,
     ) -> Self {
         let mut column_maps = ColumnMaps::default();
         for (column_id, field, expression, is_predicate_column) in columns {
@@ -69,10 +129,11 @@ impl CachedRowGroup {
             let column = Arc::new(CachedColumn::new(
                 Arc::clone(field),
                 Arc::clone(&cache_store),
-                column_access_path,
                 Arc::clone(&file_id),
+                column_access_path,
                 expression.clone(),
                 *is_predicate_column,
+                Arc::clone(&snapshots),
             ));
             column_maps.by_id.insert(*column_id, column.clone());
             column_maps.by_name.insert(field.name().to_string(), column);
@@ -81,6 +142,7 @@ impl CachedRowGroup {
         Self {
             columns: column_maps,
             cache_store,
+            snapshots,
         }
     }
 
@@ -104,6 +166,10 @@ impl CachedRowGroup {
         // (e.g. "table.col"), while cache fields are keyed by file schema names.
         let unqualified = column_name.rsplit('.').next().unwrap_or(column_name);
         self.columns.by_name.get(unqualified).cloned()
+    }
+
+    pub(crate) fn snapshot_selection(&self, batch_id: BatchID) -> Option<BooleanBuffer> {
+        self.snapshots.selection(batch_id)
     }
 
     /// Evaluate a predicate on a row group.
@@ -132,7 +198,28 @@ impl CachedRowGroup {
 
                 for (col_name, expr) in column_exprs {
                     let column = self.get_column_by_name(col_name)?;
-                    let liquid_expr = column.liquid_expr_for_predicate(Arc::clone(&expr));
+                    let snapshot_liquid = match column.snapshot_entry(batch_id) {
+                        Some(entry) => match entry.as_ref() {
+                            CacheEntry::MemoryLiquid(array) => Some(Arc::clone(array)),
+                            _ => {
+                                combined_buffer = None;
+                                break;
+                            }
+                        },
+                        None => None,
+                    };
+                    let expr = expr
+                        .transform_up(|expr| {
+                            if let Some(column) = expr.downcast_ref::<Column>() {
+                                Ok(Transformed::yes(Arc::new(Column::new(column.name(), 0))
+                                    as Arc<dyn PhysicalExpr>))
+                            } else {
+                                Ok(Transformed::no(expr))
+                            }
+                        })
+                        .ok()?
+                        .data;
+                    let liquid_expr = column.liquid_expr_for_predicate(expr);
                     let liquid_expr = match liquid_expr {
                         Some(expr) => expr,
                         None => {
@@ -141,10 +228,14 @@ impl CachedRowGroup {
                         }
                     };
                     let entry_id = column.entry_id(batch_id).into();
-                    let liquid_array = self
-                        .cache_store
-                        .try_read_liquid(&entry_id, column.identity())
-                        .await;
+                    let liquid_array = match snapshot_liquid {
+                        Some(array) => Some(array),
+                        None => {
+                            self.cache_store
+                                .try_read_liquid(&entry_id, column.identity())
+                                .await
+                        }
+                    };
                     let liquid_array = match liquid_array {
                         None => {
                             combined_buffer = None;
@@ -152,15 +243,7 @@ impl CachedRowGroup {
                         }
                         Some(array) => array,
                     };
-                    // Leave the loop rather than the function, as the two
-                    // arms above do: an array that cannot answer the predicate
-                    // does not mean the column is unreadable, and the arrow
-                    // fallback below may still serve it from the cache.
-                    let Some(buffer) = liquid_array.try_eval_predicate(&liquid_expr, selection)
-                    else {
-                        combined_buffer = None;
-                        break;
-                    };
+                    let buffer = liquid_array.try_eval_predicate(&liquid_expr, selection);
 
                     combined_buffer = Some(match combined_buffer {
                         None => buffer,
@@ -175,6 +258,17 @@ impl CachedRowGroup {
                 }
             }
         }
+        // A conjunct that reads no column still has to be evaluated, over a batch
+        // that carries only the row count the selection implies.
+        if column_ids.is_empty() {
+            let options =
+                RecordBatchOptions::new().with_row_count(Some(selection.count_set_bits()));
+            let record_batch =
+                RecordBatch::try_new_with_options(Arc::new(Schema::empty()), Vec::new(), &options)
+                    .ok()?;
+            return Some(predicate.evaluate(record_batch));
+        }
+
         // Otherwise, we need to first convert the data into arrow arrays.
         let mut arrays = Vec::new();
         let mut fields = Vec::new();
@@ -187,14 +281,9 @@ impl CachedRowGroup {
             fields.push(column.field());
         }
         let schema = Arc::new(Schema::new(fields));
-        // The row count has to be carried explicitly: a column-free conjunct
-        // (`NULL`, `false`) projects no arrays, and an array-less batch would
-        // otherwise claim zero rows.
-        let options = RecordBatchOptions::new().with_row_count(Some(selection.count_set_bits()));
-        Some(
-            RecordBatch::try_new_with_options(schema, arrays, &options)
-                .and_then(|batch| predicate.evaluate(batch)),
-        )
+        let record_batch = RecordBatch::try_new(schema, arrays).unwrap();
+        let boolean_array = predicate.evaluate(record_batch).unwrap();
+        Some(Ok(boolean_array))
     }
 }
 
@@ -204,25 +293,25 @@ pub(crate) type CachedRowGroupRef = Arc<CachedRowGroup>;
 #[derive(Debug)]
 pub struct CachedFile {
     cache_store: Arc<LiquidCache>,
-    /// Held, not copied: the id stays allocated for as long as anything can
-    /// still compute a cache key from it.
-    file_id: Arc<FileId>,
+    /// Held, not copied: the id returns to the pool when the last holder — this
+    /// file and everything derived from it — is dropped.
+    file_id: Arc<file_id::FileId>,
     file_schema: SchemaRef,
-    squeeze_hints: Arc<ColumnSqueezeHints>,
+    lineages: Arc<ColumnLineages>,
 }
 
 impl CachedFile {
     fn new(
         cache_store: Arc<LiquidCache>,
-        file_id: Arc<FileId>,
+        file_id: Arc<file_id::FileId>,
         file_schema: SchemaRef,
-        squeeze_hints: Arc<ColumnSqueezeHints>,
+        lineages: Arc<ColumnLineages>,
     ) -> Self {
         Self {
             cache_store,
             file_id,
             file_schema,
-            squeeze_hints,
+            lineages,
         }
     }
 
@@ -232,6 +321,15 @@ impl CachedFile {
         row_group_id: u64,
         predicate_column_ids: Vec<usize>,
     ) -> CachedRowGroupRef {
+        self.create_row_group_with_snapshots(row_group_id, predicate_column_ids, Arc::default())
+    }
+
+    pub(crate) fn create_row_group_with_snapshots(
+        &self,
+        row_group_id: u64,
+        predicate_column_ids: Vec<usize>,
+        snapshots: Arc<RowGroupSnapshots>,
+    ) -> CachedRowGroupRef {
         let columns: Vec<CachedColumnSpec> = self
             .file_schema
             .fields()
@@ -239,7 +337,7 @@ impl CachedFile {
             .enumerate()
             .map(|(idx, field)| {
                 let is_predicate_column = predicate_column_ids.contains(&idx);
-                let expression = self.squeeze_hints.get(field.name()).cloned();
+                let expression = self.lineages.get(field.name()).cloned();
                 (
                     idx as u64,
                     Arc::clone(field),
@@ -254,13 +352,8 @@ impl CachedFile {
             row_group_id,
             Arc::clone(&self.file_id),
             &columns,
+            snapshots,
         ))
-    }
-
-    /// The leased id this file's cache keys are built from.
-    #[cfg(test)]
-    pub(crate) fn file_id(&self) -> u64 {
-        self.file_id.get()
     }
 
     /// Return the configured cache batch size.
@@ -280,10 +373,11 @@ pub(crate) type CachedFileRef = Arc<CachedFile>;
 /// The main cache structure.
 #[derive(Debug)]
 pub struct LiquidCacheParquet {
-    /// Leases the file ids that name cached data. Ids come back when nothing
-    /// is reading the file any more, so the number in use tracks what is being
-    /// read rather than everything ever read — see [`file_id`].
-    file_ids: Arc<FileIdPool>,
+    /// Map object-store-qualified file identity to file id.
+    /// Leases the file ids that cache keys are built from, so the id space
+    /// tracks the files being read rather than every file ever read — see
+    /// [`file_id`].
+    file_ids: Arc<file_id::FileIdPool>,
 
     cache_store: Arc<LiquidCache>,
 }
@@ -299,34 +393,34 @@ impl LiquidCacheParquet {
         max_disk_bytes: usize,
         store: t4::Store,
         cache_policy: Box<dyn CachePolicy>,
-        squeeze_policy: Box<dyn SqueezePolicy>,
+        eviction_policy: Box<dyn EvictionPolicy>,
         hydration_policy: Box<dyn HydrationPolicy>,
     ) -> Self {
-        Self::new_with_squeeze_victim_concurrency(
+        Self::new_with_eviction_concurrency(
             batch_size,
             max_memory_bytes,
             max_disk_bytes,
             store,
             cache_policy,
-            squeeze_policy,
+            eviction_policy,
             hydration_policy,
             !cfg!(test),
         )
         .await
     }
 
-    /// Create a new cache for parquet files with explicit victim squeeze concurrency.
+    /// Create a new cache for parquet files with explicit victim eviction concurrency.
     #[doc(hidden)]
     #[allow(clippy::too_many_arguments)]
-    pub async fn new_with_squeeze_victim_concurrency(
+    pub async fn new_with_eviction_concurrency(
         batch_size: usize,
         max_memory_bytes: usize,
         max_disk_bytes: usize,
         store: t4::Store,
         cache_policy: Box<dyn CachePolicy>,
-        squeeze_policy: Box<dyn SqueezePolicy>,
+        eviction_policy: Box<dyn EvictionPolicy>,
         hydration_policy: Box<dyn HydrationPolicy>,
-        squeeze_victims_concurrently: bool,
+        evict_victims_concurrently: bool,
     ) -> Self {
         assert!(batch_size.is_power_of_two());
         let metadata = Arc::new(ParquetCacheMetadata::new());
@@ -334,17 +428,17 @@ impl LiquidCacheParquet {
             .with_batch_size(batch_size)
             .with_max_memory_bytes(max_memory_bytes)
             .with_max_disk_bytes(max_disk_bytes)
-            .with_squeeze_policy(squeeze_policy)
+            .with_eviction_policy(eviction_policy)
             .with_cache_policy(cache_policy)
             .with_hydration_policy(hydration_policy)
             .with_metadata(metadata)
             .with_store(store)
-            .with_squeeze_victims_concurrently(squeeze_victims_concurrently)
+            .with_evict_victims_concurrently(evict_victims_concurrently)
             .build()
             .await;
 
         LiquidCacheParquet {
-            file_ids: FileIdPool::new(),
+            file_ids: file_id::FileIdPool::new(),
             cache_store: cache_storage,
         }
     }
@@ -352,26 +446,48 @@ impl LiquidCacheParquet {
     /// Register a file in the cache.
     pub fn register_or_get_file(
         &self,
-        file_path: String,
+        file_identity: ParquetFileIdentity,
         full_file_schema: SchemaRef,
     ) -> CachedFileRef {
-        self.register_or_get_file_with_hints(file_path, full_file_schema, Arc::default())
+        self.register_or_get_file_with_hints(file_identity, full_file_schema, Arc::default())
     }
 
-    /// Register a file in the cache, attaching typed squeeze hints derived from
+    /// Register a file in the cache, attaching typed lineage expressions derived from
     /// the query plan (keyed by file-schema column name).
     pub fn register_or_get_file_with_hints(
         &self,
-        file_path: String,
+        file_identity: ParquetFileIdentity,
         full_file_schema: SchemaRef,
-        squeeze_hints: Arc<ColumnSqueezeHints>,
+        lineages: Arc<ColumnLineages>,
     ) -> CachedFileRef {
         Arc::new(CachedFile::new(
             self.cache_store.clone(),
-            self.file_ids.acquire(&file_path),
+            self.file_ids.acquire(&file_identity.lease_key()),
             full_file_schema,
-            squeeze_hints,
+            lineages,
         ))
+    }
+
+    /// How many file ids are currently leased.
+    ///
+    /// Bounded by the files being read, not by everything ever read. Rising
+    /// without bound means leases are being held longer than the reads that
+    /// need them.
+    pub fn leased_file_ids(&self) -> usize {
+        self.file_ids.live_count()
+    }
+
+    /// How many ids have been handed out that do not fit the cache key's
+    /// 16-bit file field. Non-zero means more files are being read at once
+    /// than the key can name, and ids are being recycled under entries that
+    /// are still resident.
+    pub fn file_ids_over_key_width(&self) -> u64 {
+        self.file_ids.over_key_width()
+    }
+
+    /// How many cache lookups or writes found a key held by another file.
+    pub fn identity_mismatches(&self) -> u64 {
+        self.cache_store.stats().identity_mismatches
     }
 
     /// Get the batch size of the cache.
@@ -399,34 +515,6 @@ impl LiquidCacheParquet {
         self.cache_store.budget().disk_usage_bytes()
     }
 
-    /// How many file ids are currently leased.
-    ///
-    /// This tracks the files being read, not the files ever read. It is the
-    /// number that has to stay under the cache key's 16-bit file field, so it
-    /// is worth watching: rising without bound means leases are being held by
-    /// something that should have let go.
-    pub fn leased_file_ids(&self) -> usize {
-        self.file_ids.live_count()
-    }
-
-    /// How many ids have been handed out that do not fit the cache key's file
-    /// field.
-    ///
-    /// Expected to stay at zero. Above zero, distinct files are computing the
-    /// same keys — served correctly, because each entry records which file it
-    /// came from, but unable to share the cache.
-    pub fn file_ids_over_key_width(&self) -> u64 {
-        self.file_ids.over_key_width()
-    }
-
-    /// How many cache lookups or writes found a key held by another file.
-    ///
-    /// The consequence of the counter above, and the one that proves the
-    /// aliasing is being caught rather than served.
-    pub fn identity_mismatches(&self) -> u64 {
-        self.cache_store.stats().identity_mismatches
-    }
-
     /// Flush the cache trace to a file.
     pub fn flush_trace(&self, to_file: impl AsRef<Path>) {
         self.cache_store.observer().flush_cache_trace(to_file);
@@ -447,9 +535,9 @@ impl LiquidCacheParquet {
     /// # Safety
     /// This is unsafe because resetting the cache while other threads are using the cache may cause undefined behavior.
     /// You should only call this when no one else is using the cache.
-    pub async unsafe fn reset(&self) {
+    pub unsafe fn reset(&self) {
         self.file_ids.reset();
-        self.cache_store.reset().await;
+        self.cache_store.reset();
     }
 
     /// Flush all memory-based entries to disk while preserving their format.
@@ -479,7 +567,7 @@ mod tests {
     use super::*;
     use crate::cache::{CachedRowGroupRef, LiquidCacheParquet};
     use crate::reader::FilterCandidateBuilder;
-    use arrow::array::{Array, ArrayRef, Int32Array};
+    use arrow::array::{Array, ArrayRef, Int32Array, StringViewArray};
     use arrow::buffer::BooleanBuffer;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
@@ -489,7 +577,7 @@ mod tests {
     use datafusion::physical_expr::expressions::{BinaryExpr, Literal};
     use datafusion::physical_plan::expressions::Column;
     use liquid_cache::cache::AlwaysHydrate;
-    use liquid_cache::cache::squeeze_policies::TranscodeSqueezeEvict;
+    use liquid_cache::cache::TranscodeEvict;
     use liquid_cache::cache_policies::LiquidPolicy;
     use parquet::arrow::ArrowWriter;
     use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
@@ -497,250 +585,173 @@ mod tests {
 
     async fn setup_cache(batch_size: usize, schema: SchemaRef) -> CachedRowGroupRef {
         let tmp_dir = tempfile::tempdir().unwrap();
-        let store = crate::test_utils::mount_test_store(tmp_dir.path()).await;
+        let store = t4::mount(tmp_dir.path().join("liquid_cache.t4"))
+            .await
+            .unwrap();
         let cache = LiquidCacheParquet::new(
             batch_size,
             usize::MAX,
             usize::MAX,
             store,
             Box::new(LiquidPolicy::new()),
-            Box::new(TranscodeSqueezeEvict),
+            Box::new(TranscodeEvict),
             Box::new(AlwaysHydrate::new()),
         )
         .await;
-        let file = cache.register_or_get_file("test".to_string(), schema);
+        let file = cache.register_or_get_file(
+            ParquetFileIdentity::new(ObjectStoreUrl::local_filesystem(), "test".to_string()),
+            schema,
+        );
         file.create_row_group(0, vec![])
     }
 
-    /// Recycling a file id must not recycle a file's *name*.
-    ///
-    /// The id is narrow and reused so the key space cannot run out. If the
-    /// identity recorded against each entry were that same id, the next file
-    /// to inherit it would be indistinguishable from the one that gave it
-    /// back, and would read the entries it left behind — reintroducing the
-    /// aliasing the identity exists to catch, at every lease boundary rather
-    /// than only past 65,536 files.
-    #[tokio::test]
-    async fn a_file_inheriting_a_recycled_id_does_not_read_its_predecessors_data() {
-        let batch_size = 8;
-        let schema: SchemaRef =
-            Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+    async fn setup_liquid_cache(
+        batch_size: usize,
+        schema: SchemaRef,
+        max_memory_bytes: usize,
+    ) -> CachedRowGroupRef {
         let tmp_dir = tempfile::tempdir().unwrap();
-        let store = crate::test_utils::mount_test_store(tmp_dir.path()).await;
-        let cache = LiquidCacheParquet::new(
-            batch_size,
-            usize::MAX,
-            usize::MAX,
-            store,
-            Box::new(LiquidPolicy::new()),
-            Box::new(TranscodeSqueezeEvict),
-            Box::new(AlwaysHydrate::new()),
-        )
-        .await;
-
-        let batch_id = BatchID::from_row_id(0, batch_size);
-        let filter = BooleanBuffer::new_set(batch_size);
-        let first_data: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6, 7, 8]));
-
-        let first_id = {
-            let first =
-                cache.register_or_get_file("first.parquet".to_string(), Arc::clone(&schema));
-            let column = first.create_row_group(0, vec![]).get_column(0).unwrap();
-            column
-                .insert(batch_id, Arc::clone(&first_data))
-                .await
-                .unwrap();
-            first.file_id()
-        }; // lease dropped here, so the id goes back to the pool
-
-        let second = cache.register_or_get_file("second.parquet".to_string(), schema);
-        assert_eq!(
-            second.file_id(),
-            first_id,
-            "the id must actually be recycled, or this test proves nothing"
-        );
-
-        let column = second.create_row_group(0, vec![]).get_column(0).unwrap();
-        assert!(!column.is_cached(batch_id));
-        assert!(
-            column
-                .get_arrow_array_with_filter(batch_id, &filter)
-                .await
-                .is_none(),
-            "inheriting an id must not inherit the entries keyed from it"
-        );
-
-        // It must also be able to cache. The predecessor's entries are keyed
-        // where this file's belong and nobody can read them any more, so they
-        // give way — otherwise a cache under its budget, where nothing is ever
-        // evicted, would leave this file permanently uncacheable.
-        let second_data: ArrayRef = Arc::new(Int32Array::from(vec![9, 9, 9, 9, 9, 9, 9, 9]));
-        column
-            .insert(batch_id, Arc::clone(&second_data))
-            .await
-            .expect("the inheriting file must be able to cache");
-        let got = column
-            .get_arrow_array_with_filter(batch_id, &filter)
-            .await
-            .expect("the new owner reads back its own rows");
-        assert_eq!(got.as_ref(), second_data.as_ref());
-    }
-
-    /// What part of the fix is actually for: a process that reads far more
-    /// files than it holds open at once must not exhaust the key's 16-bit file
-    /// field. Before ids were leased this counter only ever climbed, so a
-    /// long-lived instance wrapped it purely by having *seen* enough files.
-    #[tokio::test]
-    async fn reading_files_one_after_another_does_not_consume_the_id_space() {
-        let schema: SchemaRef =
-            Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let store = crate::test_utils::mount_test_store(tmp_dir.path()).await;
-        let cache = LiquidCacheParquet::new(
-            8,
-            usize::MAX,
-            usize::MAX,
-            store,
-            Box::new(LiquidPolicy::new()),
-            Box::new(TranscodeSqueezeEvict),
-            Box::new(AlwaysHydrate::new()),
-        )
-        .await;
-
-        // Well past the ceiling in total, but only ever one open at a time.
-        for i in 0..(u16::MAX as usize + 1_000) {
-            let file = cache.register_or_get_file(format!("scan-{i}.parquet"), Arc::clone(&schema));
-            assert_eq!(
-                file.file_id(),
-                0,
-                "each file should reuse the id the previous one gave back"
-            );
-        }
-
-        // And a file opened now still fits the key field.
-        let after = cache.register_or_get_file("after.parquet".to_string(), schema);
-        assert!(after.file_id() <= u16::MAX as u64);
-    }
-
-    /// The bug in its real shape, walked through the actual registration path.
-    ///
-    /// `ColumnAccessPath` narrows the file id to 16 bits, so the 65,537th
-    /// distinct file a process registers is keyed identically to the first.
-    /// Before entries recorded their identity, the newcomer read the
-    /// incumbent's data — a panic when the column types differed, silently
-    /// wrong rows when they matched.
-    #[tokio::test]
-    async fn a_file_past_the_key_ceiling_does_not_read_the_first_file_s_data() {
-        let batch_size = 8;
-        let schema: SchemaRef =
-            Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let store = crate::test_utils::mount_test_store(tmp_dir.path()).await;
-        let cache = LiquidCacheParquet::new(
-            batch_size,
-            usize::MAX,
-            usize::MAX,
-            store,
-            Box::new(LiquidPolicy::new()),
-            Box::new(TranscodeSqueezeEvict),
-            Box::new(AlwaysHydrate::new()),
-        )
-        .await;
-
-        let batch_id = BatchID::from_row_id(0, batch_size);
-        let filter = BooleanBuffer::new_set(batch_size);
-
-        // File id 0, with data in the cache.
-        let first = cache.register_or_get_file("first.parquet".to_string(), Arc::clone(&schema));
-        let first_column = first.create_row_group(0, vec![]).get_column(0).unwrap();
-        let first_data: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6, 7, 8]));
-        first_column
-            .insert(batch_id, Arc::clone(&first_data))
+        let store = t4::mount(tmp_dir.path().join("liquid_cache.t4"))
             .await
             .unwrap();
-
-        // Burn the rest of the 16-bit id space. The handles are held: ids are
-        // leased, so files that are opened and closed hand their id straight
-        // back and the ceiling is only reachable with this many files open at
-        // once.
-        let _fillers: Vec<_> = (1..=u16::MAX as usize)
-            .map(|i| cache.register_or_get_file(format!("filler-{i}.parquet"), Arc::clone(&schema)))
-            .collect();
-
-        // Id 65536, which narrows to 0.
-        let wrapped = cache.register_or_get_file("wrapped.parquet".to_string(), schema);
-        let wrapped_column = wrapped.create_row_group(0, vec![]).get_column(0).unwrap();
-
-        assert_eq!(
-            usize::from(wrapped_column.entry_id(batch_id)),
-            usize::from(first_column.entry_id(batch_id)),
-            "the packed keys must actually collide, or this test proves nothing"
-        );
-
-        // The newcomer must not be handed the incumbent's rows.
-        assert!(!wrapped_column.is_cached(batch_id));
-        assert!(
-            wrapped_column
-                .get_arrow_array_with_filter(batch_id, &filter)
-                .await
-                .is_none(),
-            "a colliding key must read as a miss, not as the other file's data"
-        );
-
-        // And the incumbent still reads its own.
-        let got = first_column
-            .get_arrow_array_with_filter(batch_id, &filter)
-            .await
-            .expect("the owner's entry is still there");
-        assert_eq!(got.as_ref(), first_data.as_ref());
+        let cache = LiquidCacheParquet::new(
+            batch_size,
+            max_memory_bytes,
+            usize::MAX,
+            store,
+            Box::new(LiquidPolicy::new()),
+            Box::new(TranscodeEvict),
+            Box::new(AlwaysHydrate::new()),
+        )
+        .await;
+        cache
+            .register_or_get_file(
+                ParquetFileIdentity::new(ObjectStoreUrl::local_filesystem(), "test".to_string()),
+                schema,
+            )
+            .create_row_group(0, vec![0, 1])
     }
 
-    /// Issue #19: `NOT (s = s)` simplifies to `s IS NULL AND NULL`, so a conjunct
-    /// that reads no column reaches the row filter. It has to survive candidate
-    /// building and then evaluate against the selection's row count — an
-    /// array-less batch would otherwise report zero rows and hand back a mask of
-    /// the wrong length, which silently widens the filter.
-    #[tokio::test]
-    async fn evaluate_column_free_conjunct() {
-        let batch_size = 8;
-        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
-        let row_group = setup_cache(batch_size, schema.clone()).await;
-
-        let array = Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6, 7, 8]));
-        let batch_id = BatchID::from_row_id(0, batch_size);
-        let column = row_group.get_column(0).unwrap();
-        assert!(column.insert(batch_id, array.clone()).await.is_ok());
-
+    fn build_predicate(
+        schema: &SchemaRef,
+        arrays: Vec<ArrayRef>,
+        expr: Arc<dyn PhysicalExpr>,
+    ) -> LiquidPredicate {
         let tmp_meta = tempfile::NamedTempFile::new().unwrap();
         let mut writer =
-            ArrowWriter::try_new(tmp_meta.reopen().unwrap(), Arc::clone(&schema), None).unwrap();
-        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![array]).unwrap();
-        writer.write(&batch).unwrap();
+            ArrowWriter::try_new(tmp_meta.reopen().unwrap(), Arc::clone(schema), None).unwrap();
+        writer
+            .write(&RecordBatch::try_new(Arc::clone(schema), arrays).unwrap())
+            .unwrap();
         writer.close().unwrap();
-        let file_reader = std::fs::File::open(tmp_meta.path()).unwrap();
-        let metadata = ArrowReaderMetadata::load(&file_reader, ArrowReaderOptions::new()).unwrap();
-
-        let expr: Arc<dyn PhysicalExpr> = Arc::new(Literal::new(ScalarValue::Boolean(None)));
-        let builder = FilterCandidateBuilder::new(expr, Arc::clone(&schema));
-        let candidate = builder
+        let reader = std::fs::File::open(tmp_meta.path()).unwrap();
+        let metadata = ArrowReaderMetadata::load(&reader, ArrowReaderOptions::new()).unwrap();
+        let candidate = FilterCandidateBuilder::new(expr, Arc::clone(schema))
             .build(metadata.metadata())
             .unwrap()
-            .expect("a column-free conjunct must still produce a candidate");
+            .unwrap();
         let projection = candidate.projection(metadata.metadata());
-        let mut predicate = LiquidPredicate::try_new(candidate, projection).unwrap();
-        assert!(predicate.predicate_column_ids().is_empty());
+        LiquidPredicate::try_new(candidate, projection).unwrap()
+    }
 
-        // Four of the eight rows are selected, so the mask must be four long.
-        let selection = BooleanBuffer::collect_bool(batch_size, |i| i % 2 == 0);
+    fn equals(name: &str, index: usize, value: ScalarValue) -> Arc<dyn PhysicalExpr> {
+        Arc::new(BinaryExpr::new(
+            Arc::new(Column::new(name, index)),
+            Operator::Eq,
+            Arc::new(Literal::new(value)),
+        ))
+    }
+
+    fn dummy(len: usize) -> ArrayRef {
+        Arc::new(Int32Array::from(vec![0; len]))
+    }
+
+    async fn insert_liquid_columns(
+        row_group: &CachedRowGroupRef,
+        batch_id: BatchID,
+        arrays: [ArrayRef; 3],
+    ) {
+        for (column_id, array) in arrays.into_iter().enumerate() {
+            row_group
+                .get_column(column_id as u64)
+                .unwrap()
+                .insert(batch_id, array)
+                .await
+                .unwrap();
+        }
+        assert_eq!(row_group.cache_store.stats().memory_liquid_entries, 2);
+    }
+
+    #[tokio::test]
+    async fn or_fast_path_evaluates_on_liquid() {
+        let batch_size = 1024;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+            Field::new("dummy", DataType::Int32, false),
+        ]));
+        let a: ArrayRef = Arc::new(Int32Array::from_iter_values(
+            (0..batch_size).map(|i| (i % 4) as i32 + 1),
+        ));
+        let b: ArrayRef = Arc::new(Int32Array::from_iter_values(
+            (0..batch_size).map(|i| (i % 5) as i32 * 10),
+        ));
+        let budget = a.get_array_memory_size() + b.get_array_memory_size();
+        let row_group = setup_liquid_cache(batch_size, schema.clone(), budget).await;
+        let batch_id = BatchID::from_row_id(0, batch_size);
+        insert_liquid_columns(&row_group, batch_id, [a.clone(), b.clone(), dummy(1)]).await;
+        let expr = Arc::new(BinaryExpr::new(
+            equals("a", 0, ScalarValue::Int32(Some(3))),
+            Operator::Or,
+            equals("b", 1, ScalarValue::Int32(Some(20))),
+        ));
+        let mut predicate = build_predicate(&schema, vec![a, b, dummy(batch_size)], expr);
+        row_group.cache_store.stats();
+        let selection = BooleanBuffer::new_set(batch_size);
         let result = row_group
             .evaluate_selection_with_predicate(batch_id, &selection, &mut predicate)
             .await
             .unwrap()
             .unwrap();
+        let expected = BooleanBuffer::collect_bool(batch_size, |i| i % 4 == 2 || i % 5 == 2);
+        assert_eq!(result, BooleanArray::new(expected, None));
+        assert!(row_group.cache_store.stats().runtime.try_read_liquid_calls >= 2);
+    }
 
-        assert_eq!(result.len(), selection.count_set_bits());
-        assert_eq!(result.true_count(), 0);
-        assert_eq!(result.null_count(), result.len());
+    #[tokio::test]
+    async fn or_fast_path_on_strings() {
+        let batch_size = 128;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("city", DataType::Utf8View, false),
+            Field::new("name", DataType::Utf8View, false),
+            Field::new("dummy", DataType::Int32, false),
+        ]));
+        let city: ArrayRef = Arc::new(StringViewArray::from_iter_values(
+            (0..batch_size).map(|i| if i % 5 == 2 { "Tokyo" } else { "Paris" }),
+        ));
+        let name: ArrayRef = Arc::new(StringViewArray::from_iter_values(
+            (0..batch_size).map(|i| if i % 4 == 1 { "Bob" } else { "Alice" }),
+        ));
+        let budget = city.get_array_memory_size() + name.get_array_memory_size();
+        let row_group = setup_liquid_cache(batch_size, schema.clone(), budget).await;
+        let batch_id = BatchID::from_row_id(0, batch_size);
+        insert_liquid_columns(&row_group, batch_id, [city.clone(), name.clone(), dummy(1)]).await;
+        let expr = Arc::new(BinaryExpr::new(
+            equals("name", 1, ScalarValue::Utf8View(Some("Bob".into()))),
+            Operator::Or,
+            equals("city", 0, ScalarValue::Utf8View(Some("Tokyo".into()))),
+        ));
+        let mut predicate = build_predicate(&schema, vec![city, name, dummy(batch_size)], expr);
+        row_group.cache_store.stats();
+        let selection = BooleanBuffer::new_set(batch_size);
+        let result = row_group
+            .evaluate_selection_with_predicate(batch_id, &selection, &mut predicate)
+            .await
+            .unwrap()
+            .unwrap();
+        let expected = BooleanBuffer::collect_bool(batch_size, |i| i % 4 == 1 || i % 5 == 2);
+        assert_eq!(result, BooleanArray::new(expected, None));
+        assert!(row_group.cache_store.stats().runtime.try_read_liquid_calls >= 2);
     }
 
     #[tokio::test]

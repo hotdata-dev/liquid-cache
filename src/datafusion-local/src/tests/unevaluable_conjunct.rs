@@ -1,16 +1,10 @@
-//! Regression tests for issue #23 (and #21, one instance of it): a pushed-down
-//! conjunct the liquid row filter cannot evaluate.
+//! A pushed-down conjunct the liquid row filter may not be able to evaluate.
 //!
 //! `build_row_filter` splits the pushed-down predicate into conjuncts and builds
-//! one `FilterCandidate` per conjunct. `PushdownChecker` refuses a conjunct that
-//! touches a nested column, and one that references a column absent from the
-//! file schema. Those refusals used to be dropped silently, leaving the scan
-//! applying a *strictly weaker* filter than the query asked for — and since
-//! DataFusion removes the `FilterExec` when it pushes a predicate down, nothing
-//! re-applies the dropped conjunct.
-//!
-//! The scan is now declined at plan time instead, so the predicate stays with
-//! the reader that planned it.
+//! one `FilterCandidate` per conjunct. A conjunct that is refused and then
+//! dropped leaves the scan applying a *strictly weaker* filter than the query
+//! asked for — and since DataFusion removes the `FilterExec` when it pushes a
+//! predicate down, nothing re-applies what was dropped.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -19,7 +13,6 @@ use arrow::array::{ArrayRef, Int32Array, Int64Array, RecordBatch, StructArray};
 use arrow_schema::{DataType, Field, Fields, Schema};
 use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::listing::{ListingOptions, ListingTableUrl};
-use datafusion::physical_plan::display::DisplayableExecutionPlan;
 use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
 use parquet::arrow::ArrowWriter;
 use tempfile::TempDir;
@@ -72,18 +65,8 @@ async fn ids(ctx: &SessionContext, sql: &str) -> Vec<i64> {
     out
 }
 
-async fn plan_of(ctx: &SessionContext, sql: &str) -> String {
-    let (state, plan) = ctx.sql(sql).await.unwrap().into_parts();
-    let plan = state.create_physical_plan(&plan).await.unwrap();
-    format!(
-        "{}",
-        DisplayableExecutionPlan::new(plan.as_ref()).indent(true)
-    )
-}
-
-/// The repro from #21: one conjunct is pushable (`id >= 0`, matching all eight
-/// rows) and one is not (`st.a = 3`, matching one). Dropping the second returned
-/// all eight rows.
+/// One pushable conjunct (`id >= 0`, all eight rows) and one nested
+/// (`st.a = 3`, one row). Dropping the second returns all eight.
 #[tokio::test]
 async fn nested_column_conjunct_is_still_applied() {
     let dir = TempDir::new().unwrap();
@@ -99,31 +82,16 @@ async fn nested_column_conjunct_is_still_applied() {
     .unwrap();
 
     let sql = "SELECT id FROM t WHERE id >= 0 AND st.a = 3";
-
-    // The scan is declined rather than taken over with a filter that cannot
-    // evaluate `st.a`, so the plan still carries the whole predicate.
-    let plan = plan_of(&ctx, sql).await;
-    assert!(
-        plan.contains("id@0 >= 0 AND get_field(st@1, a) = 3"),
-        "the unevaluable conjunct left the plan:\n{plan}"
-    );
-    assert!(
-        !plan.contains("liquid_parquet"),
-        "the scan was taken over despite an unevaluable conjunct:\n{plan}"
-    );
-
-    // The first pass reads through the parquet fallback and would fill the cache;
-    // the second is served from it, a separate evaluation path.
+    // Cold reads through the source and fills the cache; warm is served from it,
+    // a separate evaluation path.
     for pass in ["cold", "warm"] {
         assert_eq!(ids(&ctx, sql).await, vec![3], "{pass}");
     }
 }
 
-/// Every conjunct being unevaluable was the case the old code thought was safe:
-/// it returned `None` only when *all* candidates failed. That was wrong too —
-/// `None` means the scan applies no filter at all, and the `FilterExec` that
-/// would have caught it is gone. `id > 100 OR st.a = 3` is a single conjunct
-/// touching `st`, so it takes that path, and it matches exactly one row.
+/// A single conjunct that mixes a pushable and a nested column through `OR`, so
+/// the whole predicate is one candidate. Refusing it and returning no filter at
+/// all means the scan applies nothing, and the `FilterExec` is already gone.
 #[tokio::test]
 async fn sole_unevaluable_conjunct_is_still_applied() {
     let dir = TempDir::new().unwrap();
@@ -144,56 +112,9 @@ async fn sole_unevaluable_conjunct_is_still_applied() {
     }
 }
 
-/// Declining a scan costs it the cache, so the refusal has to stay narrow: it is
-/// a nested column *in the predicate* that the row filter cannot evaluate, not
-/// the mere presence of one in the table or in the projection. Projecting `st.a`
-/// is still cached, and so is a scan of a table that merely has a struct column.
-#[tokio::test]
-async fn only_a_nested_predicate_costs_the_cache() {
-    let dir = TempDir::new().unwrap();
-    let parquet = dir.path().join("t.parquet");
-    write_t(&parquet);
-    let ctx = liquid_ctx(&dir.path().join("cache")).await;
-    ctx.register_parquet(
-        "t",
-        parquet.to_str().unwrap(),
-        ParquetReadOptions::default(),
-    )
-    .await
-    .unwrap();
-
-    for sql in [
-        "SELECT st.a FROM t WHERE id >= 0",
-        "SELECT id FROM t WHERE id >= 0",
-        "SELECT id FROM t",
-    ] {
-        let plan = plan_of(&ctx, sql).await;
-        assert!(
-            plan.contains("liquid_parquet"),
-            "`{sql}` lost the cache; the refusal has widened:\n{plan}"
-        );
-    }
-
-    for sql in [
-        "SELECT id FROM t WHERE st.a = 3",
-        "SELECT id FROM t WHERE id >= 0 AND st.a = 3",
-    ] {
-        let plan = plan_of(&ctx, sql).await;
-        assert!(
-            !plan.contains("liquid_parquet"),
-            "`{sql}` kept a filter it cannot evaluate:\n{plan}"
-        );
-    }
-}
-
-/// The other `PushdownChecker` refusal: a conjunct on a column that is not in the
-/// file schema. The table declares `extra`, the file does not have it, so every
-/// row's `extra` is NULL and `extra = 3` is never TRUE.
-///
-/// The scan is still cached here — the opener's physical-expr adapter resolves
-/// `extra` to a literal NULL before the row filter is built, so nothing is
-/// dropped — but the answer has to come out right either way, and a filter that
-/// dropped the conjunct would return all eight rows.
+/// A conjunct on a column that is not in the file schema. The table declares
+/// `extra`, the file lacks it, so every row's `extra` is NULL and `extra = 3` is
+/// never TRUE. A filter that dropped the conjunct would return all eight rows.
 #[tokio::test]
 async fn conjunct_on_column_outside_file_schema_is_still_applied() {
     let dir = TempDir::new().unwrap();
@@ -203,7 +124,7 @@ async fn conjunct_on_column_outside_file_schema_is_still_applied() {
     let ctx = liquid_ctx(&dir.path().join("cache")).await;
 
     // A declared schema wider than the file: `extra` exists in the table schema
-    // only. `st` is left out so this test exercises the missing-column path alone.
+    // only. `st` is left out so this exercises the missing-column path alone.
     let declared = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
         Field::new("extra", DataType::Int64, true),

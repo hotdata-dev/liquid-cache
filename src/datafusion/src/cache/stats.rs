@@ -124,19 +124,17 @@ impl LiquidCacheParquet {
     pub fn write_stats(&self, parquet_file_path: impl AsRef<Path>) -> Result<(), ParquetError> {
         let mut writer = StatsWriter::new(parquet_file_path)?;
         self.cache_store
-            .for_each_entry(|entry_id, _identity, cached_batch| {
+            .for_each_entry(|entry_id, _, cached_batch| {
                 let memory_size = cached_batch.memory_usage_bytes();
                 let row_count = match cached_batch {
                     CacheEntry::MemoryArrow(array) => Some(array.len() as u64),
                     CacheEntry::MemoryLiquid(array) => Some(array.len() as u64),
-                    CacheEntry::MemorySqueezedLiquid(array) => Some(array.len() as u64),
                     CacheEntry::DiskLiquid { .. } => None,
                     CacheEntry::DiskArrow { .. } => None, // We'd need to read it to get the count
                 };
                 let cache_type = match cached_batch {
                     CacheEntry::MemoryArrow(_) => "InMemory",
                     CacheEntry::MemoryLiquid(_) => "LiquidMemory",
-                    CacheEntry::MemorySqueezedLiquid(_) => "LiquidSqueezed",
                     CacheEntry::DiskLiquid { .. } => "OnDiskLiquid",
                     CacheEntry::DiskArrow { .. } => "OnDiskArrow",
                 };
@@ -163,18 +161,17 @@ impl LiquidCacheParquet {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Read;
+    use std::fs::File;
 
-    use crate::cache::id::BatchID;
+    use crate::cache::{ParquetFileIdentity, id::BatchID};
 
     use super::*;
     use arrow::{
         array::{Array, AsArray},
         datatypes::UInt64Type,
     };
-    use bytes::Bytes;
     use liquid_cache::{
-        cache::{AlwaysHydrate, squeeze_policies::Evict},
+        cache::{AlwaysHydrate, Evict},
         cache_policies::LiquidPolicy,
     };
     use parquet::arrow::arrow_reader::ParquetRecordBatchReader;
@@ -183,7 +180,9 @@ mod tests {
     #[tokio::test]
     async fn test_stats_writer() -> Result<(), ParquetError> {
         let tmp_dir = tempfile::tempdir().unwrap();
-        let store = crate::test_utils::mount_test_store(tmp_dir.path()).await;
+        let store = t4::mount(tmp_dir.path().join("liquid_cache.t4"))
+            .await
+            .unwrap();
         let cache = LiquidCacheParquet::new(
             1024,
             usize::MAX,
@@ -211,7 +210,13 @@ mod tests {
         // opening the next would hand them all the same id.
         let files: Vec<_> = (0..8)
             .map(|file_no| {
-                cache.register_or_get_file(format!("test_{file_no}.parquet"), schema.clone())
+                cache.register_or_get_file(
+                    ParquetFileIdentity::new(
+                        datafusion::execution::object_store::ObjectStoreUrl::local_filesystem(),
+                        format!("test_{file_no}.parquet"),
+                    ),
+                    schema.clone(),
+                )
             })
             .collect();
         for file in &files {
@@ -236,14 +241,11 @@ mod tests {
             }
         }
 
-        let mut tmp_file = NamedTempFile::new()?;
+        let tmp_file = NamedTempFile::new()?;
         cache.write_stats(tmp_file.path())?;
 
         // Read and verify stats
-        let mut bytes = Vec::new();
-        tmp_file.read_to_end(&mut bytes)?;
-        let bytes = Bytes::from(bytes);
-        let reader = ParquetRecordBatchReader::try_new(bytes, 8192)?;
+        let reader = ParquetRecordBatchReader::try_new(File::open(tmp_file.path())?, 8192)?;
 
         let batch = reader.into_iter().next().unwrap()?;
         assert_eq!(batch.num_rows(), num_rows);
