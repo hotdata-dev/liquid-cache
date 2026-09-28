@@ -1,8 +1,10 @@
 # Working in this fork
 
 `hotdata-dev/liquid-cache` is a fork of `datafusion-contrib/liquid-cache`.
-`main` contains upstream's history in full plus our patches, so
-`git merge-base main upstream/main` resolves.
+`origin/main` contains upstream's history in full plus our patches, so
+`git merge-base origin/main upstream/main` resolves. Check `origin/main`
+rather than local `main`: a local branch can track the wrong remote or simply
+be stale, and neither says so.
 
 ## Set your remotes up first
 
@@ -33,7 +35,15 @@ misread as the opposite of what it meant) — rename it, then add ours:
 ```
 git remote rename origin upstream
 git remote add origin git@github.com:hotdata-dev/liquid-cache.git
+git fetch origin
+git branch --set-upstream-to=origin/main main
 ```
+
+The last two matter: `git remote rename` rewrites the tracking config of every
+branch that followed it, so after the rename local `main` follows
+`upstream/main`. A `git pull` on `main` would then merge upstream straight into
+it, and `git merge-base main upstream/main` would pass whatever the fork's
+state is.
 
 Either way, confirm the two point at *different* repositories before relying
 on anything below:
