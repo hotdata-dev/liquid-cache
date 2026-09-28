@@ -13,14 +13,34 @@ origin     hotdata-dev/liquid-cache          ours, where we push
 upstream   datafusion-contrib/liquid-cache   theirs, read-only
 ```
 
-Check with `git remote -v`. A clone made from upstream has it backwards —
-`origin` pointing at *upstream* — which has already been misread as the
-opposite of what it meant. Fix it once:
+See what you have first — the two cases need different commands, and running
+the wrong one leaves both remotes pointing at this fork, where `upstream/main`
+silently means our `main` and every recipe below is wrong with no error.
+
+```
+git remote -v
+```
+
+**Cloned this fork** (`origin` already correct) — add the other:
+
+```
+git remote add upstream https://github.com/datafusion-contrib/liquid-cache.git
+```
+
+**Cloned upstream** (`origin` points at *upstream*, which has already been
+misread as the opposite of what it meant) — rename it, then add ours:
 
 ```
 git remote rename origin upstream
 git remote add origin git@github.com:hotdata-dev/liquid-cache.git
-git remote set-url upstream https://github.com/datafusion-contrib/liquid-cache.git
+```
+
+Either way, confirm the two point at *different* repositories before relying
+on anything below:
+
+```
+git remote get-url origin    # must be hotdata-dev
+git remote get-url upstream  # must be datafusion-contrib
 ```
 
 Then `origin/main` and `upstream/main` are stable refs that mean one thing.
