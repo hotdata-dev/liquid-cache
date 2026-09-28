@@ -2,61 +2,49 @@
 
 `hotdata-dev/liquid-cache` is a fork of `datafusion-contrib/liquid-cache`.
 `main` contains upstream's history in full plus our patches, so
-`git merge-base main <any upstream commit>` resolves.
+`git merge-base main upstream/main` resolves.
 
-Nothing here states where upstream currently is, or where we are: both move.
-Ask git instead.
+## Set your remotes up first
+
+The standard fork layout, which everything below assumes:
 
 ```
-git fetch https://github.com/datafusion-contrib/liquid-cache main
-git log --oneline FETCH_HEAD..main   # ours that upstream does not have
-git log --oneline main..FETCH_HEAD   # upstream's that we do not have
+origin     hotdata-dev/liquid-cache          ours, where we push
+upstream   datafusion-contrib/liquid-cache   theirs, read-only
 ```
+
+Check with `git remote -v`. A clone made from upstream has it backwards —
+`origin` pointing at *upstream* — which has already been misread as the
+opposite of what it meant. Fix it once:
+
+```
+git remote rename origin upstream
+git remote add origin git@github.com:hotdata-dev/liquid-cache.git
+git remote set-url upstream https://github.com/datafusion-contrib/liquid-cache.git
+```
+
+Then `origin/main` and `upstream/main` are stable refs that mean one thing.
+Prefer them over `FETCH_HEAD`, which holds only the most recent fetch and has
+repeatedly produced instructions in this file that silently checked the wrong
+thing.
 
 `AGENTS.md` and `README.md` are upstream's and describe the project itself.
 This file is ours and describes only what differs here. Nothing in this repo
 should edit an upstream-owned file to record a fork convention: that conflicts
 on every sync. Add a file upstream does not have instead.
 
-## Remotes
-
-**Check before using a remote name. They vary by clone and they are not what
-you would guess** — in at least one working copy `origin` is *upstream* and the
-fork is a second remote named `fork`, which is the reverse of the usual
-arrangement.
-
-```
-git remote -v
-```
-
-Commands below name repositories by URL rather than by remote, so they are
-correct in any clone. Do the same when writing instructions for anyone else: a
-bare `origin/main` is ambiguous here and has already been misread as the
-opposite of what it meant.
-
 ## Branches
 
-- Work off `main`, and fetch before branching — a local `main` goes stale with
-  no signal, and branching off a stale one silently drops everything merged
-  since.
-- **Upstream PRs branch from upstream, not from `main`**, and are named
-  `upstream/<topic>`. A branch cut from `main` carries our whole patch stack
-  into the PR diff.
+- `git fetch origin` before branching, and branch from `origin/main`. A local
+  `main` goes stale with no signal, and branching off a stale one silently
+  drops everything merged since.
+- **Upstream PRs branch from upstream**, named `upstream/<topic>`. A branch cut
+  from our `main` carries the whole patch stack into the PR diff.
 
   ```
-  git fetch https://github.com/datafusion-contrib/liquid-cache main
-  git checkout -b upstream/<topic> FETCH_HEAD
-  ```
-
-  Before pushing, this must list only the commits you wrote — anything else is
-  a fork patch that would land in the upstream diff. Re-fetch upstream on the
-  line above it: `FETCH_HEAD` holds whatever the last fetch wrote, so after
-  fetching any other remote it is no longer upstream and the check hides every
-  fork patch.
-
-  ```
-  git fetch https://github.com/datafusion-contrib/liquid-cache main
-  git log --oneline FETCH_HEAD..HEAD
+  git fetch upstream
+  git checkout -b upstream/<topic> upstream/main
+  git log --oneline upstream/main..HEAD   # must list only your own commits
   ```
 
   `.github/workflows/upstream-branch-guard.yml` checks the same property on
@@ -73,45 +61,32 @@ opposite of what it meant.
 
 ## Syncing from upstream
 
-Merge upstream into a branch off `main` and raise a PR; do not use GitHub's
-"Sync fork" button, which offers to discard our commits when the merge is not
-a fast-forward.
-
-Fetch *this fork* first and branch from what came back, not from local `main`
-— the upstream fetch below never refreshes `main`, so a stale one would make
-the sync PR revert fork commits merged since. Use each `FETCH_HEAD`
-immediately: it holds only the last fetch.
-
 ```
-git fetch https://github.com/hotdata-dev/liquid-cache main
-git checkout -b sync/upstream-<date> FETCH_HEAD
-
-git fetch https://github.com/datafusion-contrib/liquid-cache main
-git merge FETCH_HEAD
+git fetch --multiple origin upstream
+git checkout -b sync/upstream-<date> origin/main
+git merge upstream/main
 ```
 
-**Merge this PR, do not squash it.** A squash gives the result a single parent,
+Raise a PR; do not use GitHub's "Sync fork" button, which offers to discard our
+commits when the merge is not a fast-forward.
+
+**Merge that PR, do not squash it.** A squash gives the result a single parent,
 so upstream's history never enters `main`'s ancestry: the merge-base does not
-move, the same upstream commits stay missing, and nothing reports it.
-
-Verify afterwards. The merge happens on GitHub, so local `main` does not have
-it and must not be what you check; and `FETCH_HEAD` holds only the last fetch,
-so capture upstream before fetching the fork over it:
+move, the same upstream commits stay missing, and nothing reports it. Verify
+afterwards — the merge happens on GitHub, so fetch before checking:
 
 ```
-git fetch https://github.com/datafusion-contrib/liquid-cache main
-upstream=$(git rev-parse FETCH_HEAD)
-git fetch https://github.com/hotdata-dev/liquid-cache main
-git merge-base --is-ancestor "$upstream" FETCH_HEAD && echo ok
+git fetch --multiple origin upstream
+git merge-base --is-ancestor upstream/main origin/main && echo ok
 ```
 
 A change we contributed upstream comes back as their squash of it. The content
 matches but the commit does not, so the merge conflicts where both sides
-touched the same lines — typically a module list that each side appended to.
-Keep ours *for the returned change*, and keep any other upstream edit in the
-same hunk: upstream may have appended something of its own next to it, and
-taking the whole hunk from our side drops that silently. Read the hunk rather
-than resolving by rule.
+touched the same lines — typically a module list each side appended to. Keep
+ours *for the returned change*, and keep any other upstream edit in the same
+hunk: upstream may have appended something of its own next to it, and taking
+the whole hunk from our side drops that silently. Read the hunk rather than
+resolving by rule.
 
 Sync promptly rather than letting such a conflict wait: alone it is obvious,
 bundled with real upstream work later it is not.
