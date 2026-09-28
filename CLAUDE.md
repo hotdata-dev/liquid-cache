@@ -144,15 +144,12 @@ bundled with real upstream work later it is not.
   default-build total at all, and CI stays green because a missing test is not
   a failing one.
 
-## Known open issue
+## Reporting a problem
 
-The disk reclaim path has an unclosed race. A store key is
-`(entry id, identity)` and identities are reused — the file-id pool hands a
-re-opened path its previous record. `reclaim_orphaned_disk` consults the index
-before deleting, but a put that has landed while its index record is not yet
-installed is invisible to that check, and t4 applies puts and tombstones by
-LSN, so the later `remove` wins and deletes live bytes.
+Open an issue. Nothing in this file records a specific bug: a bug is by
+definition temporary, and this file goes stale the moment someone fixes one
+without remembering to edit it.
 
-Closing it needs a per-write generation in the store key, which also makes
-`DiskResidue::superseded` unreachable and removes the in-place-overwrite case.
-Not yet done. Do not re-report it as new.
+Check the open issues before reporting something — known gaps in the cache's
+accounting and reclamation are tracked there, and at least one has been
+re-discovered more than once.
