@@ -92,8 +92,18 @@ git merge FETCH_HEAD
 
 **Merge this PR, do not squash it.** A squash gives the result a single parent,
 so upstream's history never enters `main`'s ancestry: the merge-base does not
-move, the same upstream commits stay missing, and nothing reports it. Verify
-after merging that `git merge-base main FETCH_HEAD` is upstream's tip.
+move, the same upstream commits stay missing, and nothing reports it.
+
+Verify afterwards. The merge happens on GitHub, so local `main` does not have
+it and must not be what you check; and `FETCH_HEAD` holds only the last fetch,
+so capture upstream before fetching the fork over it:
+
+```
+git fetch https://github.com/datafusion-contrib/liquid-cache main
+upstream=$(git rev-parse FETCH_HEAD)
+git fetch https://github.com/hotdata-dev/liquid-cache main
+git merge-base --is-ancestor "$upstream" FETCH_HEAD && echo ok
+```
 
 A change we contributed upstream comes back as their squash of it. The content
 matches but the commit does not, so the merge conflicts where both sides
