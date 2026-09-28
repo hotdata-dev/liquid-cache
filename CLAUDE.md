@@ -77,18 +77,34 @@ Merge upstream into a branch off `main` and raise a PR; do not use GitHub's
 "Sync fork" button, which offers to discard our commits when the merge is not
 a fast-forward.
 
+Fetch *this fork* first and branch from what came back, not from local `main`
+— the upstream fetch below never refreshes `main`, so a stale one would make
+the sync PR revert fork commits merged since. Use each `FETCH_HEAD`
+immediately: it holds only the last fetch.
+
 ```
+git fetch https://github.com/hotdata-dev/liquid-cache main
+git checkout -b sync/upstream-<date> FETCH_HEAD
+
 git fetch https://github.com/datafusion-contrib/liquid-cache main
-git checkout -b sync/upstream-<date> main
 git merge FETCH_HEAD
 ```
+
+**Merge this PR, do not squash it.** A squash gives the result a single parent,
+so upstream's history never enters `main`'s ancestry: the merge-base does not
+move, the same upstream commits stay missing, and nothing reports it. Verify
+after merging that `git merge-base main FETCH_HEAD` is upstream's tip.
 
 A change we contributed upstream comes back as their squash of it. The content
 matches but the commit does not, so the merge conflicts where both sides
 touched the same lines — typically a module list that each side appended to.
-Resolve by keeping ours, which already contains the change. Sync promptly
-rather than letting such a conflict wait: alone it is obvious, bundled with
-real upstream work later it is not.
+Keep ours *for the returned change*, and keep any other upstream edit in the
+same hunk: upstream may have appended something of its own next to it, and
+taking the whole hunk from our side drops that silently. Read the hunk rather
+than resolving by rule.
+
+Sync promptly rather than letting such a conflict wait: alone it is obvious,
+bundled with real upstream work later it is not.
 
 ## Building and testing
 
