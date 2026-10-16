@@ -20,12 +20,13 @@ use std::sync::Arc;
 #[derive(Debug)]
 pub struct CachedColumn {
     cache_store: Arc<LiquidCache>,
-    /// The lease its keys are built from. Held so the id cannot be recycled
-    /// while this column can still compute keys from it; `identity()` is what
-    /// every cache read and write is checked against.
-    file_id: Arc<crate::cache::file_id::FileId>,
     field: Arc<Field>,
     column_path: ColumnAccessPath,
+    /// The unnarrowed id of the file this column belongs to. `column_path`
+    /// keeps only its low 16 bits, so another file can compute the same
+    /// entry ids; the cache serves an entry only to the identity it was
+    /// cached for.
+    file_identity: u64,
     expression: Option<Arc<CacheExpression>>,
     snapshots: Arc<RowGroupSnapshots>,
 }
@@ -58,8 +59,8 @@ impl CachedColumn {
     pub(crate) fn new(
         field: Arc<Field>,
         cache_store: Arc<LiquidCache>,
-        file_id: Arc<crate::cache::file_id::FileId>,
         column_access_path: ColumnAccessPath,
+        file_identity: u64,
         expression: Option<Arc<CacheExpression>>,
         is_predicate_column: bool,
         snapshots: Arc<RowGroupSnapshots>,
@@ -83,27 +84,25 @@ impl CachedColumn {
         Self {
             field,
             cache_store,
-            file_id,
             column_path: column_access_path,
+            file_identity,
             expression,
             snapshots,
         }
     }
 
     /// row_id must be on a batch boundary.
-    /// The unnarrowed name of the file this column reads, recorded with every
-    /// entry it caches and checked on every read.
-    pub(crate) fn identity(&self) -> u64 {
-        self.file_id.identity()
-    }
-
     pub(crate) fn entry_id(&self, batch_id: BatchID) -> ParquetArrayID {
         self.column_path.entry_id(batch_id)
     }
 
+    pub(crate) fn file_identity(&self) -> u64 {
+        self.file_identity
+    }
+
     pub(crate) fn contains(&self, batch_id: BatchID) -> bool {
         self.cache_store
-            .is_cached(&self.entry_id(batch_id).into(), self.identity())
+            .contains(&self.entry_id(batch_id).into(), self.file_identity)
     }
 
     pub(crate) fn snapshot_entry(&self, batch_id: BatchID) -> Option<Arc<CacheEntry>> {
@@ -144,7 +143,7 @@ impl CachedColumn {
                     self.cache_store
                         .eval_predicate_on_entry(
                             &entry_id,
-                            self.identity(),
+                            self.file_identity,
                             entry.as_ref(),
                             Some(filter),
                             &liquid_expr,
@@ -153,7 +152,7 @@ impl CachedColumn {
                 }
                 None => {
                     self.cache_store
-                        .eval_predicate(&entry_id, self.identity(), &liquid_expr)
+                        .eval_predicate(&entry_id, self.file_identity, &liquid_expr)
                         .with_selection(filter)
                         .await
                 }
@@ -205,7 +204,7 @@ impl CachedColumn {
                 .cache_store
                 .read_entry(
                     &entry_id,
-                    self.identity(),
+                    self.file_identity,
                     entry.as_ref(),
                     Some(filter),
                     self.expression.as_deref(),
@@ -213,7 +212,7 @@ impl CachedColumn {
                 .await;
         }
         self.cache_store
-            .get(&entry_id, self.identity())
+            .get(&entry_id, self.file_identity)
             .with_selection(filter)
             .with_optional_expression_hint(self.expression())
             .read()
@@ -223,7 +222,7 @@ impl CachedColumn {
     #[cfg(test)]
     pub(crate) async fn get_arrow_array_test_only(&self, batch_id: BatchID) -> Option<ArrayRef> {
         let entry_id = self.entry_id(batch_id).into();
-        self.cache_store.get(&entry_id, self.identity()).await
+        self.cache_store.get(&entry_id, self.file_identity).await
     }
 
     /// Insert an array into the cache.
@@ -237,7 +236,7 @@ impl CachedColumn {
         }
 
         self.cache_store
-            .insert(self.entry_id(batch_id).into(), self.identity(), array)
+            .insert(self.entry_id(batch_id).into(), self.file_identity, array)
             .await?;
         Ok(())
     }
@@ -254,7 +253,11 @@ impl CachedColumn {
         if self.snapshots.get(&entry_id).is_some() {
             return PrefetchOutcome::AlreadySnapshotted;
         }
-        match self.cache_store.prefetch(&entry_id, self.identity()).await {
+        match self
+            .cache_store
+            .prefetch(&entry_id, self.file_identity)
+            .await
+        {
             PrefetchResult::Snapshot(entry) => {
                 self.snapshots.insert(entry_id, entry);
                 PrefetchOutcome::Snapshotted

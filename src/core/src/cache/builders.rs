@@ -175,8 +175,6 @@ pub fn default_max_memory_bytes() -> usize {
 pub struct Insert<'a> {
     pub(super) storage: &'a Arc<LiquidCache>,
     pub(super) entry_id: EntryID,
-    /// The unnarrowed name of the source this data belongs to, recorded with
-    /// the entry so a key collision cannot serve it to anyone else.
     pub(super) identity: u64,
     pub(super) batch: ArrayRef,
     pub(super) skip_gc: bool,
@@ -223,11 +221,7 @@ impl<'a> Insert<'a> {
         }
         let batch = CacheEntry::memory_arrow(batch);
         self.storage
-            .insert_inner(
-                self.entry_id,
-                crate::cache::index::WriteIdentity::Owned(self.identity),
-                batch,
-            )
+            .insert_inner(self.entry_id, self.identity, batch)
             .await
     }
 }

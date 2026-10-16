@@ -104,7 +104,7 @@ async fn liquid_eviction_reads_memory_and_disk() {
     }
 
     let mut states = Vec::new();
-    cache.for_each_entry(|_, _, entry| states.push(CachedBatchType::from(entry)));
+    cache.for_each_entry(|_, entry| states.push(CachedBatchType::from(entry)));
     assert!(
         states
             .iter()
@@ -154,7 +154,7 @@ async fn liquid_eviction_reads_memory_and_disk() {
 
     cache.flush_all_to_disk().await.unwrap();
     let mut disk_states = Vec::new();
-    cache.for_each_entry(|_, _, entry| disk_states.push(CachedBatchType::from(entry)));
+    cache.for_each_entry(|_, entry| disk_states.push(CachedBatchType::from(entry)));
     assert!(disk_states.iter().all(|state| matches!(
         state,
         CachedBatchType::DiskLiquid | CachedBatchType::DiskArrow
