@@ -1,9 +1,9 @@
-//! Regression tests for issue #13: the reader indexes the cache by batch id, and
-//! the parquet fallback turns that id back into rows using the *cache* batch size.
-//! Reading at the session batch size (`datafusion.execution.batch_size`) instead
-//! therefore addressed the wrong rows whenever the two differed — the scan either
-//! ran off the end of the row group and panicked, or silently returned rows from
-//! the wrong offsets.
+//! Regression tests for batch-size alignment: the reader indexes the cache by batch
+//! id, and the parquet fallback turns that id back into rows using the *cache* batch
+//! size. Reading at the session batch size (`datafusion.execution.batch_size`)
+//! instead addresses the wrong rows whenever the two differ — the scan either runs
+//! off the end of the row group and fails, or silently returns rows from the wrong
+//! offsets.
 //!
 //! `LiquidCacheLocalBuilder::build` pins `execution.batch_size` to the cache batch
 //! size, which is why the default configuration never hit this. A host that sets a
@@ -150,7 +150,7 @@ async fn narrowed_session_batch_size_with_limit_returns_aligned_rows() {
     assert_eq!(ids, (0..4290).collect::<Vec<_>>());
 }
 
-/// Issue #13 question 2: the fully-cached path misaligned as well. The cold run
+/// The fully-cached path misaligns as well. The cold run
 /// populates cache batches 0 and 1; the warm run reads only from the cache and
 /// used to emit rows 8192.. for query batch 1, because `read_arrow_array` applied
 /// the 2145-bit selection to the 8192-row stored chunk and `arrow::compute::filter`

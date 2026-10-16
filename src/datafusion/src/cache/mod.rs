@@ -3,9 +3,7 @@
 
 use crate::io::ParquetCacheMetadata;
 use crate::reader::{LiquidPredicate, extract_multi_column_or};
-use crate::sync::RwLock;
-mod file_id;
-
+use crate::sync::{Mutex, RwLock};
 use ahash::AHashMap;
 use arrow::array::{BooleanArray, RecordBatch, RecordBatchOptions};
 use arrow::buffer::BooleanBuffer;
@@ -23,6 +21,7 @@ use parquet::arrow::arrow_reader::ArrowPredicate;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 mod column;
 mod id;
@@ -51,15 +50,6 @@ pub struct ParquetFileIdentity {
 }
 
 impl ParquetFileIdentity {
-    /// The key a file id is leased against.
-    ///
-    /// Both components, for the same reason the identity carries both: a path
-    /// is unique only within its object store, so keying on it alone would let
-    /// two stores share one lease and therefore one set of cache keys.
-    pub(crate) fn lease_key(&self) -> String {
-        format!("{}{}", self.object_store_url.as_str(), self.path)
-    }
-
     /// Create an identity from an object store URL and an object path.
     pub fn new(object_store_url: ObjectStoreUrl, path: String) -> Self {
         Self {
@@ -118,19 +108,18 @@ impl CachedRowGroup {
     fn new(
         cache_store: Arc<LiquidCache>,
         row_group_idx: u64,
-        file_id: Arc<file_id::FileId>,
+        file_idx: u64,
         columns: &[CachedColumnSpec],
         snapshots: Arc<RowGroupSnapshots>,
     ) -> Self {
         let mut column_maps = ColumnMaps::default();
         for (column_id, field, expression, is_predicate_column) in columns {
-            let column_access_path =
-                ColumnAccessPath::new(file_id.get(), row_group_idx, *column_id);
+            let column_access_path = ColumnAccessPath::new(file_idx, row_group_idx, *column_id);
             let column = Arc::new(CachedColumn::new(
                 Arc::clone(field),
                 Arc::clone(&cache_store),
-                Arc::clone(&file_id),
                 column_access_path,
+                file_idx,
                 expression.clone(),
                 *is_predicate_column,
                 Arc::clone(&snapshots),
@@ -232,7 +221,7 @@ impl CachedRowGroup {
                         Some(array) => Some(array),
                         None => {
                             self.cache_store
-                                .try_read_liquid(&entry_id, column.identity())
+                                .try_read_liquid(&entry_id, column.file_identity())
                                 .await
                         }
                     };
@@ -293,9 +282,7 @@ pub(crate) type CachedRowGroupRef = Arc<CachedRowGroup>;
 #[derive(Debug)]
 pub struct CachedFile {
     cache_store: Arc<LiquidCache>,
-    /// Held, not copied: the id returns to the pool when the last holder — this
-    /// file and everything derived from it — is dropped.
-    file_id: Arc<file_id::FileId>,
+    file_id: u64,
     file_schema: SchemaRef,
     lineages: Arc<ColumnLineages>,
 }
@@ -303,7 +290,7 @@ pub struct CachedFile {
 impl CachedFile {
     fn new(
         cache_store: Arc<LiquidCache>,
-        file_id: Arc<file_id::FileId>,
+        file_id: u64,
         file_schema: SchemaRef,
         lineages: Arc<ColumnLineages>,
     ) -> Self {
@@ -350,7 +337,7 @@ impl CachedFile {
         Arc::new(CachedRowGroup::new(
             self.cache_store.clone(),
             row_group_id,
-            Arc::clone(&self.file_id),
+            self.file_id,
             &columns,
             snapshots,
         ))
@@ -374,12 +361,11 @@ pub(crate) type CachedFileRef = Arc<CachedFile>;
 #[derive(Debug)]
 pub struct LiquidCacheParquet {
     /// Map object-store-qualified file identity to file id.
-    /// Leases the file ids that cache keys are built from, so the id space
-    /// tracks the files being read rather than every file ever read — see
-    /// [`file_id`].
-    file_ids: Arc<file_id::FileIdPool>,
+    files: Mutex<AHashMap<ParquetFileIdentity, u64>>,
 
     cache_store: Arc<LiquidCache>,
+
+    current_file_id: AtomicU64,
 }
 
 /// A reference to the main cache structure.
@@ -438,8 +424,9 @@ impl LiquidCacheParquet {
             .await;
 
         LiquidCacheParquet {
-            file_ids: file_id::FileIdPool::new(),
+            files: Mutex::new(AHashMap::new()),
             cache_store: cache_storage,
+            current_file_id: AtomicU64::new(0),
         }
     }
 
@@ -460,34 +447,41 @@ impl LiquidCacheParquet {
         full_file_schema: SchemaRef,
         lineages: Arc<ColumnLineages>,
     ) -> CachedFileRef {
+        let mut files = self.files.lock().unwrap();
+        let file_id = *files
+            .entry(file_identity)
+            .or_insert_with(|| self.current_file_id.fetch_add(1, Ordering::Relaxed));
+        drop(files);
+
         Arc::new(CachedFile::new(
             self.cache_store.clone(),
-            self.file_ids.acquire(&file_identity.lease_key()),
+            file_id,
             full_file_schema,
             lineages,
         ))
     }
 
-    /// How many file ids are currently leased.
+    /// How many distinct files have been registered with this cache.
     ///
-    /// Bounded by the files being read, not by everything ever read. Rising
-    /// without bound means leases are being held longer than the reads that
-    /// need them.
+    /// File ids are never reused, so this counts every file ever registered,
+    /// not only those being read now.
     pub fn leased_file_ids(&self) -> usize {
-        self.file_ids.live_count()
+        self.files.lock().unwrap().len()
     }
 
-    /// How many ids have been handed out that do not fit the cache key's
-    /// 16-bit file field. Non-zero means more files are being read at once
-    /// than the key can name, and ids are being recycled under entries that
-    /// are still resident.
+    /// How many file ids have been handed out that do not fit the cache key's
+    /// 16-bit file field. Above zero, distinct files compute the same keys:
+    /// each is served correctly, but they cannot share the cache.
     pub fn file_ids_over_key_width(&self) -> u64 {
-        self.file_ids.over_key_width()
+        self.current_file_id
+            .load(Ordering::Relaxed)
+            .saturating_sub(1 << 16)
     }
 
-    /// How many cache lookups or writes found a key held by another file.
+    /// How many cache lookups found a key held by another file, and missed
+    /// rather than serve it.
     pub fn identity_mismatches(&self) -> u64 {
-        self.cache_store.stats().identity_mismatches
+        self.cache_store.identity_mismatches()
     }
 
     /// Get the batch size of the cache.
@@ -536,7 +530,8 @@ impl LiquidCacheParquet {
     /// This is unsafe because resetting the cache while other threads are using the cache may cause undefined behavior.
     /// You should only call this when no one else is using the cache.
     pub unsafe fn reset(&self) {
-        self.file_ids.reset();
+        let mut files = self.files.lock().unwrap();
+        files.clear();
         self.cache_store.reset();
     }
 
@@ -960,5 +955,71 @@ mod tests {
         // Expected: row 1 (name="Bob"), row 3 (city="Tokyo") -> indices 1, 3
         let expected = BooleanBuffer::collect_bool(batch_size, |i| i == 1 || i == 3).into();
         assert_eq!(result, expected);
+    }
+
+    /// A cache key holds 16 bits of file id, so the 65,537th file registered
+    /// computes the same keys as the first. Its reads must not be served the
+    /// first file's data, and its own data must still be cacheable.
+    #[tokio::test]
+    async fn files_whose_keys_collide_do_not_share_entries() {
+        let batch_size = 64;
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let store = t4::mount(tmp_dir.path().join("liquid_cache.t4"))
+            .await
+            .unwrap();
+        let cache = LiquidCacheParquet::new(
+            batch_size,
+            usize::MAX,
+            usize::MAX,
+            store,
+            Box::new(LiquidPolicy::new()),
+            Box::new(TranscodeEvict),
+            Box::new(AlwaysHydrate::new()),
+        )
+        .await;
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let identity =
+            |path: String| ParquetFileIdentity::new(ObjectStoreUrl::local_filesystem(), path);
+        let batch_id = BatchID::from_row_id(0, batch_size);
+
+        let first = cache.register_or_get_file(identity("first".to_string()), schema.clone());
+        let first_column = first.create_row_group(0, vec![]).get_column(0).unwrap();
+        let first_data: ArrayRef = Arc::new(Int32Array::from_iter_values(0..batch_size as i32));
+        first_column
+            .insert(batch_id, first_data.clone())
+            .await
+            .unwrap();
+
+        for i in 1..=u16::MAX as u32 {
+            cache.register_or_get_file(identity(format!("filler-{i}")), schema.clone());
+        }
+
+        let colliding = cache.register_or_get_file(identity("colliding".to_string()), schema);
+        let colliding_column = colliding.create_row_group(0, vec![]).get_column(0).unwrap();
+        assert_eq!(
+            colliding_column.entry_id(batch_id),
+            first_column.entry_id(batch_id),
+            "the 65,537th file should compute the first file's key"
+        );
+
+        assert!(
+            colliding_column
+                .get_arrow_array_test_only(batch_id)
+                .await
+                .is_none(),
+            "a file was served another file's cached data"
+        );
+
+        let colliding_data: ArrayRef =
+            Arc::new(Int32Array::from_iter_values((0..batch_size as i32).rev()));
+        colliding_column
+            .insert(batch_id, colliding_data.clone())
+            .await
+            .expect("a file could not cache its own data");
+        let read = colliding_column
+            .get_arrow_array_test_only(batch_id)
+            .await
+            .unwrap();
+        assert_eq!(read.as_ref(), colliding_data.as_ref());
     }
 }

@@ -24,14 +24,12 @@ let storage = LiquidCacheBuilder::new().build().await;
 let entry_id = EntryID::from(42);
 let arrow_array = Arc::new(UInt64Array::from_iter_values(0..1000));
 
-// Insert once; replacement/placement is handled by the cache policy
-// `0` is the file identity: the unnarrowed name of the source this data
-// belongs to. Cache keys pack their fields into fixed widths, so two sources
-// can compute one key; the identity is what keeps a read from being served
-// the other's data. One source here, so any constant will do.
+// Insert once; replacement/placement is handled by the cache policy.
+// `0` is the identity: the source this data belongs to. Reads under any
+// other identity miss. One source here, so any constant will do.
 storage.insert(entry_id, 0, arrow_array.clone()).await;
 
-assert!(storage.is_cached(&entry_id, 0));
+assert!(storage.contains(&entry_id, 0));
 });
 ```
 

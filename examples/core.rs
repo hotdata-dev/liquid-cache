@@ -18,10 +18,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await;
 
     let entry_id = EntryID::from(7);
-    // The identity names which source this data came from. A cache key packs
-    // its fields into fixed widths, so two sources can compute one key; the
-    // identity is what keeps a read from being served the other's data. One
-    // source here, so any constant will do.
+    // The identity names the source this data belongs to. One source here,
+    // so any constant will do.
     let identity = 0;
     let arrow_array = Arc::new(UInt64Array::from_iter_values(0..16));
     storage
