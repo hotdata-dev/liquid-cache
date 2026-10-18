@@ -17,7 +17,10 @@ use datafusion::{
     config::ConfigOptions,
     datasource::{
         listing::PartitionedFile,
-        physical_plan::{FileScanConfig, FileSource, ParquetSource},
+        physical_plan::{
+            FileScanConfig, FileSource, ParquetSource,
+            parquet::{ParquetAccessPlan, ParquetRowSelection, RowGroupAccess},
+        },
         source::DataSource,
         table_schema::TableSchema,
     },
@@ -29,7 +32,12 @@ use datafusion::{
 pub(crate) use lineage::HintAnalyzer;
 pub use lineage::LineageHints;
 
-use crate::{LiquidCacheParquetRef, LiquidParquetSource, cache::ColumnLineages};
+use crate::{
+    LiquidCacheParquetRef, LiquidParquetSource, cache::ColumnLineages, reader::TouchedBatches,
+};
+
+/// Default [`LocalModeOptimizer::with_sparse_selection_ratio`].
+pub const DEFAULT_SPARSE_SELECTION_RATIO: f64 = 0.05;
 
 /// Parameters for the footprint-based admission gate.
 ///
@@ -89,6 +97,8 @@ pub struct LocalModeOptimizer {
     /// left as a vanilla parquet read instead of being wrapped by LiquidCache.
     /// `None` means cache every scan.
     admission: Option<AdmissionGate>,
+    /// See [`Self::with_sparse_selection_ratio`].
+    sparse_selection_ratio: f64,
 }
 
 impl LocalModeOptimizer {
@@ -98,6 +108,7 @@ impl LocalModeOptimizer {
             cache,
             prefetch: true,
             admission: None,
+            sparse_selection_ratio: DEFAULT_SPARSE_SELECTION_RATIO,
         }
     }
 
@@ -156,6 +167,49 @@ impl LocalModeOptimizer {
         }
         self
     }
+
+    /// A scan whose files' row selections (a `ParquetAccessPlan` or
+    /// `ParquetRowSelection` extension, e.g. from a secondary index) keep fewer
+    /// than this fraction of its rows is *sparse*. A sparse scan is never
+    /// admitted with its whole projection: a cache miss fills whole cache
+    /// batches of every cached column, so a few hundred scattered rows would
+    /// read and cache whole batches of wide columns. It is admitted
+    /// predicate-only (the other columns are read for the selected rows only),
+    /// or bypassed when it has no predicate to cache.
+    ///
+    /// Applies with or without the admission gate. `0.0` turns it off; values
+    /// are clamped to `[0.0, 1.0]`, and a non-finite one means the default
+    /// ([`DEFAULT_SPARSE_SELECTION_RATIO`]).
+    pub fn with_sparse_selection_ratio(mut self, ratio: f64) -> Self {
+        self.sparse_selection_ratio = if ratio.is_finite() {
+            ratio.clamp(0.0, 1.0)
+        } else {
+            DEFAULT_SPARSE_SELECTION_RATIO
+        };
+        self
+    }
+
+    fn admission_policy(&self) -> AdmissionPolicy {
+        AdmissionPolicy {
+            gate: self.admission,
+            memory_budget: self.cache.max_memory_bytes() as u64,
+            disk_budget: self.cache.max_disk_bytes() as u64,
+            cache_batch_size: self.cache.batch_size(),
+            sparse_selection_ratio: self.sparse_selection_ratio,
+        }
+    }
+}
+
+/// Everything the admission decision needs besides the scan itself.
+#[derive(Debug, Clone, Copy)]
+struct AdmissionPolicy {
+    gate: Option<AdmissionGate>,
+    memory_budget: u64,
+    disk_budget: u64,
+    /// Rows per cache batch: misses fill whole batches, so a row selection's
+    /// footprint is its touched batches, not its rows.
+    cache_batch_size: usize,
+    sparse_selection_ratio: f64,
 }
 
 /// The admission gate's decision for one parquet scan.
@@ -179,7 +233,6 @@ impl PhysicalOptimizerRule for LocalModeOptimizer {
         let analysis = HintAnalyzer::analyze(&plan);
         let cache = self.cache.clone();
         let prefetch = self.prefetch;
-        let admission = self.admission;
         // The gate sizes against both cache tiers, not just RAM: when a scan
         // overflows memory its entries spill to the on-disk liquid tier (NVMe)
         // instead of thrashing. They are weighted differently (see
@@ -187,16 +240,13 @@ impl PhysicalOptimizerRule for LocalModeOptimizer {
         // counts at face value — so they are passed through separately. With the
         // disk tier off (`max_disk_bytes == 0`) the threshold is exactly the RAM
         // budget, so gate behaviour is unchanged there.
-        let memory_budget = self.cache.max_memory_bytes() as u64;
-        let disk_budget = self.cache.max_disk_bytes() as u64;
+        let policy = self.admission_policy();
         let mut convert = |node: &Arc<dyn ExecutionPlan>, hints: ColumnLineages| {
             // Leave scans whose estimated liquid footprint exceeds the budget as
             // vanilla parquet reads, so oversized scans don't thrash the cache.
-            let admission = match (admission, parquet_scan_parts(node)) {
-                (Some(gate), Some((cfg, src))) => {
-                    admission_guarded(cfg, src, gate, memory_budget, disk_budget)
-                }
-                _ => Admission::Admit,
+            let admission = match parquet_scan_parts(node) {
+                Some((cfg, src)) => admission_guarded(cfg, src, policy),
+                None => Admission::Admit,
             };
             match admission {
                 Admission::Bypass => None,
@@ -277,6 +327,128 @@ struct FootprintEstimate {
     /// per-column size stat for this table, so the estimate is coarse and
     /// over-counts.
     fallback_files: usize,
+    /// Charged files carrying a row selection (see [`FileRowCoverage`]).
+    selected_files: usize,
+    /// Rows the charged files' selections keep, over the rows they hold.
+    /// `None` when some charged file's row count is unknown.
+    selected_rows: Option<(u64, u64)>,
+}
+
+impl FootprintEstimate {
+    /// Whether the files' row selections keep fewer than `ratio` of the rows.
+    /// A scan without selections, or with unknown row counts, is not sparse.
+    fn is_sparse(&self, ratio: f64) -> bool {
+        match self.selected_rows {
+            Some((selected, total)) if self.selected_files > 0 && total > 0 => {
+                (selected as f64) < ratio * (total as f64)
+            }
+            _ => false,
+        }
+    }
+}
+
+/// How much of one file a scan reads, given the row selection attached to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileRowCoverage {
+    /// Rows the selection keeps.
+    selected: u64,
+    /// Rows in the cache batches those rows fall in: what filling the cache
+    /// for them reads.
+    touched: u64,
+    /// Rows in the file.
+    total: u64,
+    has_selection: bool,
+}
+
+impl FileRowCoverage {
+    /// The coverage of `file`'s `ParquetAccessPlan` or `ParquetRowSelection`
+    /// extension, or the whole file without one. `None` when the size cannot
+    /// be told: no row count and a selection that does not imply one.
+    fn of(file: &PartitionedFile, cache_batch_size: usize) -> Option<Self> {
+        let num_rows = file
+            .statistics
+            .as_ref()
+            .and_then(|stats| stats.num_rows.get_value().copied())
+            .map(|rows| rows as u64);
+        if let Some(plan) = file.extension::<ParquetAccessPlan>() {
+            return Self::of_access_plan(plan, num_rows, cache_batch_size);
+        }
+        if let Some(selection) = file.extension::<ParquetRowSelection>() {
+            // Spans row groups whose sizes are unknown here, so batches are
+            // counted from the file start: an estimate.
+            let selection = selection.selection();
+            let rows: usize = selection.iter().map(|s| s.row_count).sum();
+            let touched = TouchedBatches::new(selection, cache_batch_size)
+                .touched_rows(cache_batch_size, rows);
+            return Some(Self {
+                selected: selection.row_count() as u64,
+                touched: touched as u64,
+                total: num_rows.unwrap_or(0).max(rows as u64),
+                has_selection: true,
+            });
+        }
+        num_rows.map(|rows| Self {
+            selected: rows,
+            touched: rows,
+            total: rows,
+            has_selection: false,
+        })
+    }
+
+    /// A `Selection` row group carries its own size. `Scan` and `Skip` ones
+    /// share what the file's row count leaves; without a row count, `Skip`
+    /// groups count as empty (over-states the kept fraction, the conservative
+    /// side) and a `Scan` group makes the coverage unknown.
+    fn of_access_plan(
+        plan: &ParquetAccessPlan,
+        num_rows: Option<u64>,
+        cache_batch_size: usize,
+    ) -> Option<Self> {
+        let (mut selected, mut touched, mut known) = (0u64, 0u64, 0u64);
+        let (mut scan_groups, mut other_groups) = (0u64, 0u64);
+        for access in plan.inner() {
+            match access {
+                RowGroupAccess::Selection(selection) => {
+                    let rows: usize = selection.iter().map(|s| s.row_count).sum();
+                    known += rows as u64;
+                    selected += selection.row_count() as u64;
+                    touched += TouchedBatches::new(selection, cache_batch_size)
+                        .touched_rows(cache_batch_size, rows) as u64;
+                }
+                RowGroupAccess::Scan => scan_groups += 1,
+                RowGroupAccess::Skip => other_groups += 1,
+            }
+        }
+        let total = match num_rows {
+            Some(rows) => {
+                let rest = rows.saturating_sub(known);
+                let scanned = rest
+                    .saturating_mul(scan_groups)
+                    .checked_div(scan_groups + other_groups)
+                    .unwrap_or(0);
+                selected += scanned;
+                touched += scanned;
+                rows.max(known)
+            }
+            None if scan_groups == 0 => known,
+            None => return None,
+        };
+        Some(Self {
+            selected,
+            touched,
+            total,
+            has_selection: true,
+        })
+    }
+
+    /// Scale `bytes` (the file's required-column bytes) to the cache batches
+    /// the selection touches.
+    fn scale(&self, bytes: u64) -> u64 {
+        if !self.has_selection || self.total == 0 || self.touched >= self.total {
+            return bytes;
+        }
+        ((bytes as u128 * self.touched as u128) / self.total as u128) as u64
+    }
 }
 
 /// Estimate the raw required-column parquet bytes a scan reads: the sum, over
@@ -293,10 +465,15 @@ struct FootprintEstimate {
 ///
 /// With `predicate_only`, only the predicate's columns count: the footprint of
 /// a scan admitted in [`Admission::AdmitPredicateOnly`] mode.
+///
+/// A file carrying a row selection is charged only for the cache batches the
+/// selection touches (see [`FileRowCoverage`]), with `cache_batch_size` rows
+/// per batch.
 fn estimate_required_bytes(
     cfg: &FileScanConfig,
     src: &ParquetSource,
     predicate_only: bool,
+    cache_batch_size: usize,
 ) -> FootprintEstimate {
     let num_file_cols = cfg.file_schema().fields().len();
     // Full table schema (file + partition columns). The pushed-down predicate
@@ -355,6 +532,8 @@ fn estimate_required_bytes(
     let mut raw_bytes = 0u64;
     let mut charged_files = 0usize;
     let mut fallback_files = 0usize;
+    let mut selected_files = 0usize;
+    let mut selected_rows = Some((0u64, 0u64));
     for (f, keep) in files.iter().zip(surviving.iter()) {
         if !*keep {
             continue;
@@ -363,11 +542,21 @@ fn estimate_required_bytes(
             continue;
         }
         charged_files += 1;
-        let (bytes, fell_back) =
+        let (mut bytes, fell_back) =
             file_required_bytes(f.statistics.as_deref(), f.object_meta.size, &required);
         if fell_back {
             fallback_files += 1;
         }
+        let coverage = FileRowCoverage::of(f, cache_batch_size);
+        if let Some(coverage) = coverage {
+            bytes = coverage.scale(bytes);
+            selected_files += usize::from(coverage.has_selection);
+        }
+        selected_rows = selected_rows
+            .zip(coverage)
+            .map(|((selected, total), coverage)| {
+                (selected + coverage.selected, total + coverage.total)
+            });
         raw_bytes = raw_bytes.saturating_add(bytes);
     }
 
@@ -377,7 +566,18 @@ fn estimate_required_bytes(
         charged_files,
         partitioned_files: files.len(),
         fallback_files,
+        selected_files,
+        selected_rows,
     }
+}
+
+/// Whether any file of the scan carries a row selection, checked before the
+/// (costlier) footprint estimate so an ungated scan without one stays free.
+fn has_row_selection(cfg: &FileScanConfig) -> bool {
+    cfg.file_groups.iter().flat_map(|g| g.files()).any(|f| {
+        f.extension::<ParquetAccessPlan>().is_some()
+            || f.extension::<ParquetRowSelection>().is_some()
+    })
 }
 
 /// The admission threshold in bytes: the largest estimated liquid footprint the
@@ -410,33 +610,55 @@ fn admission_threshold(memory_budget: u64, disk_budget: u64, tolerance: f64) -> 
 /// `gate.predicate_only` is set, it has a pushed-down predicate that reads
 /// fewer columns than the whole scan, and the predicate columns' footprint
 /// fits the same threshold.
-fn admission(
-    cfg: &FileScanConfig,
-    src: &ParquetSource,
-    gate: AdmissionGate,
-    memory_budget: u64,
-    disk_budget: u64,
-) -> Admission {
-    let threshold = admission_threshold(memory_budget, disk_budget, gate.tolerance);
-    let est = estimate_required_bytes(cfg, src, false);
+///
+/// A sparse scan (see [`LocalModeOptimizer::with_sparse_selection_ratio`]) is
+/// never admitted whole while it projects columns its predicate does not
+/// read: it is admitted predicate-only if that fits, else bypassed. Without a
+/// gate every footprint fits and only that rule applies.
+fn admission(cfg: &FileScanConfig, src: &ParquetSource, policy: AdmissionPolicy) -> Admission {
+    if policy.gate.is_none() && (policy.sparse_selection_ratio <= 0.0 || !has_row_selection(cfg)) {
+        return Admission::Admit;
+    }
+    let threshold = policy.gate.map_or(f64::INFINITY, |gate| {
+        admission_threshold(policy.memory_budget, policy.disk_budget, gate.tolerance)
+    });
+    // Multipliers are already sanitized to finite, >= 1.0 in `with_admission_gate`.
+    let (expansion, safety) = policy
+        .gate
+        .map_or((1.0, 1.0), |gate| (gate.expansion, gate.safety));
+    let predicate_only_allowed = policy.gate.is_none_or(|gate| gate.predicate_only);
     let fits = |est: &FootprintEstimate| {
-        // Multipliers are already sanitized to finite, >= 1.0 in `with_admission_gate`.
-        let footprint = (est.raw_bytes as f64) * gate.expansion * gate.safety;
+        let footprint = (est.raw_bytes as f64) * expansion * safety;
         (footprint, footprint <= threshold)
     };
+
+    let est = estimate_required_bytes(cfg, src, false, policy.cache_batch_size);
+    let sparse = est.is_sparse(policy.sparse_selection_ratio);
     let (footprint, full_fits) = fits(&est);
-    let (verdict, est, footprint) = if full_fits {
+    let pred = src
+        .filter()
+        .map(|_| estimate_required_bytes(cfg, src, true, policy.cache_batch_size))
+        .filter(|pred| pred.required_cols > 0);
+    // The predicate reads every column the scan does: caching it whole caches
+    // only predicate columns anyway.
+    let pred_covers_scan = pred
+        .as_ref()
+        .is_some_and(|pred| pred.required_cols >= est.required_cols);
+
+    let (verdict, est, footprint) = if full_fits && (!sparse || pred_covers_scan) {
         (Admission::Admit, est, footprint)
-    } else if gate.predicate_only && src.filter().is_some() {
-        let pred = estimate_required_bytes(cfg, src, true);
-        let (pred_footprint, pred_fits) = fits(&pred);
-        if pred_fits && pred.required_cols > 0 && pred.required_cols < est.required_cols {
-            (Admission::AdmitPredicateOnly, pred, pred_footprint)
-        } else {
-            (Admission::Bypass, est, footprint)
-        }
     } else {
-        (Admission::Bypass, est, footprint)
+        match pred {
+            Some(pred) if predicate_only_allowed && !pred_covers_scan => {
+                let (pred_footprint, pred_fits) = fits(&pred);
+                if pred_fits {
+                    (Admission::AdmitPredicateOnly, pred, pred_footprint)
+                } else {
+                    (Admission::Bypass, est, footprint)
+                }
+            }
+            _ => (Admission::Bypass, est, footprint),
+        }
     };
 
     // One line per admission decision. Without this the gate is a black box and
@@ -450,13 +672,15 @@ fn admission(
         .next()
         .map(|f| f.object_meta.location.as_ref())
         .unwrap_or("<none>");
+    let (selected, total) = est.selected_rows.unwrap_or((0, 0));
     log::info!(
         target: "liquid_cache::admission",
         "admission {verdict}: file={path} projected_cols={cols} \
-         charged_files={charged} partitioned_files={total} \
-         fallback_files={fb} raw_bytes={raw} footprint_bytes={fp} \
+         charged_files={charged} partitioned_files={total_files} \
+         fallback_files={fb} selected_files={sel_files} selected_rows={selected} \
+         total_rows={total} sparse={sparse} raw_bytes={raw} footprint_bytes={fp} \
          memory_bytes={mem} disk_bytes={disk} threshold_bytes={thr} \
-         expansion={exp} safety={saf} tolerance={tol}",
+         expansion={expansion} safety={safety} tolerance={tolerance} gated={gated}",
         verdict = match verdict {
             Admission::Admit => "ADMIT",
             Admission::AdmitPredicateOnly => "ADMIT_PREDICATE_ONLY",
@@ -464,16 +688,16 @@ fn admission(
         },
         cols = est.required_cols,
         charged = est.charged_files,
-        total = est.partitioned_files,
+        total_files = est.partitioned_files,
         fb = est.fallback_files,
+        sel_files = est.selected_files,
         raw = est.raw_bytes,
         fp = footprint as u64,
-        mem = memory_budget,
-        disk = disk_budget,
-        thr = threshold as u64,
-        exp = gate.expansion,
-        saf = gate.safety,
-        tol = gate.tolerance,
+        mem = policy.memory_budget,
+        disk = policy.disk_budget,
+        thr = threshold.min(u64::MAX as f64) as u64,
+        tolerance = policy.gate.map_or(1.0, |gate| gate.tolerance),
+        gated = policy.gate.is_some(),
     );
 
     verdict
@@ -493,18 +717,16 @@ fn admission(
 /// - `gate.strict == true`: log, then re-raise so the panic aborts the query and
 ///   the bug surfaces immediately. The log advises turning the flag *off* to
 ///   keep queries running while it is fixed.
-/// - `gate.strict == false`: log, then cache the scan normally so the query
-///   survives. The log advises turning the flag *on* to fail loud instead.
+/// - `gate.strict == false` (or no gate): log, then cache the scan normally so
+///   the query survives. The log advises turning the flag *on* to fail loud
+///   instead.
 fn admission_guarded(
     cfg: &FileScanConfig,
     src: &ParquetSource,
-    gate: AdmissionGate,
-    memory_budget: u64,
-    disk_budget: u64,
+    policy: AdmissionPolicy,
 ) -> Admission {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        admission(cfg, src, gate, memory_budget, disk_budget)
-    }));
+    let result =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| admission(cfg, src, policy)));
     match result {
         Ok(verdict) => verdict,
         Err(payload) => {
@@ -513,7 +735,7 @@ fn admission_guarded(
                 .copied()
                 .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
                 .unwrap_or("<non-string panic payload>");
-            if gate.strict {
+            if policy.gate.is_some_and(|gate| gate.strict) {
                 log::error!(
                     "liquid-cache admission gate panicked during footprint estimation: \
                      {msg}. Aborting query (admission gate is in strict mode). Configure the \
@@ -1050,8 +1272,8 @@ mod tests {
             .unwrap();
             parts.expect("parquet scan in plan")
         };
-        let full = estimate_required_bytes(&cfg, &src, false);
-        let pred = estimate_required_bytes(&cfg, &src, true);
+        let full = estimate_required_bytes(&cfg, &src, false, 8192);
+        let pred = estimate_required_bytes(&cfg, &src, true, 8192);
         assert_eq!(
             full.fallback_files + pred.fallback_files,
             0,
@@ -1129,6 +1351,365 @@ mod tests {
             last_bytes * 4 < vanilla_bytes,
             "warm predicate-only read {last_bytes} vs vanilla {vanilla_bytes}"
         );
+    }
+
+    /// Rows per cache batch in [`make_cache_with_mem_disk`] caches.
+    const CACHE_BATCH: usize = 8192;
+    const NEEDLE_ROWS: usize = 4 * CACHE_BATCH;
+
+    /// Sorts between two ordinary ids.
+    const NEEDLE: &str = "user-0000000000000000000000000000000000000000000000000000002000x";
+
+    /// Rows of the needle file whose `user_id` is [`NEEDLE`]: ten in cache batch
+    /// 0 and ten in batch 2, so a selection of them touches two of four batches.
+    fn needle_rows() -> Vec<usize> {
+        (100..110)
+            .chain(2 * CACHE_BATCH + 50..2 * CACHE_BATCH + 60)
+            .collect()
+    }
+
+    /// `user_id`, `ts`, and a wide `payload`, in 128-row pages with the page
+    /// index, as one row group.
+    fn write_needle_file(path: &Path) {
+        use arrow::array::{Int64Array, StringArray};
+
+        let needles = needle_rows();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("payload", DataType::Utf8, false),
+        ]));
+        // Scattered ids, so every page's min/max spans the needle and page
+        // statistics cannot do the index's job.
+        let user = |i: usize| {
+            if needles.contains(&i) {
+                NEEDLE.to_string()
+            } else {
+                format!("user-{:0>58}", (i * 7919) % 4093)
+            }
+        };
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from_iter_values((0..NEEDLE_ROWS).map(user))),
+                Arc::new(Int64Array::from_iter_values(
+                    (0..NEEDLE_ROWS).map(|i| i as i64),
+                )),
+                Arc::new(StringArray::from_iter_values(
+                    (0..NEEDLE_ROWS).map(|i| format!("{i:0>256}")),
+                )),
+            ],
+        )
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_data_page_row_count_limit(128)
+            .set_write_batch_size(128)
+            .set_dictionary_enabled(false)
+            .build();
+        let mut writer =
+            ArrowWriter::try_new(File::create(path).unwrap(), schema, Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+
+    /// The index's view of the needle rows: one row group, selecting them.
+    fn needle_access_plan() -> ParquetAccessPlan {
+        use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
+
+        let mut selectors = Vec::new();
+        let mut at = 0;
+        for row in needle_rows() {
+            if row > at {
+                selectors.push(RowSelector::skip(row - at));
+            }
+            selectors.push(RowSelector::select(1));
+            at = row + 1;
+        }
+        selectors.push(RowSelector::skip(NEEDLE_ROWS - at));
+        ParquetAccessPlan::new(vec![RowGroupAccess::Selection(RowSelection::from(
+            selectors,
+        ))])
+    }
+
+    struct NeedleTable {
+        ctx: SessionContext,
+        dir: tempfile::TempDir,
+        file_size: usize,
+    }
+
+    impl NeedleTable {
+        async fn new() -> Self {
+            use datafusion::prelude::SessionConfig;
+
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("needle.parquet");
+            write_needle_file(&path);
+            let file_size = std::fs::metadata(&path).unwrap().len() as usize;
+            let config = SessionConfig::new()
+                .with_target_partitions(1)
+                .set_bool("datafusion.execution.parquet.pushdown_filters", true);
+            let ctx = SessionContext::new_with_config(config);
+            ctx.register_parquet("t", path.to_str().unwrap(), Default::default())
+                .await
+                .unwrap();
+            Self {
+                ctx,
+                dir,
+                file_size,
+            }
+        }
+
+        async fn plan(&self, sql: &str) -> Arc<dyn ExecutionPlan> {
+            self.ctx
+                .sql(sql)
+                .await
+                .unwrap()
+                .create_physical_plan()
+                .await
+                .unwrap()
+        }
+
+        async fn run(&self, plan: Arc<dyn ExecutionPlan>) -> (String, usize) {
+            let batches = collect(Arc::clone(&plan), self.ctx.task_ctx())
+                .await
+                .unwrap();
+            let rows = arrow::util::pretty::pretty_format_batches(&batches)
+                .unwrap()
+                .to_string();
+            (rows, sum_metric(&plan, "bytes_scanned"))
+        }
+
+        async fn cache(&self, name: &str) -> LiquidCacheParquetRef {
+            let dir = self.dir.path().join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            make_cache_with_mem_disk(&dir, usize::MAX, 0).await
+        }
+    }
+
+    /// Attach `extension` to every file of every parquet scan in `plan`.
+    fn with_file_extension<T: Clone + Send + Sync + 'static>(
+        plan: Arc<dyn ExecutionPlan>,
+        extension: T,
+    ) -> Arc<dyn ExecutionPlan> {
+        use datafusion::datasource::physical_plan::FileGroup;
+
+        plan.transform_up(|node| {
+            let Some((cfg, _)) = parquet_scan_parts(&node) else {
+                return Ok(Transformed::no(node));
+            };
+            let mut cfg = cfg.clone();
+            cfg.file_groups = cfg
+                .file_groups
+                .iter()
+                .map(|group| {
+                    FileGroup::new(
+                        group
+                            .files()
+                            .iter()
+                            .map(|f| f.clone().with_extension(extension.clone()))
+                            .collect(),
+                    )
+                })
+                .collect();
+            let node: Arc<dyn ExecutionPlan> = Arc::new(DataSourceExec::new(Arc::new(cfg)));
+            Ok(Transformed::yes(node))
+        })
+        .unwrap()
+        .data
+    }
+
+    /// Force one liquid path on every parquet scan of `plan`, bypassing the gate.
+    fn force_liquid(
+        plan: Arc<dyn ExecutionPlan>,
+        cache: &LiquidCacheParquetRef,
+        predicate_only: bool,
+    ) -> Arc<dyn ExecutionPlan> {
+        plan.transform_up(|node| {
+            Ok(
+                match convert_parquet_scan(
+                    &node,
+                    cache,
+                    ColumnLineages::default(),
+                    true,
+                    predicate_only,
+                ) {
+                    Some(node) => Transformed::yes(node),
+                    None => Transformed::no(node),
+                },
+            )
+        })
+        .unwrap()
+        .data
+    }
+
+    const NEEDLE_FILTERED: &str = "SELECT * FROM t WHERE user_id = \
+        'user-0000000000000000000000000000000000000000000000000000002000x'";
+    const NEEDLE_UNFILTERED: &str = "SELECT * FROM t";
+
+    /// A sparse access plan gives the same rows as no access plan on every
+    /// path (vanilla parquet, liquid admitted, liquid predicate-only), with the
+    /// filter kept and with it dropped. Cold, each liquid path reads only the
+    /// touched cache batches: half the file when it caches every column, and
+    /// a small fraction when it caches only the filter column. Warm, the
+    /// selection is served without re-reading the cached columns.
+    #[tokio::test]
+    async fn sparse_access_plan_matches_on_every_path() {
+        let table = NeedleTable::new().await;
+        let (expected, _) = table.run(table.plan(NEEDLE_FILTERED).await).await;
+        assert_eq!(expected.matches(NEEDLE).count(), needle_rows().len());
+        let (_, scan_bytes) = table.run(table.plan(NEEDLE_UNFILTERED).await).await;
+        assert!(
+            scan_bytes * 10 > table.file_size * 9,
+            "a full scan reads the file"
+        );
+
+        for sql in [NEEDLE_FILTERED, NEEDLE_UNFILTERED] {
+            let selected =
+                || async { with_file_extension(table.plan(sql).await, needle_access_plan()) };
+
+            let (rows, _) = table.run(selected().await).await;
+            assert_eq!(rows, expected, "bypass, {sql}");
+
+            for predicate_only in [false, true] {
+                let cache = table
+                    .cache(&format!("{predicate_only}-{}", sql.len()))
+                    .await;
+                let mut bytes = Vec::new();
+                for _ in 0..2 {
+                    let plan = force_liquid(selected().await, &cache, predicate_only);
+                    assert!(has_liquid_source(&plan));
+                    let (rows, read) = table.run(plan).await;
+                    assert_eq!(rows, expected, "predicate_only={predicate_only}, {sql}");
+                    bytes.push(read);
+                }
+                let (cold, warm) = (bytes[0], bytes[1]);
+                let context = format!(
+                    "predicate_only={predicate_only} {sql}: cold {cold} warm {warm} of {}",
+                    table.file_size
+                );
+                // Two of four cache batches; whole-row-group re-reads put this
+                // at 1.5x the file.
+                assert!(cold * 10 < table.file_size * 6, "{context}");
+                if predicate_only && sql == NEEDLE_FILTERED {
+                    // The filter column for two batches, the rest for 20 rows.
+                    assert!(cold * 4 < table.file_size, "{context}");
+                }
+                // Warm reads at most the uncached columns' selected pages.
+                assert!(warm * 20 < table.file_size, "{context}");
+            }
+        }
+    }
+
+    /// The same rows from a file-wide `ParquetRowSelection` as from the
+    /// equivalent access plan, on the liquid path, and an error when a file
+    /// carries both rather than a silent pick.
+    #[tokio::test]
+    async fn file_row_selection_is_honoured() {
+        let table = NeedleTable::new().await;
+        let (expected, _) = table.run(table.plan(NEEDLE_FILTERED).await).await;
+        // One row group, so its selection is the file's.
+        let selection = ParquetRowSelection::new(overall_needle_selection());
+        let cache = table.cache("row-selection").await;
+        let plan = force_liquid(
+            with_file_extension(table.plan(NEEDLE_UNFILTERED).await, selection.clone()),
+            &cache,
+            false,
+        );
+        let (rows, _) = table.run(plan).await;
+        assert_eq!(rows, expected);
+
+        let both = force_liquid(
+            with_file_extension(
+                with_file_extension(table.plan(NEEDLE_UNFILTERED).await, selection),
+                needle_access_plan(),
+            ),
+            &cache,
+            false,
+        );
+        let err = collect(both, table.ctx.task_ctx()).await.unwrap_err();
+        assert!(err.to_string().contains("not both"), "{err}");
+    }
+
+    fn overall_needle_selection() -> parquet::arrow::arrow_reader::RowSelection {
+        match &needle_access_plan().inner()[0] {
+            RowGroupAccess::Selection(selection) => selection.clone(),
+            _ => unreachable!(),
+        }
+    }
+
+    /// The gate's verdict for one scan of `plan`.
+    fn verdict(plan: Arc<dyn ExecutionPlan>, optimizer: LocalModeOptimizer) -> Option<bool> {
+        let optimized = optimizer.optimize(plan, &ConfigOptions::default()).unwrap();
+        has_liquid_source(&optimized)
+            .then(|| liquid_source(&optimized).cache_predicate_columns_only())
+    }
+
+    /// A sparse selection is cached predicate-only with a filter and bypassed
+    /// without one, gated or not; the ratio's kill switch and a dense
+    /// selection keep today's whole-projection admission.
+    #[tokio::test]
+    async fn sparse_selection_is_never_admitted_whole() {
+        let table = NeedleTable::new().await;
+        let cache = table.cache("gate").await;
+        let gated =
+            || LocalModeOptimizer::new(Arc::clone(&cache)).with_admission_gate(1.0, 1.0, 1.0, true);
+        let ungated = || LocalModeOptimizer::new(Arc::clone(&cache));
+        let filtered = with_file_extension(table.plan(NEEDLE_FILTERED).await, needle_access_plan());
+        let unfiltered =
+            with_file_extension(table.plan(NEEDLE_UNFILTERED).await, needle_access_plan());
+
+        // Some(true) = predicate-only, Some(false) = admitted whole, None = bypass.
+        for optimizer in [&gated as &dyn Fn() -> LocalModeOptimizer, &ungated] {
+            assert_eq!(verdict(filtered.clone(), optimizer()), Some(true));
+            assert_eq!(verdict(unfiltered.clone(), optimizer()), None);
+            let off = optimizer().with_sparse_selection_ratio(0.0);
+            assert_eq!(verdict(filtered.clone(), off), Some(false));
+            // 20 of 32768 rows; a ratio below that is not sparse.
+            let low = optimizer().with_sparse_selection_ratio(0.0001);
+            assert_eq!(verdict(filtered.clone(), low), Some(false));
+        }
+        // The predicate-only kill switch leaves a gated sparse scan nowhere to go.
+        let no_pred_only = gated().with_predicate_only_admission(false);
+        assert_eq!(verdict(filtered.clone(), no_pred_only), None);
+        // Without a selection nothing changes.
+        assert_eq!(
+            verdict(table.plan(NEEDLE_FILTERED).await, gated()),
+            Some(false)
+        );
+        assert_eq!(
+            verdict(table.plan(NEEDLE_UNFILTERED).await, ungated()),
+            Some(false)
+        );
+    }
+
+    /// The footprint charges a selected file for the cache batches its
+    /// selection touches, not the whole file.
+    #[tokio::test]
+    async fn estimate_scales_to_touched_batches() {
+        let table = NeedleTable::new().await;
+        let parts = |plan: Arc<dyn ExecutionPlan>| {
+            let mut parts = None;
+            plan.apply(|node| {
+                if let Some((cfg, src)) = parquet_scan_parts(node) {
+                    parts = Some((cfg.clone(), src.clone()));
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+            .unwrap();
+            parts.unwrap()
+        };
+        let (cfg, src) = parts(table.plan(NEEDLE_FILTERED).await);
+        let full = estimate_required_bytes(&cfg, &src, false, CACHE_BATCH);
+        let (cfg, src) = parts(with_file_extension(
+            table.plan(NEEDLE_FILTERED).await,
+            needle_access_plan(),
+        ));
+        let selected = estimate_required_bytes(&cfg, &src, false, CACHE_BATCH);
+        assert_eq!(full.fallback_files, 0);
+        assert_eq!(selected.raw_bytes, full.raw_bytes / 2);
+        assert_eq!(selected.selected_rows, Some((20, NEEDLE_ROWS as u64)));
+        assert!(selected.is_sparse(0.05));
+        assert!(!full.is_sparse(0.05));
     }
 
     /// The budget counts the on-disk liquid tier, not just memory: the same scan
@@ -1243,7 +1824,7 @@ mod tests {
 
         // The call that used to panic. It must return a finite estimate; `s`
         // (the struct column read by `s.a`) is the one required file column.
-        let est = estimate_required_bytes(&cfg, &src, false);
+        let est = estimate_required_bytes(&cfg, &src, false, 8192);
         assert!(est.raw_bytes > 0, "estimate should be a real byte count");
     }
 

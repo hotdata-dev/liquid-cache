@@ -73,6 +73,9 @@ pub struct LiquidCacheLocalBuilder {
     /// When set, a scan is cached only if its estimated liquid footprint stays
     /// within the admission threshold; `strict` toggles fail-loud panic handling.
     admission: Option<(f64, f64, f64, bool)>,
+    /// See `LocalModeOptimizer::with_sparse_selection_ratio`; `None` keeps its
+    /// default.
+    sparse_selection_ratio: Option<f64>,
     span: fastrace::Span,
 }
 
@@ -90,6 +93,7 @@ impl Default for LiquidCacheLocalBuilder {
             hydration_policy: Box::new(AlwaysHydrate::new()),
             prefetch: true,
             admission: None,
+            sparse_selection_ratio: None,
             span: fastrace::Span::enter_with_local_parent("liquid_cache_datafusion_local_builder"),
         }
     }
@@ -177,6 +181,15 @@ impl LiquidCacheLocalBuilder {
         self
     }
 
+    /// Scans whose files' row selections keep fewer than `ratio` of their rows
+    /// are never cached whole: they are cached predicate-only, or bypassed
+    /// without a predicate. `0.0` turns this off. See
+    /// `LocalModeOptimizer::with_sparse_selection_ratio`.
+    pub fn with_sparse_selection_ratio(mut self, ratio: f64) -> Self {
+        self.sparse_selection_ratio = Some(ratio);
+        self
+    }
+
     /// Build a SessionContext with liquid cache configured
     /// Returns the SessionContext and the liquid cache reference
     pub async fn build(
@@ -225,6 +238,9 @@ impl LiquidCacheLocalBuilder {
         let mut optimizer = LocalModeOptimizer::new(cache_ref.clone()).with_prefetch(self.prefetch);
         if let Some((expansion, safety, tolerance, strict)) = self.admission {
             optimizer = optimizer.with_admission_gate(expansion, safety, tolerance, strict);
+        }
+        if let Some(ratio) = self.sparse_selection_ratio {
+            optimizer = optimizer.with_sparse_selection_ratio(ratio);
         }
 
         let state = datafusion::execution::SessionStateBuilder::new()
