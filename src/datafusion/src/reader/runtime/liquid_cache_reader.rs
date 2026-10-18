@@ -94,8 +94,67 @@ pub(crate) struct ParquetFallback {
     passthrough_projection: ProjectionMask,
     passthrough_column_ids: Vec<usize>,
     passthrough_batches: Option<Count>,
+    /// Batches the caller's selection has rows in. `None` reads to the end of
+    /// the row group on a miss.
+    touched: Option<TouchedBatches>,
     stream: Option<BoxStream<'static, Result<RecordBatch, ParquetError>>>,
     next_batch_id: BatchID,
+    /// First batch past what `stream` covers.
+    stream_end: usize,
+}
+
+/// The cache batches of one row group that a row selection has any row in.
+///
+/// A fallback read fetches every selected page of its row group up front, so
+/// what it selects is what it reads. Bounding each read to one run of
+/// adjacent touched batches keeps a sparse selection's misses to its own
+/// pages, while a dense selection is still one stream per row group.
+#[derive(Clone, Debug)]
+pub(crate) struct TouchedBatches {
+    touched: Vec<bool>,
+}
+
+impl TouchedBatches {
+    pub(crate) fn new(selection: &RowSelection, batch_size: usize) -> Self {
+        let mut touched = Vec::new();
+        let mut row = 0;
+        for selector in selection.iter() {
+            let end = row + selector.row_count;
+            if !selector.skip && selector.row_count > 0 {
+                let last = (end - 1) / batch_size;
+                if touched.len() <= last {
+                    touched.resize(last + 1, false);
+                }
+                touched[row / batch_size..=last].fill(true);
+            }
+            row = end;
+        }
+        Self { touched }
+    }
+
+    /// Rows of a `row_count`-row row group that fall in touched batches: what
+    /// a cache fill of this selection reads, since misses fill whole batches.
+    pub(crate) fn touched_rows(&self, batch_size: usize, row_count: usize) -> usize {
+        self.touched
+            .iter()
+            .enumerate()
+            .filter(|(_, touched)| **touched)
+            .map(|(batch, _)| {
+                let start = (batch * batch_size).min(row_count);
+                ((batch + 1) * batch_size).min(row_count) - start
+            })
+            .sum()
+    }
+
+    /// One past the last batch of the touched run starting at `start`; always
+    /// covers `start` itself, touched or not.
+    fn run_end(&self, start: usize) -> usize {
+        let mut end = start + 1;
+        while self.touched.get(end).copied().unwrap_or(false) {
+            end += 1;
+        }
+        end
+    }
 }
 
 impl LiquidCacheReader {
@@ -109,13 +168,14 @@ impl LiquidCacheReader {
         // unaffected either way: `DataSourceExec` re-splits every source
         // stream to the session batch size.
         let batch_size = config.cached_row_group.batch_size();
+        let touched = TouchedBatches::new(&config.selection, batch_size);
         let inner = LiquidCacheReaderInner::new(
             batch_size,
             config.selection,
             config.cached_row_group,
             config.projection_columns,
             Arc::clone(&config.schema),
-            ParquetFallback::new(config.parquet_fallback),
+            ParquetFallback::new(config.parquet_fallback).with_touched_batches(touched),
         );
         Self {
             state: ReaderState::Ready(Box::new(inner)),
@@ -182,16 +242,34 @@ impl ParquetFallback {
             passthrough_projection: config.passthrough_projection,
             passthrough_column_ids: config.passthrough_column_ids,
             passthrough_batches: config.passthrough_batches,
+            touched: None,
             stream: None,
             next_batch_id: BatchID::from_raw(0),
+            stream_end: 0,
         }
+    }
+
+    /// Limit miss reads to the batches `touched` names (see [`TouchedBatches`]).
+    pub(crate) fn with_touched_batches(mut self, touched: TouchedBatches) -> Self {
+        self.restrict_to(touched);
+        self
+    }
+
+    /// [`Self::with_touched_batches`] in place. Drops any open stream, which
+    /// may cover batches outside `touched`.
+    pub(crate) fn restrict_to(&mut self, touched: TouchedBatches) {
+        self.touched = Some(touched);
+        self.stream = None;
     }
 
     pub(crate) async fn fetch_batch(
         &mut self,
         batch_id: BatchID,
     ) -> Result<RecordBatch, ParquetError> {
-        if self.stream.is_none() || batch_id != self.next_batch_id {
+        if self.stream.is_none()
+            || batch_id != self.next_batch_id
+            || usize::from(*batch_id) >= self.stream_end
+        {
             self.rebuild_stream(batch_id)?;
         }
 
@@ -264,8 +342,12 @@ impl ParquetFallback {
     fn rebuild_stream(&mut self, batch_id: BatchID) -> Result<(), ParquetError> {
         let reader_metadata =
             ArrowReaderMetadata::try_new(Arc::clone(&self.metadata), ArrowReaderOptions::new())?;
-        let row_selection =
-            build_row_selection_from(batch_id, self.cache_batch_size, self.row_count);
+        let start = usize::from(*batch_id);
+        let end = self
+            .touched
+            .as_ref()
+            .map_or(usize::MAX, |touched| touched.run_end(start));
+        let row_selection = build_row_selection(start..end, self.cache_batch_size, self.row_count);
 
         let stream = ParquetRecordBatchStreamBuilder::new_with_metadata(
             self.reader_factory.create()?,
@@ -280,33 +362,29 @@ impl ParquetFallback {
 
         self.stream = Some(stream);
         self.next_batch_id = batch_id;
+        self.stream_end = end;
         Ok(())
     }
 }
 
-fn build_row_selection_from(
-    batch_id: BatchID,
+/// Select the rows of cache batches `batches` (clamped to the row group).
+fn build_row_selection(
+    batches: std::ops::Range<usize>,
     batch_size: usize,
     row_count: usize,
 ) -> RowSelection {
-    let start = usize::from(*batch_id) * batch_size;
+    let start = batches.start.saturating_mul(batch_size).min(row_count);
+    let end = batches.end.saturating_mul(batch_size).min(row_count);
     let mut selectors = Vec::new();
-
     if start > 0 {
-        selectors.push(RowSelector::skip(start.min(row_count)));
+        selectors.push(RowSelector::skip(start));
     }
-
-    if start >= row_count {
-        return RowSelection::from(selectors);
+    if end > start {
+        selectors.push(RowSelector::select(end - start));
     }
-
-    let mut remaining = row_count - start;
-    while remaining > 0 {
-        let selected = remaining.min(batch_size);
-        selectors.push(RowSelector::select(selected));
-        remaining -= selected;
+    if row_count > end {
+        selectors.push(RowSelector::skip(row_count - end));
     }
-
     RowSelection::from(selectors)
 }
 
@@ -612,6 +690,7 @@ mod tests {
         ArrowWriter, ProjectionMask,
         arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions, RowSelection, RowSelector},
     };
+    use parquet::file::metadata::PageIndexPolicy;
     use std::fs::File;
     use std::sync::Arc;
 
@@ -726,6 +805,187 @@ mod tests {
             },
             _tmp_dir: tmp_dir,
         }
+    }
+
+    /// One row group of `0..rows` with nothing cached, written in pages of
+    /// `page_rows` with no dictionary, so a page-index row selection can skip
+    /// pages and `bytes_scanned` shows which ones were read.
+    async fn make_uncached_row_group(
+        cache_batch_size: usize,
+        rows: i32,
+        page_rows: usize,
+    ) -> (TestRowGroup, ExecutionPlanMetricsSet, u64) {
+        use parquet::file::properties::WriterProperties;
+
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "col0",
+            DataType::Int32,
+            false,
+        )]));
+        let parquet_path = tmp_dir.path().join("data.parquet");
+        let props = WriterProperties::builder()
+            .set_data_page_row_count_limit(page_rows)
+            .set_write_batch_size(page_rows)
+            .set_dictionary_enabled(false)
+            .build();
+        let mut writer = ArrowWriter::try_new(
+            File::create(&parquet_path).unwrap(),
+            Arc::clone(&schema),
+            Some(props),
+        )
+        .unwrap();
+        let array: ArrayRef = Arc::new(Int32Array::from_iter_values(0..rows));
+        writer
+            .write(&RecordBatch::try_new(Arc::clone(&schema), vec![array]).unwrap())
+            .unwrap();
+        writer.close().unwrap();
+
+        let options = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Required);
+        let reader_metadata =
+            ArrowReaderMetadata::load(&File::open(&parquet_path).unwrap(), options).unwrap();
+        let metadata = Arc::clone(reader_metadata.metadata());
+        assert_eq!(metadata.num_row_groups(), 1);
+        let chunk_bytes = metadata.row_group(0).column(0).compressed_size() as u64;
+
+        let object_store = Arc::new(LocalFileSystem::new_with_prefix(tmp_dir.path()).unwrap());
+        let metrics = ExecutionPlanMetricsSet::new();
+        let reader_factory = Arc::new(LiquidFileReaderFactory {
+            factory: Arc::new(DefaultParquetFileReaderFactory::new(object_store)),
+            partition_index: 0,
+            partitioned_file: PartitionedFile::new(
+                "data.parquet",
+                std::fs::metadata(&parquet_path).unwrap().len(),
+            ),
+            metadata_size_hint: None,
+            metrics: metrics.clone(),
+        });
+        let projection = ProjectionMask::roots(metadata.file_metadata().schema_descr(), [0]);
+
+        let store = t4::mount(tmp_dir.path().join("liquid_cache.t4"))
+            .await
+            .unwrap();
+        let cache = LiquidCacheParquet::new(
+            cache_batch_size,
+            usize::MAX,
+            usize::MAX,
+            store,
+            Box::new(LiquidPolicy::new()),
+            Box::new(Evict),
+            Box::new(AlwaysHydrate::new()),
+        )
+        .await;
+        let file = cache.register_or_get_file(
+            crate::cache::ParquetFileIdentity::new(
+                datafusion::execution::object_store::ObjectStoreUrl::parse("test-sparse:///")
+                    .unwrap(),
+                "sparse".to_string(),
+            ),
+            Arc::clone(&schema),
+        );
+        let row_group = file.create_row_group(0, vec![]);
+        let test = TestRowGroup {
+            row_group,
+            schema,
+            fallback: ParquetFallbackConfig {
+                row_group_idx: 0,
+                metadata,
+                reader_factory,
+                cache_projection: projection,
+                cache_column_ids: vec![0],
+                cache_batch_size,
+                row_count: rows as usize,
+                passthrough_projection: ProjectionMask::none(1),
+                passthrough_column_ids: vec![],
+                passthrough_batches: None,
+            },
+            _tmp_dir: tmp_dir,
+        };
+        (test, metrics, chunk_bytes)
+    }
+
+    fn bytes_scanned(metrics: &ExecutionPlanMetricsSet) -> u64 {
+        metrics
+            .clone_inner()
+            .sum_by_name("bytes_scanned")
+            .map(|v| v.as_usize() as u64)
+            .unwrap_or(0)
+    }
+
+    /// A selection that keeps one row in each of a few far-apart cache
+    /// batches must read only those batches' pages on a cold cache. Each miss
+    /// used to rebuild the fallback stream from its batch to the end of the
+    /// row group, and the parquet reader fetches every selected page of a row
+    /// group up front, so four touched batches read about twice the column.
+    #[tokio::test]
+    async fn sparse_selection_reads_only_touched_batches() {
+        const BATCH: usize = 16;
+        const BATCHES: usize = 64;
+        let (test, metrics, chunk_bytes) =
+            make_uncached_row_group(BATCH, (BATCH * BATCHES) as i32, BATCH).await;
+        let wanted = [0usize, 21 * BATCH + 3, 42 * BATCH + 7, 63 * BATCH + 15];
+        let mut selectors = Vec::new();
+        let mut at = 0;
+        for row in wanted {
+            if row > at {
+                selectors.push(RowSelector::skip(row - at));
+            }
+            selectors.push(RowSelector::select(1));
+            at = row + 1;
+        }
+        if at < BATCH * BATCHES {
+            selectors.push(RowSelector::skip(BATCH * BATCHES - at));
+        }
+
+        let reader = test.reader(ReaderRequest {
+            selection: RowSelection::from(selectors),
+            row_filter: None,
+            projection_columns: vec![0],
+            schema: Arc::clone(&test.schema),
+        });
+        let got: Vec<i32> = collect_batches(reader)
+            .iter()
+            .flat_map(as_i32_values)
+            .collect();
+        assert_eq!(got, wanted.map(|r| r as i32).to_vec());
+
+        // 4 of 64 pages; allow 2x for page headers and the column's first page.
+        let read = bytes_scanned(&metrics);
+        assert!(
+            read * 8 < chunk_bytes,
+            "read {read} bytes of a {chunk_bytes}-byte column for 4 of {BATCHES} batches"
+        );
+        // Every touched batch was filled into the cache, nothing else.
+        let column = test.row_group.get_column(0).unwrap();
+        for batch in 0..BATCHES {
+            let touched = wanted.iter().any(|row| row / BATCH == batch);
+            assert_eq!(
+                column.contains(BatchID::from_raw(batch as u16)),
+                touched,
+                "batch {batch}"
+            );
+        }
+    }
+
+    /// A dense selection still streams the row group once.
+    #[tokio::test]
+    async fn dense_selection_reads_the_column_once() {
+        const BATCH: usize = 16;
+        const BATCHES: usize = 64;
+        let (test, metrics, chunk_bytes) =
+            make_uncached_row_group(BATCH, (BATCH * BATCHES) as i32, BATCH).await;
+        let reader = test.reader(ReaderRequest {
+            selection: RowSelection::from(vec![RowSelector::select(BATCH * BATCHES)]),
+            row_filter: None,
+            projection_columns: vec![0],
+            schema: Arc::clone(&test.schema),
+        });
+        let got: Vec<i32> = collect_batches(reader)
+            .iter()
+            .flat_map(as_i32_values)
+            .collect();
+        assert_eq!(got, (0..(BATCH * BATCHES) as i32).collect::<Vec<_>>());
+        assert!(bytes_scanned(&metrics) <= chunk_bytes);
     }
 
     fn flatten_batches(batches: &[Vec<i32>]) -> Vec<i32> {

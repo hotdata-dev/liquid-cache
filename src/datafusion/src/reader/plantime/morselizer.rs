@@ -9,7 +9,7 @@ use datafusion::{
             ParquetFileMetrics, ParquetFileReaderFactory,
             parquet::{
                 BloomFilterStatistics, PagePruningAccessPlanFilter, ParquetAccessPlan,
-                RowGroupAccessPlanFilter,
+                ParquetRowSelection, RowGroupAccessPlanFilter,
             },
         },
         table_schema::TableSchema,
@@ -37,7 +37,7 @@ use parquet::{
         parquet_column,
     },
     errors::ParquetError,
-    file::metadata::PageIndexPolicy,
+    file::metadata::{PageIndexPolicy, RowGroupMetaData},
 };
 
 use crate::{
@@ -48,8 +48,8 @@ use crate::{
     reader::{
         plantime::row_filter::build_row_filter,
         runtime::{
-            LiquidRowGroupPlanner, apply_predicates, build_projection_schema, get_root_column_ids,
-            take_next_batch,
+            LiquidRowGroupPlanner, TouchedBatches, apply_predicates, build_projection_schema,
+            get_root_column_ids, take_next_batch,
         },
     },
     utils::row_selector_to_boolean_buffer,
@@ -113,8 +113,8 @@ impl fmt::Debug for LiquidMorselizer {
 impl Morselizer for LiquidMorselizer {
     fn plan_file(&self, partitioned_file: PartitionedFile) -> Result<Box<dyn MorselPlanner>> {
         let file_range = partitioned_file.range.clone();
-        let access_plan = partitioned_file.extensions.get_arc::<ParquetAccessPlan>();
         let file_name = partitioned_file.object_meta.location.to_string();
+        let requested_rows = RequestedRows::of(&partitioned_file, &file_name)?;
         let metrics = LiquidFileMetrics::new(self.partition_index, &file_name, &self.metrics);
         let metadata_size_hint = partitioned_file.metadata_size_hint;
         let file_identity = ParquetFileIdentity::new(
@@ -178,7 +178,7 @@ impl Morselizer for LiquidMorselizer {
         Ok(Box::new(LiquidFilePlanner {
             state: LiquidOpenState::PruneFile(Box::new(PreparedLiquidOpen {
                 file_range,
-                access_plan,
+                requested_rows,
                 file_name,
                 metrics,
                 file_pruner,
@@ -233,7 +233,7 @@ impl LiquidFileMetrics {
 
 struct PreparedLiquidOpen {
     file_range: Option<FileRange>,
-    access_plan: Option<Arc<ParquetAccessPlan>>,
+    requested_rows: RequestedRows,
     file_name: String,
     metrics: LiquidFileMetrics,
     file_pruner: Option<FilePruner>,
@@ -441,11 +441,8 @@ fn prepare_and_prune_by_stats(mut loaded: MetadataLoadedLiquidOpen) -> Result<Li
 
     let metadata = builder.metadata();
     let row_group_metadata = metadata.row_groups();
-    let access_plan = create_initial_plan(
-        &loaded.prepared.file_name,
-        loaded.prepared.access_plan.take(),
-        row_group_metadata.len(),
-    )?;
+    let access_plan = std::mem::take(&mut loaded.prepared.requested_rows)
+        .into_access_plan(&loaded.prepared.file_name, row_group_metadata)?;
     let mut row_groups = RowGroupAccessPlanFilter::new(access_plan);
     if let Some(range) = &loaded.prepared.file_range {
         row_groups.prune_by_range(row_group_metadata, range);
@@ -722,6 +719,9 @@ async fn prefetch_front(chain: LiquidRowGroupChain) -> LiquidRowGroupChain {
     let mut context = chain
         .planner
         .prefetch_context(*row_group_idx, Arc::clone(&snapshots));
+    context
+        .fallback
+        .restrict_to(TouchedBatches::new(selection, batch_size));
 
     for (batch_id, input_selection) in selected_batches {
         let mut produced_snapshots = false;
@@ -888,22 +888,56 @@ async fn load_bloom_filters(
     row_group_bloom_filters
 }
 
-fn create_initial_plan(
-    file_name: &str,
-    access_plan: Option<Arc<ParquetAccessPlan>>,
-    row_group_count: usize,
-) -> Result<ParquetAccessPlan> {
-    if let Some(access_plan) = access_plan {
-        let plan_len = access_plan.len();
-        if plan_len != row_group_count {
-            return exec_err!(
-                "Invalid ParquetAccessPlan for {file_name}. Specified {plan_len} row groups, but file has {row_group_count}"
-            );
+/// The rows a file's extensions ask the scan for, as DataFusion's own parquet
+/// opener reads them: a `ParquetAccessPlan` per row group, or a file-wide
+/// `ParquetRowSelection` split over the row groups once the footer is read.
+/// Either one is honoured; ignoring one would return rows it excludes.
+#[derive(Debug, Default)]
+enum RequestedRows {
+    #[default]
+    All,
+    AccessPlan(Arc<ParquetAccessPlan>),
+    Selection(RowSelection),
+}
+
+impl RequestedRows {
+    fn of(file: &PartitionedFile, file_name: &str) -> Result<Self> {
+        match (
+            file.extensions.get_arc::<ParquetAccessPlan>(),
+            file.extension::<ParquetRowSelection>(),
+        ) {
+            (Some(_), Some(_)) => exec_err!(
+                "Invalid parquet access extensions for {file_name}. \
+                 Specify either ParquetAccessPlan or ParquetRowSelection, not both"
+            ),
+            (Some(plan), None) => Ok(Self::AccessPlan(plan)),
+            (None, Some(selection)) => Ok(Self::Selection(selection.selection().clone())),
+            (None, None) => Ok(Self::All),
         }
-        return Ok(access_plan.as_ref().clone());
     }
 
-    Ok(ParquetAccessPlan::new_all(row_group_count))
+    fn into_access_plan(
+        self,
+        file_name: &str,
+        row_groups: &[RowGroupMetaData],
+    ) -> Result<ParquetAccessPlan> {
+        match self {
+            Self::All => Ok(ParquetAccessPlan::new_all(row_groups.len())),
+            Self::AccessPlan(plan) => {
+                let plan_len = plan.len();
+                if plan_len != row_groups.len() {
+                    return exec_err!(
+                        "Invalid ParquetAccessPlan for {file_name}. Specified {plan_len} row groups, but file has {}",
+                        row_groups.len()
+                    );
+                }
+                Ok(plan.as_ref().clone())
+            }
+            Self::Selection(selection) => {
+                ParquetAccessPlan::try_new_from_overall_row_selection(selection, row_groups)
+            }
+        }
+    }
 }
 
 pub(crate) fn build_pruning_predicates(

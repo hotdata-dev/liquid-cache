@@ -1,4 +1,4 @@
-pub(crate) use liquid_cache_reader::apply_predicates;
+pub(crate) use liquid_cache_reader::{TouchedBatches, apply_predicates};
 pub(crate) use liquid_predicate::extract_multi_column_or;
 pub(crate) use morsel::{
     LiquidRowGroupPlanner, LiquidRowGroupPrefetchContext, build_projection_schema,
