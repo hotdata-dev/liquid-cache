@@ -1,5 +1,5 @@
 use std::mem::size_of;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 use arrow::array::{Array, ArrayRef, BooleanArray};
 use arrow::buffer::{BooleanBuffer, NullBuffer};
@@ -16,8 +16,9 @@ use vortex_array::scalar_fn::fns::operators::Operator;
 use vortex_array::{IntoArray, VortexSessionExecute};
 use vortex_arrow::ArrowSessionExt;
 use vortex_btrblocks::BtrBlocksCompressor;
-use vortex_buffer::BitBuffer;
+use vortex_buffer::{BitBuffer, Buffer};
 use vortex_error::VortexResult;
+use vortex_fsst::{FSST, FSSTArrayExt, FSSTArraySlotsExt, FSSTSymbolTable};
 use vortex_ipc::messages::{BufMessageReader, DecoderMessage, EncoderMessage, MessageEncoder};
 use vortex_mask::Mask;
 use vortex_session::VortexSession;
@@ -315,10 +316,61 @@ impl LiquidArray {
                 .expect("Vortex array validity must execute");
             return BooleanArray::new(values, vortex_arrow::to_null_buffer(validity));
         }
+        let filtered = if is_string_equality(predicate) {
+            with_private_fsst_symbols(filtered)
+        } else {
+            filtered
+        };
         let Some(result) = self.try_eval_vortex_predicate(&filtered, predicate) else {
             return eval_predicate_on_array(self.export(filtered), predicate);
         };
         result
+    }
+}
+
+/// `col = lit` / `col != lit`: the FSST compare kernel compresses the
+/// literal with the array's memoized compressor.
+fn is_string_equality(predicate: &LiquidExpr) -> bool {
+    predicate
+        .physical_expr()
+        .downcast_ref::<BinaryExpr>()
+        .is_some_and(|binary| {
+            matches!(
+                binary.op(),
+                DataFusionOperator::Eq | DataFusionOperator::NotEq
+            )
+        })
+}
+
+/// Vortex memoizes a ~160 KB FSST compressor on the symbol table, which every
+/// filter or slice of an array shares with it, and builds it the first time a
+/// string `=`/`!=` runs against a constant. On a cached array that keeps one
+/// compressor alive per cached batch, outside the cache's size accounting.
+/// Give the evaluated copy its own table so the compressor is dropped with
+/// it; rebuilding one costs ~7 us per evaluation.
+fn with_private_fsst_symbols(array: vortex_array::ArrayRef) -> vortex_array::ArrayRef {
+    let fsst = match array.try_downcast::<FSST>() {
+        Ok(fsst) => fsst,
+        Err(array) => return array,
+    };
+    let table = Arc::new(FSSTSymbolTable::new(
+        Buffer::copy_from(fsst.symbols()),
+        Buffer::copy_from(fsst.symbol_lengths()),
+        fsst.n_symbols(),
+    ));
+    let mut ctx = SESSION.create_execution_ctx();
+    match FSST::try_new_with_symbol_table(
+        fsst.dtype().clone(),
+        table,
+        fsst.codes(),
+        fsst.uncompressed_lengths().clone(),
+        &mut ctx,
+    ) {
+        Ok(private) => private.into_array(),
+        Err(error) => {
+            log::warn!("failed to give an FSST array a private symbol table: {error}");
+            fsst.into_array()
+        }
     }
 }
 
@@ -481,6 +533,45 @@ mod tests {
         let expected =
             arrow::compute::filter(&array, &BooleanArray::new(selection.clone(), None)).unwrap();
         assert_eq!(vortex.filter(&selection).as_ref(), expected.as_ref());
+    }
+
+    /// Evaluating `col = 'literal'` on a cached FSST string array must not
+    /// leave memory behind in that array. Vortex memoizes an FSST compressor
+    /// (~160 KB) on the symbol table the cached array shares with every
+    /// slice and filter of it, so without care each cached batch keeps one
+    /// for good, invisible to the cache's size accounting.
+    #[test]
+    fn string_eq_predicate_retains_no_memory_in_the_cached_array() {
+        let ids: ArrayRef = Arc::new(StringArray::from_iter_values(
+            (0..8192u64).map(|i| format!("u{}", (i * 2_654_435_761) % 5_000_000)),
+        ));
+        let cached = LiquidArray::from_arrow_array(&ids).unwrap();
+        // High-cardinality ids, like production user_id: FSST at the root.
+        assert!(cached.array.clone().try_downcast::<FSST>().is_ok());
+        let expr = comparison_expr(
+            DataFusionOperator::Eq,
+            ScalarValue::Utf8(Some("u4821".to_string())),
+            ids.data_type(),
+        );
+        let all = BooleanBuffer::new_set(ids.len());
+        let half = BooleanBuffer::from_iter((0..ids.len()).map(|i| i % 2 == 0));
+
+        let before = crate::test_alloc::live_bytes();
+        for selection in [&all, &half, &all, &half] {
+            let result = cached.try_eval_predicate(&expr, selection);
+            assert_eq!(result.len(), selection.count_set_bits());
+            drop(result);
+        }
+        let retained = crate::test_alloc::live_bytes() - before;
+        assert!(
+            retained < 16 * 1024,
+            "predicate evaluation left {retained} bytes behind in the cached array"
+        );
+
+        // Same answers as Arrow's own comparison.
+        let expected =
+            arrow::compute::kernels::cmp::eq(&ids, &StringArray::new_scalar("u4821")).unwrap();
+        assert_eq!(cached.try_eval_predicate(&expr, &all), expected);
     }
 
     fn comparison_expr(

@@ -4,6 +4,8 @@
 pub mod cache;
 pub mod liquid_array;
 mod sync;
+#[cfg(test)]
+mod test_alloc;
 pub mod utils;
 
 pub use cache::cache_policies;
