@@ -72,6 +72,7 @@ pub(crate) struct LiquidMorselizer {
     pub(crate) span: Option<Arc<fastrace::Span>>,
     pub(crate) lineages: Arc<ColumnLineages>,
     pub(crate) prefetch: bool,
+    pub(crate) cache_predicate_columns_only: bool,
 }
 
 type ParquetInput = Box<dyn AsyncFileReader>;
@@ -193,6 +194,7 @@ impl Morselizer for LiquidMorselizer {
                 span,
                 lineages: Arc::clone(&self.lineages),
                 prefetch: self.prefetch,
+                cache_predicate_columns_only: self.cache_predicate_columns_only,
             })),
         }))
     }
@@ -204,6 +206,9 @@ pub(crate) struct LiquidFileMetrics {
     pub(crate) predicate_creation_errors: Count,
     pub(crate) batches_prefetched: Count,
     pub(crate) prefetch_skipped: Count,
+    /// Batches whose non-predicate columns were read straight from parquet
+    /// (selected rows only, not cached) in predicate-columns-only mode.
+    pub(crate) passthrough_batches: Count,
 }
 
 impl LiquidFileMetrics {
@@ -220,6 +225,8 @@ impl LiquidFileMetrics {
                 .counter("batches_prefetched", partition_index),
             prefetch_skipped: MetricBuilder::new(metrics)
                 .counter("prefetch_skipped", partition_index),
+            passthrough_batches: MetricBuilder::new(metrics)
+                .counter("passthrough_batches", partition_index),
         }
     }
 }
@@ -242,6 +249,7 @@ struct PreparedLiquidOpen {
     span: Option<Arc<fastrace::Span>>,
     lineages: Arc<ColumnLineages>,
     prefetch: bool,
+    cache_predicate_columns_only: bool,
 }
 
 struct MetadataLoadedLiquidOpen {
@@ -604,6 +612,7 @@ fn plan_row_group_morsels(planned: PlannedRowGroups) -> Result<Option<MorselPlan
         span: context.prepared.span,
         liquid_cache: context.prepared.liquid_cache,
         metrics: context.prepared.metrics.clone(),
+        cache_predicate_columns_only: context.prepared.cache_predicate_columns_only,
     });
 
     let row_group_indexes = access_plan.row_group_indexes();
@@ -1137,6 +1146,7 @@ mod tests {
             span: None,
             lineages: Arc::default(),
             prefetch: true,
+            cache_predicate_columns_only: false,
         };
         let cached_file = cache.register_or_get_file(
             ParquetFileIdentity::new(object_store_url, file_name),
@@ -1279,6 +1289,7 @@ mod tests {
             span: None,
             lineages: Arc::default(),
             prefetch: true,
+            cache_predicate_columns_only: false,
         };
         let morselizer_b = LiquidMorselizer {
             partition_index: 0,
@@ -1297,6 +1308,7 @@ mod tests {
             span: None,
             lineages: Arc::default(),
             prefetch: true,
+            cache_predicate_columns_only: false,
         };
 
         let file_a = PartitionedFile::new("data.parquet", std::fs::metadata(path_a).unwrap().len());

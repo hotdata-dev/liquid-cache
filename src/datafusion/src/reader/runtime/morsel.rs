@@ -38,6 +38,9 @@ pub(crate) struct LiquidRowGroupPlanner {
     pub(crate) span: Option<Arc<fastrace::Span>>,
     pub(crate) liquid_cache: LiquidCacheParquetRef,
     pub(crate) metrics: LiquidFileMetrics,
+    /// Insert only predicate columns into the cache; the rest of the projection
+    /// is a passthrough read (see `LiquidParquetSource::with_cache_predicate_columns_only`).
+    pub(crate) cache_predicate_columns_only: bool,
 }
 
 impl LiquidRowGroupPlanner {
@@ -54,13 +57,35 @@ impl LiquidRowGroupPlanner {
                 }
             }
         }
-        let mut cache_projection = self.projection.clone();
-        if let Some(predicate_projection) = &predicate_projection {
-            cache_projection.union(predicate_projection);
-        }
+        let projection_column_ids = get_root_column_ids(schema_descr, &self.projection);
+        let cache_projection = if self.cache_predicate_columns_only {
+            // Only the row filter's columns are cached. If no conjunct became a
+            // row filter, cache nothing rather than fall back to caching the
+            // whole (too-big-to-admit) projection.
+            predicate_projection
+                .clone()
+                .unwrap_or_else(|| ProjectionMask::none(schema_descr.num_columns()))
+        } else {
+            let mut cache_projection = self.projection.clone();
+            if let Some(predicate_projection) = &predicate_projection {
+                cache_projection.union(predicate_projection);
+            }
+            cache_projection
+        };
+        let cache_column_ids = get_root_column_ids(schema_descr, &cache_projection);
+        let passthrough_column_ids: Vec<usize> = projection_column_ids
+            .iter()
+            .copied()
+            .filter(|id| !cache_column_ids.contains(id))
+            .collect();
         CacheDetails {
-            projection_column_ids: get_root_column_ids(schema_descr, &self.projection),
-            cache_column_ids: get_root_column_ids(schema_descr, &cache_projection),
+            passthrough_projection: ProjectionMask::roots(
+                schema_descr,
+                passthrough_column_ids.iter().copied(),
+            ),
+            passthrough_column_ids,
+            projection_column_ids,
+            cache_column_ids,
             predicate_column_ids: predicate_projection
                 .as_ref()
                 .map(|projection| get_root_column_ids(schema_descr, projection))
@@ -83,6 +108,9 @@ impl LiquidRowGroupPlanner {
             cache_column_ids: details.cache_column_ids.clone(),
             cache_batch_size,
             row_count: self.metadata.row_group(row_group_idx).num_rows() as usize,
+            passthrough_projection: details.passthrough_projection.clone(),
+            passthrough_column_ids: details.passthrough_column_ids.clone(),
+            passthrough_batches: Some(self.metrics.passthrough_batches.clone()),
         }
     }
 
@@ -118,7 +146,12 @@ impl LiquidRowGroupPlanner {
             cached_row_group,
             cache_column_ids: details.cache_column_ids,
             predicate_column_ids: details.predicate_column_ids,
-            projection_column_ids: details.projection_column_ids,
+            // Passthrough columns are never cached, so prefetch skips them.
+            projection_column_ids: details
+                .projection_column_ids
+                .into_iter()
+                .filter(|id| !details.passthrough_column_ids.contains(id))
+                .collect(),
             row_filter: self.row_filter.clone(),
             fallback,
         }
@@ -166,6 +199,10 @@ impl LiquidRowGroupPlanner {
 }
 
 struct CacheDetails {
+    /// Projected columns read straight from parquet (selected rows only) and
+    /// never cached. Empty unless `cache_predicate_columns_only`.
+    passthrough_projection: ProjectionMask,
+    passthrough_column_ids: Vec<usize>,
     cache_projection: ProjectionMask,
     cache_column_ids: Vec<usize>,
     predicate_column_ids: Vec<usize>,

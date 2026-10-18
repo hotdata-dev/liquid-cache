@@ -41,6 +41,7 @@ pub struct LiquidParquetSource {
     span: Option<Arc<fastrace::Span>>,
     lineages: Arc<ColumnLineages>,
     prefetch: bool,
+    cache_predicate_columns_only: bool,
 }
 
 impl LiquidParquetSource {
@@ -79,6 +80,21 @@ impl LiquidParquetSource {
         self
     }
 
+    /// Cache only the pushed-down predicate's columns. The rest of the
+    /// projection is served from the cache when already resident, otherwise
+    /// read from parquet for just the rows the predicate selected, and never
+    /// inserted. For wide, selective scans whose full projection is too big to
+    /// admit (see the optimizer's admission gate).
+    pub fn with_cache_predicate_columns_only(mut self, enabled: bool) -> Self {
+        self.cache_predicate_columns_only = enabled;
+        self
+    }
+
+    /// Whether only predicate columns are inserted into the cache.
+    pub fn cache_predicate_columns_only(&self) -> bool {
+        self.cache_predicate_columns_only
+    }
+
     /// The typed lineage expressions currently attached to this source.
     pub fn lineages(&self) -> &Arc<ColumnLineages> {
         &self.lineages
@@ -115,6 +131,7 @@ impl LiquidParquetSource {
             span: None,
             lineages: Arc::default(),
             prefetch: true,
+            cache_predicate_columns_only: false,
         };
 
         if let Some(predicate) = predicate {
@@ -179,6 +196,7 @@ impl FileSource for LiquidParquetSource {
             span: execution_span.map(Arc::new),
             lineages: Arc::clone(&self.lineages),
             prefetch: self.prefetch,
+            cache_predicate_columns_only: self.cache_predicate_columns_only,
         }))
     }
 

@@ -67,6 +67,13 @@ pub struct AdmissionGate {
     /// When `false`, the panic is caught, logged at ERROR, and the scan is cached
     /// normally so the query survives. The caller chooses the default.
     pub strict: bool,
+    /// When a scan's full projection is too big to admit but its pushed-down
+    /// predicate's columns fit, admit it in predicate-columns-only mode instead
+    /// of bypassing: the predicate columns are cached and the predicate runs
+    /// on them, and the other projected columns are read from parquet for just
+    /// the matched rows (never cached). Turns a selective wide scan's full read
+    /// of its filter columns into a cache hit.
+    pub predicate_only: bool,
 }
 
 /// Physical optimizer rule for local mode liquid cache.
@@ -136,9 +143,31 @@ impl LocalModeOptimizer {
             safety: estimate_factor(safety),
             tolerance,
             strict,
+            predicate_only: true,
         });
         self
     }
+
+    /// Enable or disable the gate's predicate-columns-only admission (see
+    /// [`AdmissionGate::predicate_only`]); on by default. No-op without a gate.
+    pub fn with_predicate_only_admission(mut self, enabled: bool) -> Self {
+        if let Some(gate) = &mut self.admission {
+            gate.predicate_only = enabled;
+        }
+        self
+    }
+}
+
+/// The admission gate's decision for one parquet scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Admission {
+    /// Cache the scan's whole projection (the normal liquid path).
+    Admit,
+    /// Cache only the predicate's columns; read the rest from parquet for the
+    /// matched rows.
+    AdmitPredicateOnly,
+    /// Leave the scan as a vanilla parquet read.
+    Bypass,
 }
 
 impl PhysicalOptimizerRule for LocalModeOptimizer {
@@ -163,13 +192,19 @@ impl PhysicalOptimizerRule for LocalModeOptimizer {
         let mut convert = |node: &Arc<dyn ExecutionPlan>, hints: ColumnLineages| {
             // Leave scans whose estimated liquid footprint exceeds the budget as
             // vanilla parquet reads, so oversized scans don't thrash the cache.
-            if let Some(gate) = admission
-                && let Some((cfg, src)) = parquet_scan_parts(node)
-                && should_bypass_guarded(cfg, src, gate, memory_budget, disk_budget)
-            {
-                return None;
+            let admission = match (admission, parquet_scan_parts(node)) {
+                (Some(gate), Some((cfg, src))) => {
+                    admission_guarded(cfg, src, gate, memory_budget, disk_budget)
+                }
+                _ => Admission::Admit,
+            };
+            match admission {
+                Admission::Bypass => None,
+                Admission::Admit => convert_parquet_scan(node, &cache, hints, prefetch, false),
+                Admission::AdmitPredicateOnly => {
+                    convert_parquet_scan(node, &cache, hints, prefetch, true)
+                }
             }
-            convert_parquet_scan(node, &cache, hints, prefetch)
         };
         Ok(lineage::rewrite_with_hints(plan, &mut convert, &analysis))
     }
@@ -195,7 +230,7 @@ pub fn rewrite_data_source_plan_with_hints(
     hints: &ColumnLineages,
 ) -> Arc<dyn ExecutionPlan> {
     plan.transform_up(
-        |node| match convert_parquet_scan(&node, cache, hints.clone(), true) {
+        |node| match convert_parquet_scan(&node, cache, hints.clone(), true, false) {
             Some(new_node) => Ok(Transformed::new(
                 new_node,
                 true,
@@ -224,7 +259,7 @@ fn parquet_scan_parts(node: &Arc<dyn ExecutionPlan>) -> Option<(&FileScanConfig,
 }
 
 /// A scan's footprint estimate plus the breakdown behind it, for the admission
-/// decision ([`should_bypass`]) and its diagnostic log line.
+/// decision ([`admission`]) and its diagnostic log line.
 #[derive(Debug, Default, Clone, Copy)]
 struct FootprintEstimate {
     /// Raw required-column parquet bytes (the decision input).
@@ -247,7 +282,7 @@ struct FootprintEstimate {
 /// Estimate the raw required-column parquet bytes a scan reads: the sum, over
 /// the files that survive the scan's predicate, of the byte sizes of the columns
 /// it materializes. This is the byte-accurate, filter-aware size the admission
-/// decision is built on (see [`should_bypass`]); the expansion/safety/tolerance
+/// decision is built on (see [`admission`]); the expansion/safety/tolerance
 /// factors are applied there, not here.
 ///
 /// "Required columns" is the output projection **unioned with the predicate
@@ -255,7 +290,14 @@ struct FootprintEstimate {
 /// `Inexact` per-column sizes; a column with an `Absent` size or a file with no
 /// stats falls back to the whole file size. The sum saturates rather than
 /// overflowing on pathological file lists.
-fn estimate_required_bytes(cfg: &FileScanConfig, src: &ParquetSource) -> FootprintEstimate {
+///
+/// With `predicate_only`, only the predicate's columns count: the footprint of
+/// a scan admitted in [`Admission::AdmitPredicateOnly`] mode.
+fn estimate_required_bytes(
+    cfg: &FileScanConfig,
+    src: &ParquetSource,
+    predicate_only: bool,
+) -> FootprintEstimate {
     let num_file_cols = cfg.file_schema().fields().len();
     // Full table schema (file + partition columns). The pushed-down predicate
     // and `PartitionedFile` stats are expressed against it, so file pruning must
@@ -268,6 +310,7 @@ fn estimate_required_bytes(cfg: &FileScanConfig, src: &ParquetSource) -> Footpri
     // non-column projection expression. Indices are table-schema-relative; keep
     // only file columns (partition columns are literals, never materialized).
     let mut required: Vec<usize> = match src.projection() {
+        _ if predicate_only => Vec::new(),
         Some(p) => p
             .column_indices()
             .into_iter()
@@ -362,18 +405,39 @@ fn admission_threshold(memory_budget: u64, disk_budget: u64, tolerance: f64) -> 
 /// `raw` is [`estimate_required_bytes`]. It bypasses when that footprint exceeds
 /// the [`admission_threshold`] (`memory × tolerance + disk`). The comparison is
 /// done in finite `f64` space to avoid integer overflow.
-fn should_bypass(
+///
+/// A scan that would bypass is instead admitted predicate-only when
+/// `gate.predicate_only` is set, it has a pushed-down predicate that reads
+/// fewer columns than the whole scan, and the predicate columns' footprint
+/// fits the same threshold.
+fn admission(
     cfg: &FileScanConfig,
     src: &ParquetSource,
     gate: AdmissionGate,
     memory_budget: u64,
     disk_budget: u64,
-) -> bool {
-    let est = estimate_required_bytes(cfg, src);
-    // Multipliers are already sanitized to finite, >= 1.0 in `with_admission_gate`.
-    let footprint = (est.raw_bytes as f64) * gate.expansion * gate.safety;
+) -> Admission {
     let threshold = admission_threshold(memory_budget, disk_budget, gate.tolerance);
-    let bypass = footprint > threshold;
+    let est = estimate_required_bytes(cfg, src, false);
+    let fits = |est: &FootprintEstimate| {
+        // Multipliers are already sanitized to finite, >= 1.0 in `with_admission_gate`.
+        let footprint = (est.raw_bytes as f64) * gate.expansion * gate.safety;
+        (footprint, footprint <= threshold)
+    };
+    let (footprint, full_fits) = fits(&est);
+    let (verdict, est, footprint) = if full_fits {
+        (Admission::Admit, est, footprint)
+    } else if gate.predicate_only && src.filter().is_some() {
+        let pred = estimate_required_bytes(cfg, src, true);
+        let (pred_footprint, pred_fits) = fits(&pred);
+        if pred_fits && pred.required_cols > 0 && pred.required_cols < est.required_cols {
+            (Admission::AdmitPredicateOnly, pred, pred_footprint)
+        } else {
+            (Admission::Bypass, est, footprint)
+        }
+    } else {
+        (Admission::Bypass, est, footprint)
+    };
 
     // One line per admission decision. Without this the gate is a black box and
     // every tuning cycle costs a benchmark run to infer decisions from side
@@ -393,7 +457,11 @@ fn should_bypass(
          fallback_files={fb} raw_bytes={raw} footprint_bytes={fp} \
          memory_bytes={mem} disk_bytes={disk} threshold_bytes={thr} \
          expansion={exp} safety={saf} tolerance={tol}",
-        verdict = if bypass { "BYPASS" } else { "ADMIT" },
+        verdict = match verdict {
+            Admission::Admit => "ADMIT",
+            Admission::AdmitPredicateOnly => "ADMIT_PREDICATE_ONLY",
+            Admission::Bypass => "BYPASS",
+        },
         cols = est.required_cols,
         charged = est.charged_files,
         total = est.partitioned_files,
@@ -408,10 +476,10 @@ fn should_bypass(
         tol = gate.tolerance,
     );
 
-    bypass
+    verdict
 }
 
-/// [`should_bypass`], with an optional panic guard.
+/// [`admission`], with an optional panic guard.
 ///
 /// The gate is a pure performance optimization: caching a scan or reading it as
 /// vanilla parquet yields identical results. So if footprint estimation ever
@@ -427,18 +495,18 @@ fn should_bypass(
 ///   keep queries running while it is fixed.
 /// - `gate.strict == false`: log, then cache the scan normally so the query
 ///   survives. The log advises turning the flag *on* to fail loud instead.
-fn should_bypass_guarded(
+fn admission_guarded(
     cfg: &FileScanConfig,
     src: &ParquetSource,
     gate: AdmissionGate,
     memory_budget: u64,
     disk_budget: u64,
-) -> bool {
+) -> Admission {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        should_bypass(cfg, src, gate, memory_budget, disk_budget)
+        admission(cfg, src, gate, memory_budget, disk_budget)
     }));
     match result {
-        Ok(bypass) => bypass,
+        Ok(verdict) => verdict,
         Err(payload) => {
             let msg = payload
                 .downcast_ref::<&str>()
@@ -459,7 +527,7 @@ fn should_bypass_guarded(
                  caching scan normally. Configure the admission gate with strict=true to fail \
                  loud instead."
             );
-            false
+            Admission::Admit
         }
     }
 }
@@ -611,6 +679,7 @@ fn convert_parquet_scan(
     cache: &LiquidCacheParquetRef,
     hints: ColumnLineages,
     prefetch: bool,
+    cache_predicate_columns_only: bool,
 ) -> Option<Arc<dyn ExecutionPlan>> {
     let data_source_exec = node.downcast_ref::<DataSourceExec>()?;
     let (file_scan_config, parquet_source) =
@@ -634,7 +703,8 @@ fn convert_parquet_scan(
     let new_source =
         LiquidParquetSource::from_parquet_source(parquet_source.clone(), cache.clone())
             .with_lineages(Arc::new(hints))
-            .with_prefetch(prefetch);
+            .with_prefetch(prefetch)
+            .with_cache_predicate_columns_only(cache_predicate_columns_only);
 
     let mut new_config = file_scan_config.clone();
     new_config.file_source = Arc::new(new_source);
@@ -820,7 +890,7 @@ mod tests {
         // Positive control: an ordinary scan is still handed to the cache.
         let plain = scan(TableSchema::builder(Arc::clone(&file_schema)).build());
         assert!(
-            convert_parquet_scan(&plain, &cache, ColumnLineages::default(), true).is_some(),
+            convert_parquet_scan(&plain, &cache, ColumnLineages::default(), true, false).is_some(),
             "an ordinary scan must still convert to the liquid source"
         );
 
@@ -836,7 +906,8 @@ mod tests {
                 .build(),
         );
         assert!(
-            convert_parquet_scan(&positional, &cache, ColumnLineages::default(), true).is_none(),
+            convert_parquet_scan(&positional, &cache, ColumnLineages::default(), true, false)
+                .is_none(),
             "a scan reading a virtual column must stay on ParquetSource"
         );
     }
@@ -872,6 +943,191 @@ mod tests {
         assert!(
             has_liquid_source(&uncapped),
             "fitting scan should be wrapped in LiquidParquetSource"
+        );
+    }
+
+    /// Sum of the named metric over every node in `plan`.
+    fn sum_metric(plan: &Arc<dyn ExecutionPlan>, name: &str) -> usize {
+        let mut total = 0;
+        plan.apply(|node| {
+            if let Some(metrics) = node.metrics() {
+                total += metrics.sum_by_name(name).map(|v| v.as_usize()).unwrap_or(0);
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })
+        .unwrap();
+        total
+    }
+
+    /// The production shape: `SELECT * ... WHERE user_id = ? ORDER BY ts DESC
+    /// LIMIT n` over a table whose wide column makes the whole projection too
+    /// big to admit, while the filter column fits. The gate must admit it
+    /// predicate-only rather than bypass, the rows must match vanilla parquet,
+    /// the filter column must be served from the cache, and the wide column
+    /// must be read from parquet for the matched rows only and never cached.
+    #[tokio::test]
+    async fn wide_selective_scan_is_admitted_predicate_only() {
+        use arrow::array::{Int64Array, StringArray};
+        use datafusion::prelude::SessionConfig;
+
+        const ROWS: usize = 4 * 8192;
+        const USERS: usize = 4093;
+        // Wide-ish ids so the filter column, like production's, costs real bytes.
+        let user = |i: usize| format!("user-{:0>58}", i % USERS);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wide.parquet");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("user_id", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("payload", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from_iter_values((0..ROWS).map(user))),
+                Arc::new(Int64Array::from_iter_values((0..ROWS).map(|i| i as i64))),
+                Arc::new(StringArray::from_iter_values(
+                    (0..ROWS).map(|i| format!("{i:0>256}")),
+                )),
+            ],
+        )
+        .unwrap();
+        // Small pages so the payload read can skip pages without a match.
+        let props = WriterProperties::builder()
+            .set_data_page_row_count_limit(128)
+            .set_write_batch_size(128)
+            .set_dictionary_enabled(false)
+            .build();
+        let mut writer =
+            ArrowWriter::try_new(File::create(&path).unwrap(), schema, Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let session_config =
+            SessionConfig::new().set_bool("datafusion.execution.parquet.pushdown_filters", true);
+        let ctx = SessionContext::new_with_config(session_config);
+        ctx.register_parquet("t", path.to_str().unwrap(), Default::default())
+            .await
+            .unwrap();
+        let sql = format!(
+            "SELECT * FROM t WHERE user_id = '{}' ORDER BY ts DESC LIMIT 500",
+            user(7)
+        );
+        let sql = sql.as_str();
+        let expected = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+        let expected_rows: usize = expected.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(expected_rows, (0..ROWS).filter(|i| i % USERS == 7).count());
+
+        // Bytes vanilla parquet reads for this query, the bypass baseline.
+        let vanilla_plan = ctx
+            .sql(sql)
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        collect(Arc::clone(&vanilla_plan), ctx.task_ctx())
+            .await
+            .unwrap();
+        let vanilla_bytes = sum_metric(&vanilla_plan, "bytes_scanned");
+
+        // A budget between the filter column's footprint and the whole scan's.
+        let plan = ctx
+            .sql(sql)
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let (cfg, src) = {
+            let mut parts = None;
+            plan.apply(|node| {
+                if let Some((cfg, src)) = parquet_scan_parts(node) {
+                    parts = Some((cfg.clone(), src.clone()));
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+            .unwrap();
+            parts.expect("parquet scan in plan")
+        };
+        let full = estimate_required_bytes(&cfg, &src, false);
+        let pred = estimate_required_bytes(&cfg, &src, true);
+        assert_eq!(
+            full.fallback_files + pred.fallback_files,
+            0,
+            "per-column sizes expected"
+        );
+        assert!(pred.raw_bytes * 4 < full.raw_bytes, "{pred:?} vs {full:?}");
+        let budget = ((pred.raw_bytes + full.raw_bytes) / 2) as usize;
+
+        let cache = make_cache_with_mem_disk(dir.path(), budget, 0).await;
+        let optimizer =
+            LocalModeOptimizer::new(Arc::clone(&cache)).with_admission_gate(1.0, 1.0, 1.0, true);
+        let config = ConfigOptions::default();
+
+        // Kill switch: with predicate-only admission off, the scan bypasses.
+        let off = LocalModeOptimizer::new(Arc::clone(&cache))
+            .with_admission_gate(1.0, 1.0, 1.0, true)
+            .with_predicate_only_admission(false)
+            .optimize(plan.clone(), &config)
+            .unwrap();
+        assert!(
+            !has_liquid_source(&off),
+            "full footprint exceeds the budget"
+        );
+
+        let to_strings = |batches: &[RecordBatch]| {
+            arrow::util::pretty::pretty_format_batches(batches)
+                .unwrap()
+                .to_string()
+        };
+        // The scan's metrics set is shared by every plan optimized from `plan`,
+        // so per-run bytes are deltas.
+        let mut bytes_before = 0;
+        let mut last_bytes = 0;
+        // Run twice: the first fills the cache, the second reads it.
+        for _ in 0..2 {
+            let liquid = optimizer.optimize(plan.clone(), &config).unwrap();
+            assert!(liquid_source(&liquid).cache_predicate_columns_only());
+            let got = collect(Arc::clone(&liquid), ctx.task_ctx()).await.unwrap();
+            assert_eq!(to_strings(&got), to_strings(&expected));
+            assert!(sum_metric(&liquid, "passthrough_batches") > 0);
+            let bytes_after = sum_metric(&liquid, "bytes_scanned");
+            last_bytes = bytes_after - bytes_before;
+            bytes_before = bytes_after;
+        }
+
+        // The filter column is resident; the wide payload never was.
+        let file = cache.register_or_get_file(
+            crate::cache::ParquetFileIdentity::new(
+                cfg.object_store_url.clone(),
+                cfg.file_groups[0].files()[0]
+                    .object_meta
+                    .location
+                    .to_string(),
+            ),
+            cfg.file_schema().clone(),
+        );
+        let row_group = file.create_row_group(0, vec![]);
+        let user_id = row_group.get_column_by_name("user_id").unwrap();
+        let payload = row_group.get_column_by_name("payload").unwrap();
+        for batch in 0..(ROWS / 8192) as u16 {
+            let batch = crate::cache::BatchID::from_raw(batch);
+            assert!(
+                user_id.contains(batch),
+                "user_id batch {batch:?} not cached"
+            );
+            assert!(
+                !payload.contains(batch),
+                "payload batch {batch:?} was cached"
+            );
+        }
+
+        // Warm, parquet serves only the matched rows' pages of the other
+        // columns; vanilla also reads the whole filter column.
+        assert!(
+            last_bytes * 4 < vanilla_bytes,
+            "warm predicate-only read {last_bytes} vs vanilla {vanilla_bytes}"
         );
     }
 
@@ -987,7 +1243,7 @@ mod tests {
 
         // The call that used to panic. It must return a finite estimate; `s`
         // (the struct column read by `s.a`) is the one required file column.
-        let est = estimate_required_bytes(&cfg, &src);
+        let est = estimate_required_bytes(&cfg, &src, false);
         assert!(est.raw_bytes > 0, "estimate should be a real byte count");
     }
 
