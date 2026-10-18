@@ -207,7 +207,9 @@ impl LocalModeOptimizer {
     /// Wide means it projects at least
     /// [`Self::with_sparse_selection_bypass_min_columns`] columns its
     /// predicate does not read; a narrower sparse scan is admitted as before.
-    /// Off by default.
+    /// A wide one the cache would admit whole without its selection (by the
+    /// gate's threshold) is still admitted whole: the bypass replaces only the
+    /// predicate-only verdict. Off by default.
     pub fn with_sparse_selection_bypass(mut self, enabled: bool) -> Self {
         self.sparse_selection_bypass = enabled;
         self
@@ -512,6 +514,19 @@ fn estimate_required_bytes(
     predicate_only: bool,
     cache_batch_size: usize,
 ) -> FootprintEstimate {
+    estimate_footprint(cfg, src, predicate_only, cache_batch_size, true)
+}
+
+/// [`estimate_required_bytes`], charging a selected file its touched batches
+/// only with `scale_to_selection`, else its whole required columns: what
+/// the scan would cost with no selection.
+fn estimate_footprint(
+    cfg: &FileScanConfig,
+    src: &ParquetSource,
+    predicate_only: bool,
+    cache_batch_size: usize,
+    scale_to_selection: bool,
+) -> FootprintEstimate {
     let num_file_cols = cfg.file_schema().fields().len();
     // Full table schema (file + partition columns). The pushed-down predicate
     // and `PartitionedFile` stats are expressed against it, so file pruning must
@@ -585,7 +600,7 @@ fn estimate_required_bytes(
             fallback_files += 1;
         }
         let coverage = FileRowCoverage::of(f, cache_batch_size);
-        if let Some(coverage) = coverage {
+        if let Some(coverage) = coverage.filter(|_| scale_to_selection) {
             bytes = coverage.scale(bytes);
             selected_files += usize::from(coverage.has_selection);
         }
@@ -691,7 +706,15 @@ fn admission(cfg: &FileScanConfig, src: &ParquetSource, policy: AdmissionPolicy)
         && policy.sparse_selection_bypass
         && extra_cols >= policy.sparse_selection_bypass_min_columns
     {
-        (Admission::Bypass, est, footprint)
+        // The bypass replaces only the predicate-only verdict: a scan the
+        // cache would admit whole without its selection (a short window) is
+        // admitted whole, selection and all, and served from memory.
+        let whole = estimate_footprint(cfg, src, false, policy.cache_batch_size, false);
+        if fits(&whole).1 {
+            (Admission::Admit, est, footprint)
+        } else {
+            (Admission::Bypass, est, footprint)
+        }
     } else if full_fits && (!sparse || pred_covers_scan) {
         (Admission::Admit, est, footprint)
     } else {
@@ -1730,59 +1753,79 @@ mod tests {
     }
 
     /// With sparse-selection bypass on, a wide sparse scan (two or more
-    /// columns beyond its predicate's) is read as vanilla parquet, gated or
-    /// not; a narrow one keeps the cache's path, and a dense one is
-    /// unaffected. Each answers as vanilla parquet does.
+    /// columns beyond its predicate's) is read as vanilla parquet only when
+    /// the cache would not admit the scan whole without its selection: the
+    /// bypass replaces the predicate-only verdict, not admission. A narrow one
+    /// keeps the cache's path, and a dense one is unaffected. Each answers as
+    /// vanilla parquet does.
     #[tokio::test]
-    async fn sparse_selection_bypass_bypasses_only_wide_sparse_scans() {
+    async fn sparse_selection_bypass_replaces_only_predicate_only() {
         const NEEDLE: &str = "'user-0000000000000000000000000000000000000000000000000000002000x'";
         let wide = format!("SELECT * FROM t WHERE user_id = {NEEDLE}");
         // A histogram's shape: the filter column and one more.
         let narrow = format!("SELECT user_id, ts FROM t WHERE user_id = {NEEDLE}");
         let filter_only = format!("SELECT user_id FROM t WHERE user_id = {NEEDLE}");
         let table = NeedleTable::new().await;
-        let cache = table.cache("bypass").await;
-        let gated = || {
-            LocalModeOptimizer::new(Arc::clone(&cache))
+        // Room for the whole file, and for a tenth of it.
+        let roomy = table.cache("roomy").await;
+        let small_dir = table.dir.path().join("small");
+        std::fs::create_dir_all(&small_dir).unwrap();
+        let small = make_cache_with_mem_disk(&small_dir, table.file_size / 10, 0).await;
+        let gated = |cache: &LiquidCacheParquetRef| {
+            LocalModeOptimizer::new(Arc::clone(cache))
                 .with_admission_gate(1.0, 1.0, 1.0, true)
                 .with_sparse_selection_bypass(true)
         };
-        let ungated =
-            || LocalModeOptimizer::new(Arc::clone(&cache)).with_sparse_selection_bypass(true);
         let t = &table;
         let selected = |sql: String| async move {
             with_file_extension(t.plan(&sql).await, needle_access_plan())
         };
         let unfiltered = selected(NEEDLE_UNFILTERED.to_string()).await;
+
         // Some(true) = predicate-only, Some(false) = admitted whole, None = bypass.
-        for optimizer in [&gated as &dyn Fn() -> LocalModeOptimizer, &ungated] {
-            assert_eq!(verdict(selected(wide.clone()).await, optimizer()), None);
-            assert_eq!(verdict(unfiltered.clone(), optimizer()), None);
+        // The whole scan fits: admitted whole, selection and all.
+        assert_eq!(
+            verdict(selected(wide.clone()).await, gated(&roomy)),
+            Some(false)
+        );
+        assert_eq!(verdict(unfiltered.clone(), gated(&roomy)), Some(false));
+        // Ungated, everything fits.
+        let ungated =
+            LocalModeOptimizer::new(Arc::clone(&roomy)).with_sparse_selection_bypass(true);
+        assert_eq!(verdict(selected(wide.clone()).await, ungated), Some(false));
+        // It does not: wide scans bypass instead of going predicate-only.
+        assert_eq!(verdict(selected(wide.clone()).await, gated(&small)), None);
+        assert_eq!(verdict(unfiltered.clone(), gated(&small)), None);
+        for cache in [&roomy, &small] {
+            // Narrow ones keep the cache's path, as without the bypass.
             assert_eq!(
-                verdict(selected(narrow.clone()).await, optimizer()),
+                verdict(selected(narrow.clone()).await, gated(cache)),
                 Some(true)
             );
             assert_eq!(
-                verdict(selected(filter_only.clone()).await, optimizer()),
+                verdict(selected(filter_only.clone()).await, gated(cache)),
                 Some(false)
             );
-            // Zero columns: every sparse scan bypasses.
-            let all = optimizer().with_sparse_selection_bypass_min_columns(0);
-            assert_eq!(verdict(selected(narrow.clone()).await, all), None);
-            // 20 of 32768 rows; a ratio below that is not sparse.
-            let low = optimizer().with_sparse_selection_ratio(0.0001);
-            assert_eq!(verdict(selected(wide.clone()).await, low), Some(false));
         }
-        assert_eq!(verdict(table.plan(&wide).await, ungated()), Some(false));
-        // Same rows on the cached and the bypassed path as on vanilla parquet.
-        for sql in [&wide, &narrow, &filter_only] {
-            let (vanilla, _) = table.run(selected(sql.clone()).await).await;
-            let optimized = gated()
-                .optimize(selected(sql.clone()).await, &ConfigOptions::default())
-                .unwrap();
-            let (rows, _) = table.run(optimized).await;
-            assert_eq!(rows, vanilla, "{sql}");
-            assert!(vanilla.contains("2000x"), "{vanilla}");
+        // 20 of 32768 rows; below that ratio the scan is not sparse, and the
+        // bypass does not apply.
+        let low = gated(&roomy).with_sparse_selection_ratio(0.0001);
+        assert_eq!(verdict(selected(wide.clone()).await, low), Some(false));
+        // Zero columns: every sparse scan that does not fit bypasses.
+        let all = gated(&small).with_sparse_selection_bypass_min_columns(0);
+        assert_eq!(verdict(selected(narrow.clone()).await, all), None);
+
+        // Same rows on every path as on vanilla parquet.
+        for cache in [&roomy, &small] {
+            for sql in [&wide, &narrow, &filter_only] {
+                let (vanilla, _) = table.run(selected(sql.clone()).await).await;
+                let optimized = gated(cache)
+                    .optimize(selected(sql.clone()).await, &ConfigOptions::default())
+                    .unwrap();
+                let (rows, _) = table.run(optimized).await;
+                assert_eq!(rows, vanilla, "{sql}");
+                assert!(vanilla.contains("2000x"), "{vanilla}");
+            }
         }
     }
 
