@@ -78,6 +78,9 @@ pub struct LiquidCacheLocalBuilder {
     sparse_selection_ratio: Option<f64>,
     /// See `LocalModeOptimizer::with_sparse_selection_bypass`.
     sparse_selection_bypass: bool,
+    /// See `LocalModeOptimizer::with_sparse_selection_bypass_min_columns`;
+    /// `None` keeps its default.
+    sparse_selection_bypass_min_columns: Option<usize>,
     span: fastrace::Span,
 }
 
@@ -97,6 +100,7 @@ impl Default for LiquidCacheLocalBuilder {
             admission: None,
             sparse_selection_ratio: None,
             sparse_selection_bypass: false,
+            sparse_selection_bypass_min_columns: None,
             span: fastrace::Span::enter_with_local_parent("liquid_cache_datafusion_local_builder"),
         }
     }
@@ -200,6 +204,14 @@ impl LiquidCacheLocalBuilder {
         self
     }
 
+    /// Columns beyond its predicate's a sparse scan must project to be
+    /// bypassed. See
+    /// `LocalModeOptimizer::with_sparse_selection_bypass_min_columns`.
+    pub fn with_sparse_selection_bypass_min_columns(mut self, columns: usize) -> Self {
+        self.sparse_selection_bypass_min_columns = Some(columns);
+        self
+    }
+
     /// Build a SessionContext with liquid cache configured
     /// Returns the SessionContext and the liquid cache reference
     pub async fn build(
@@ -253,6 +265,9 @@ impl LiquidCacheLocalBuilder {
             optimizer = optimizer.with_sparse_selection_ratio(ratio);
         }
         optimizer = optimizer.with_sparse_selection_bypass(self.sparse_selection_bypass);
+        if let Some(columns) = self.sparse_selection_bypass_min_columns {
+            optimizer = optimizer.with_sparse_selection_bypass_min_columns(columns);
+        }
 
         let state = datafusion::execution::SessionStateBuilder::new()
             .with_config(config)

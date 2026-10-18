@@ -36,6 +36,11 @@ use crate::{
     LiquidCacheParquetRef, LiquidParquetSource, cache::ColumnLineages, reader::TouchedBatches,
 };
 
+/// Default [`LocalModeOptimizer::with_sparse_selection_bypass_min_columns`]:
+/// a scan reading one column besides its filter's (a histogram's time
+/// column, say) is still served by the cache.
+pub const DEFAULT_SPARSE_SELECTION_BYPASS_MIN_COLUMNS: usize = 2;
+
 /// Default [`LocalModeOptimizer::with_sparse_selection_ratio`].
 pub const DEFAULT_SPARSE_SELECTION_RATIO: f64 = 0.05;
 
@@ -101,6 +106,8 @@ pub struct LocalModeOptimizer {
     sparse_selection_ratio: f64,
     /// See [`Self::with_sparse_selection_bypass`].
     sparse_selection_bypass: bool,
+    /// See [`Self::with_sparse_selection_bypass_min_columns`].
+    sparse_selection_bypass_min_columns: usize,
 }
 
 impl LocalModeOptimizer {
@@ -112,6 +119,7 @@ impl LocalModeOptimizer {
             admission: None,
             sparse_selection_ratio: DEFAULT_SPARSE_SELECTION_RATIO,
             sparse_selection_bypass: false,
+            sparse_selection_bypass_min_columns: DEFAULT_SPARSE_SELECTION_BYPASS_MIN_COLUMNS,
         }
     }
 
@@ -192,13 +200,25 @@ impl LocalModeOptimizer {
         self
     }
 
-    /// Bypass every sparse scan (see [`Self::with_sparse_selection_ratio`])
+    /// Bypass a wide sparse scan (see [`Self::with_sparse_selection_ratio`])
     /// instead of admitting it predicate-only: read it as vanilla parquet,
-    /// whose access plan fetches only the selected rows' pages and coalesces
-    /// them, rather than fetching each matched row's batch on its own. Off by
-    /// default.
+    /// whose access plan fetches only the selected rows' pages, rather than
+    /// fetching each matched row's batch of every other column on its own.
+    /// Wide means it projects at least
+    /// [`Self::with_sparse_selection_bypass_min_columns`] columns its
+    /// predicate does not read; a narrower sparse scan is admitted as before.
+    /// Off by default.
     pub fn with_sparse_selection_bypass(mut self, enabled: bool) -> Self {
         self.sparse_selection_bypass = enabled;
+        self
+    }
+
+    /// Columns beyond its predicate's a sparse scan must project to be
+    /// bypassed (see [`Self::with_sparse_selection_bypass`]); default
+    /// [`DEFAULT_SPARSE_SELECTION_BYPASS_MIN_COLUMNS`]. `0` bypasses every
+    /// sparse scan.
+    pub fn with_sparse_selection_bypass_min_columns(mut self, columns: usize) -> Self {
+        self.sparse_selection_bypass_min_columns = columns;
         self
     }
 
@@ -210,6 +230,7 @@ impl LocalModeOptimizer {
             cache_batch_size: self.cache.batch_size(),
             sparse_selection_ratio: self.sparse_selection_ratio,
             sparse_selection_bypass: self.sparse_selection_bypass,
+            sparse_selection_bypass_min_columns: self.sparse_selection_bypass_min_columns,
         }
     }
 }
@@ -225,6 +246,7 @@ struct AdmissionPolicy {
     cache_batch_size: usize,
     sparse_selection_ratio: f64,
     sparse_selection_bypass: bool,
+    sparse_selection_bypass_min_columns: usize,
 }
 
 /// The admission gate's decision for one parquet scan.
@@ -660,7 +682,15 @@ fn admission(cfg: &FileScanConfig, src: &ParquetSource, policy: AdmissionPolicy)
         .as_ref()
         .is_some_and(|pred| pred.required_cols >= est.required_cols);
 
-    let (verdict, est, footprint) = if sparse && policy.sparse_selection_bypass {
+    // Columns the scan projects that its predicate does not read: what a
+    // predicate-only read fetches per matched batch.
+    let extra_cols = est
+        .required_cols
+        .saturating_sub(pred.as_ref().map_or(0, |pred| pred.required_cols));
+    let (verdict, est, footprint) = if sparse
+        && policy.sparse_selection_bypass
+        && extra_cols >= policy.sparse_selection_bypass_min_columns
+    {
         (Admission::Bypass, est, footprint)
     } else if full_fits && (!sparse || pred_covers_scan) {
         (Admission::Admit, est, footprint)
@@ -1699,10 +1729,17 @@ mod tests {
         );
     }
 
-    /// With sparse-selection bypass on, a sparse scan is read as vanilla
-    /// parquet, gated or not, filtered or not; a dense one is unaffected.
+    /// With sparse-selection bypass on, a wide sparse scan (two or more
+    /// columns beyond its predicate's) is read as vanilla parquet, gated or
+    /// not; a narrow one keeps the cache's path, and a dense one is
+    /// unaffected. Each answers as vanilla parquet does.
     #[tokio::test]
-    async fn sparse_selection_bypass_bypasses_only_sparse_scans() {
+    async fn sparse_selection_bypass_bypasses_only_wide_sparse_scans() {
+        const NEEDLE: &str = "'user-0000000000000000000000000000000000000000000000000000002000x'";
+        let wide = format!("SELECT * FROM t WHERE user_id = {NEEDLE}");
+        // A histogram's shape: the filter column and one more.
+        let narrow = format!("SELECT user_id, ts FROM t WHERE user_id = {NEEDLE}");
+        let filter_only = format!("SELECT user_id FROM t WHERE user_id = {NEEDLE}");
         let table = NeedleTable::new().await;
         let cache = table.cache("bypass").await;
         let gated = || {
@@ -1712,20 +1749,41 @@ mod tests {
         };
         let ungated =
             || LocalModeOptimizer::new(Arc::clone(&cache)).with_sparse_selection_bypass(true);
-        let filtered = with_file_extension(table.plan(NEEDLE_FILTERED).await, needle_access_plan());
-        let unfiltered =
-            with_file_extension(table.plan(NEEDLE_UNFILTERED).await, needle_access_plan());
+        let t = &table;
+        let selected = |sql: String| async move {
+            with_file_extension(t.plan(&sql).await, needle_access_plan())
+        };
+        let unfiltered = selected(NEEDLE_UNFILTERED.to_string()).await;
+        // Some(true) = predicate-only, Some(false) = admitted whole, None = bypass.
         for optimizer in [&gated as &dyn Fn() -> LocalModeOptimizer, &ungated] {
-            assert_eq!(verdict(filtered.clone(), optimizer()), None);
+            assert_eq!(verdict(selected(wide.clone()).await, optimizer()), None);
             assert_eq!(verdict(unfiltered.clone(), optimizer()), None);
+            assert_eq!(
+                verdict(selected(narrow.clone()).await, optimizer()),
+                Some(true)
+            );
+            assert_eq!(
+                verdict(selected(filter_only.clone()).await, optimizer()),
+                Some(false)
+            );
+            // Zero columns: every sparse scan bypasses.
+            let all = optimizer().with_sparse_selection_bypass_min_columns(0);
+            assert_eq!(verdict(selected(narrow.clone()).await, all), None);
             // 20 of 32768 rows; a ratio below that is not sparse.
             let low = optimizer().with_sparse_selection_ratio(0.0001);
-            assert_eq!(verdict(filtered.clone(), low), Some(false));
+            assert_eq!(verdict(selected(wide.clone()).await, low), Some(false));
         }
-        assert_eq!(
-            verdict(table.plan(NEEDLE_FILTERED).await, ungated()),
-            Some(false)
-        );
+        assert_eq!(verdict(table.plan(&wide).await, ungated()), Some(false));
+        // Same rows on the cached and the bypassed path as on vanilla parquet.
+        for sql in [&wide, &narrow, &filter_only] {
+            let (vanilla, _) = table.run(selected(sql.clone()).await).await;
+            let optimized = gated()
+                .optimize(selected(sql.clone()).await, &ConfigOptions::default())
+                .unwrap();
+            let (rows, _) = table.run(optimized).await;
+            assert_eq!(rows, vanilla, "{sql}");
+            assert!(vanilla.contains("2000x"), "{vanilla}");
+        }
     }
 
     /// The footprint charges a selected file for the cache batches its
