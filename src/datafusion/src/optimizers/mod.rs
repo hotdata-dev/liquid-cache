@@ -99,6 +99,8 @@ pub struct LocalModeOptimizer {
     admission: Option<AdmissionGate>,
     /// See [`Self::with_sparse_selection_ratio`].
     sparse_selection_ratio: f64,
+    /// See [`Self::with_sparse_selection_bypass`].
+    sparse_selection_bypass: bool,
 }
 
 impl LocalModeOptimizer {
@@ -109,6 +111,7 @@ impl LocalModeOptimizer {
             prefetch: true,
             admission: None,
             sparse_selection_ratio: DEFAULT_SPARSE_SELECTION_RATIO,
+            sparse_selection_bypass: false,
         }
     }
 
@@ -189,6 +192,16 @@ impl LocalModeOptimizer {
         self
     }
 
+    /// Bypass every sparse scan (see [`Self::with_sparse_selection_ratio`])
+    /// instead of admitting it predicate-only: read it as vanilla parquet,
+    /// whose access plan fetches only the selected rows' pages and coalesces
+    /// them, rather than fetching each matched row's batch on its own. Off by
+    /// default.
+    pub fn with_sparse_selection_bypass(mut self, enabled: bool) -> Self {
+        self.sparse_selection_bypass = enabled;
+        self
+    }
+
     fn admission_policy(&self) -> AdmissionPolicy {
         AdmissionPolicy {
             gate: self.admission,
@@ -196,6 +209,7 @@ impl LocalModeOptimizer {
             disk_budget: self.cache.max_disk_bytes() as u64,
             cache_batch_size: self.cache.batch_size(),
             sparse_selection_ratio: self.sparse_selection_ratio,
+            sparse_selection_bypass: self.sparse_selection_bypass,
         }
     }
 }
@@ -210,6 +224,7 @@ struct AdmissionPolicy {
     /// footprint is its touched batches, not its rows.
     cache_batch_size: usize,
     sparse_selection_ratio: f64,
+    sparse_selection_bypass: bool,
 }
 
 /// The admission gate's decision for one parquet scan.
@@ -645,7 +660,9 @@ fn admission(cfg: &FileScanConfig, src: &ParquetSource, policy: AdmissionPolicy)
         .as_ref()
         .is_some_and(|pred| pred.required_cols >= est.required_cols);
 
-    let (verdict, est, footprint) = if full_fits && (!sparse || pred_covers_scan) {
+    let (verdict, est, footprint) = if sparse && policy.sparse_selection_bypass {
+        (Admission::Bypass, est, footprint)
+    } else if full_fits && (!sparse || pred_covers_scan) {
         (Admission::Admit, est, footprint)
     } else {
         match pred {
@@ -1678,6 +1695,35 @@ mod tests {
         );
         assert_eq!(
             verdict(table.plan(NEEDLE_UNFILTERED).await, ungated()),
+            Some(false)
+        );
+    }
+
+    /// With sparse-selection bypass on, a sparse scan is read as vanilla
+    /// parquet, gated or not, filtered or not; a dense one is unaffected.
+    #[tokio::test]
+    async fn sparse_selection_bypass_bypasses_only_sparse_scans() {
+        let table = NeedleTable::new().await;
+        let cache = table.cache("bypass").await;
+        let gated = || {
+            LocalModeOptimizer::new(Arc::clone(&cache))
+                .with_admission_gate(1.0, 1.0, 1.0, true)
+                .with_sparse_selection_bypass(true)
+        };
+        let ungated =
+            || LocalModeOptimizer::new(Arc::clone(&cache)).with_sparse_selection_bypass(true);
+        let filtered = with_file_extension(table.plan(NEEDLE_FILTERED).await, needle_access_plan());
+        let unfiltered =
+            with_file_extension(table.plan(NEEDLE_UNFILTERED).await, needle_access_plan());
+        for optimizer in [&gated as &dyn Fn() -> LocalModeOptimizer, &ungated] {
+            assert_eq!(verdict(filtered.clone(), optimizer()), None);
+            assert_eq!(verdict(unfiltered.clone(), optimizer()), None);
+            // 20 of 32768 rows; a ratio below that is not sparse.
+            let low = optimizer().with_sparse_selection_ratio(0.0001);
+            assert_eq!(verdict(filtered.clone(), low), Some(false));
+        }
+        assert_eq!(
+            verdict(table.plan(NEEDLE_FILTERED).await, ungated()),
             Some(false)
         );
     }

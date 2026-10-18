@@ -76,6 +76,8 @@ pub struct LiquidCacheLocalBuilder {
     /// See `LocalModeOptimizer::with_sparse_selection_ratio`; `None` keeps its
     /// default.
     sparse_selection_ratio: Option<f64>,
+    /// See `LocalModeOptimizer::with_sparse_selection_bypass`.
+    sparse_selection_bypass: bool,
     span: fastrace::Span,
 }
 
@@ -94,6 +96,7 @@ impl Default for LiquidCacheLocalBuilder {
             prefetch: true,
             admission: None,
             sparse_selection_ratio: None,
+            sparse_selection_bypass: false,
             span: fastrace::Span::enter_with_local_parent("liquid_cache_datafusion_local_builder"),
         }
     }
@@ -190,6 +193,13 @@ impl LiquidCacheLocalBuilder {
         self
     }
 
+    /// Bypass sparse scans instead of caching them predicate-only. See
+    /// `LocalModeOptimizer::with_sparse_selection_bypass`.
+    pub fn with_sparse_selection_bypass(mut self, enabled: bool) -> Self {
+        self.sparse_selection_bypass = enabled;
+        self
+    }
+
     /// Build a SessionContext with liquid cache configured
     /// Returns the SessionContext and the liquid cache reference
     pub async fn build(
@@ -242,6 +252,7 @@ impl LiquidCacheLocalBuilder {
         if let Some(ratio) = self.sparse_selection_ratio {
             optimizer = optimizer.with_sparse_selection_ratio(ratio);
         }
+        optimizer = optimizer.with_sparse_selection_bypass(self.sparse_selection_bypass);
 
         let state = datafusion::execution::SessionStateBuilder::new()
             .with_config(config)
