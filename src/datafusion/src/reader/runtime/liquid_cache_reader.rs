@@ -8,7 +8,8 @@ use arrow::buffer::BooleanBuffer;
 use arrow::compute::prep_null_mask_filter;
 use arrow::record_batch::RecordBatchOptions;
 use arrow_schema::{ArrowError, SchemaRef};
-use futures::{Stream, StreamExt, future::BoxFuture, stream::BoxStream};
+use datafusion::physical_plan::metrics::Count;
+use futures::{Stream, StreamExt, TryStreamExt, future::BoxFuture, stream::BoxStream};
 use parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, RowSelection, RowSelector,
 };
@@ -75,6 +76,11 @@ pub(crate) struct ParquetFallbackConfig {
     pub(crate) cache_column_ids: Vec<usize>,
     pub(crate) cache_batch_size: usize,
     pub(crate) row_count: usize,
+    /// Projected columns read for selected rows only and never cached; see
+    /// [`ParquetFallback::fetch_selected`]. Empty in the normal mode.
+    pub(crate) passthrough_projection: ProjectionMask,
+    pub(crate) passthrough_column_ids: Vec<usize>,
+    pub(crate) passthrough_batches: Option<Count>,
 }
 
 pub(crate) struct ParquetFallback {
@@ -85,6 +91,9 @@ pub(crate) struct ParquetFallback {
     cache_column_ids: Vec<usize>,
     cache_batch_size: usize,
     row_count: usize,
+    passthrough_projection: ProjectionMask,
+    passthrough_column_ids: Vec<usize>,
+    passthrough_batches: Option<Count>,
     stream: Option<BoxStream<'static, Result<RecordBatch, ParquetError>>>,
     next_batch_id: BatchID,
 }
@@ -170,6 +179,9 @@ impl ParquetFallback {
             cache_column_ids: config.cache_column_ids,
             cache_batch_size: config.cache_batch_size,
             row_count: config.row_count,
+            passthrough_projection: config.passthrough_projection,
+            passthrough_column_ids: config.passthrough_column_ids,
+            passthrough_batches: config.passthrough_batches,
             stream: None,
             next_batch_id: BatchID::from_raw(0),
         }
@@ -194,6 +206,59 @@ impl ParquetFallback {
         self.next_batch_id = batch_id;
         self.next_batch_id.inc();
         Ok(record_batch)
+    }
+
+    fn passthrough_position(&self, file_column_id: usize) -> Option<usize> {
+        self.passthrough_column_ids
+            .iter()
+            .position(|id| *id == file_column_id)
+    }
+
+    /// Read the passthrough columns for only the rows `selection` keeps in
+    /// `batch_id`, without touching the cache. The row selection lets the
+    /// parquet reader fetch just the pages holding those rows (the metadata
+    /// carries the page index), which is what keeps a wide, selective scan
+    /// cheap: the predicate ran against cached columns, and the wide columns are
+    /// read only where it matched.
+    pub(crate) async fn fetch_selected(
+        &mut self,
+        batch_id: BatchID,
+        selection: &BooleanBuffer,
+    ) -> Result<RecordBatch, ParquetError> {
+        let start = usize::from(*batch_id) * self.cache_batch_size;
+        let end = start + selection.len();
+        let mut selectors = Vec::new();
+        if start > 0 {
+            selectors.push(RowSelector::skip(start));
+        }
+        let batch_selection =
+            RowSelection::from_filters(&[BooleanArray::new(selection.clone(), None)]);
+        selectors.extend(Vec::<RowSelector>::from(batch_selection));
+        if end < self.row_count {
+            selectors.push(RowSelector::skip(self.row_count - end));
+        }
+
+        let reader_metadata =
+            ArrowReaderMetadata::try_new(Arc::clone(&self.metadata), ArrowReaderOptions::new())?;
+        let builder = ParquetRecordBatchStreamBuilder::new_with_metadata(
+            self.reader_factory.create()?,
+            reader_metadata,
+        )
+        .with_projection(self.passthrough_projection.clone())
+        .with_row_groups(vec![self.row_group_idx])
+        .with_batch_size(self.cache_batch_size)
+        .with_row_selection(RowSelection::from(selectors));
+        let batches: Vec<RecordBatch> = builder.build()?.try_collect().await?;
+        if let Some(count) = &self.passthrough_batches {
+            count.add(1);
+        }
+        // `builder.schema()` is the whole file's; take the projected one from
+        // the output. Callers only ask for a non-empty selection.
+        let schema = batches
+            .first()
+            .map(|batch| batch.schema())
+            .ok_or_else(|| ParquetError::General("passthrough read returned no rows".into()))?;
+        Ok(arrow::compute::concat_batches(&schema, &batches)?)
     }
 
     fn rebuild_stream(&mut self, batch_id: BatchID) -> Result<(), ParquetError> {
@@ -310,10 +375,11 @@ impl LiquidCacheReaderInner {
             .cached_row_group
             .snapshot_selection(self.current_batch_id)
         {
-            return Ok(boolean_buffer_and_then(
-                &input_selection,
-                &snapshot_selection,
-            ));
+            // Prefetch stores the filtered selection batch-absolute (already
+            // ANDed with this same input), not relative to the input's set
+            // bits, so combine positionally. `boolean_buffer_and_then` only
+            // agreed when the input selected every row of the batch.
+            return Ok(&input_selection & &snapshot_selection);
         }
 
         let Some(filter) = row_filter.as_mut() else {
@@ -364,6 +430,8 @@ impl LiquidCacheReaderInner {
         }
 
         let mut arrays = Vec::with_capacity(self.projection_columns.len());
+        // Passthrough columns for this batch, read on the first cache miss.
+        let mut passthrough: Option<RecordBatch> = None;
         for column_idx in self.projection_columns.clone() {
             let column = self
                 .cached_row_group
@@ -378,9 +446,28 @@ impl LiquidCacheReaderInner {
                 .get_arrow_array_with_filter(self.current_batch_id, selection)
                 .await;
 
-            let array = match array {
-                Some(array) => array,
-                None => {
+            let passthrough_position = self.parquet_fallback.passthrough_position(column_idx);
+            let array = match (array, passthrough_position) {
+                (Some(array), _) => array,
+                (None, Some(position)) => {
+                    if passthrough.is_none() {
+                        passthrough = Some(
+                            self.parquet_fallback
+                                .fetch_selected(self.current_batch_id, selection)
+                                .await
+                                .map_err(|e| {
+                                    ArrowError::ComputeError(format!(
+                                        "parquet passthrough read failed: {e}"
+                                    ))
+                                })?,
+                        );
+                    }
+                    let batch = passthrough
+                        .as_ref()
+                        .expect("passthrough batch was just read");
+                    Arc::clone(batch.column(position))
+                }
+                (None, None) => {
                     let record_batch = self
                         .read_parquet_batch_and_fill_cache(self.current_batch_id)
                         .await?;
@@ -633,6 +720,9 @@ mod tests {
                 cache_column_ids: vec![0],
                 cache_batch_size: batch_size,
                 row_count: flatten_batches(batches).len(),
+                passthrough_projection: ProjectionMask::none(1),
+                passthrough_column_ids: vec![],
+                passthrough_batches: None,
             },
             _tmp_dir: tmp_dir,
         }
