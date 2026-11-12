@@ -497,14 +497,28 @@ impl LiquidCache {
         self.cache_policy.notify_remove(&entry_id);
     }
 
+    /// Remove `entry_id` if the index still holds it on disk.
+    ///
+    /// Callers pick the victim from advice read earlier: the policy's disk
+    /// queue, or a slot loaded before the eviction policy ran. A read can have
+    /// hydrated the key back into memory since, under the same identity. That
+    /// record holds memory, not disk, and its writer files it with the policy,
+    /// so it is left alone. Its disk reservation is not released here either:
+    /// the hydrating insert replaced the disk record, and with it the only
+    /// byte count this call could release.
     async fn remove_disk_entry(&self, entry_id: EntryID) {
-        let Some(removed) = self.index.remove(&entry_id) else {
+        let Some(removed) = self.index.remove_if(&entry_id, |slot| {
+            matches!(
+                slot.entry,
+                CacheEntry::DiskLiquid { .. } | CacheEntry::DiskArrow { .. }
+            )
+        }) else {
             return;
         };
         let disk_bytes = match &removed.entry {
             CacheEntry::DiskLiquid { disk_bytes, .. }
             | CacheEntry::DiskArrow { disk_bytes, .. } => *disk_bytes,
-            _ => panic!("remove_disk_entry called for non-disk entry"),
+            _ => unreachable!("remove_if removed a memory entry"),
         };
         self.store
             .remove(&entry_id_to_key(&entry_id))
@@ -1397,5 +1411,119 @@ mod tests {
 
         assert_eq!(result, Ok(()));
         assert!(!cache.contains(&entry_id, 0));
+    }
+
+    type DiskVictimHook = Box<dyn FnOnce(&[EntryID]) + Send>;
+
+    /// A [`LiquidPolicy`] that runs a hook once, after it hands out disk
+    /// victims and before the cache acts on them.
+    struct HookAfterDiskVictims {
+        inner: LiquidPolicy,
+        hook: Arc<std::sync::Mutex<Option<DiskVictimHook>>>,
+    }
+
+    impl std::fmt::Debug for HookAfterDiskVictims {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("HookAfterDiskVictims").finish()
+        }
+    }
+
+    impl CachePolicy for HookAfterDiskVictims {
+        fn find_memory_victim(&self, cnt: usize) -> Vec<EntryID> {
+            self.inner.find_memory_victim(cnt)
+        }
+
+        fn find_disk_victim(&self, cnt: usize) -> Vec<EntryID> {
+            let victims = self.inner.find_disk_victim(cnt);
+            let hook = self.hook.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook(&victims);
+            }
+            victims
+        }
+
+        fn notify_insert(&self, entry_id: &EntryID, batch_type: CachedBatchType) {
+            self.inner.notify_insert(entry_id, batch_type);
+        }
+
+        fn notify_access(&self, entry_id: &EntryID, batch_type: CachedBatchType) {
+            self.inner.notify_access(entry_id, batch_type);
+        }
+
+        fn notify_remove(&self, entry_id: &EntryID) {
+            self.inner.notify_remove(entry_id);
+        }
+    }
+
+    /// The memory budget equals what the index's memory entries hold.
+    fn assert_memory_budget_matches_index(cache: &LiquidCache) {
+        let mut held = 0;
+        cache
+            .index()
+            .for_each(|_, slot| held += slot.entry.memory_usage_bytes());
+        assert_eq!(cache.budget.memory_usage_bytes(), held);
+    }
+
+    /// A disk victim is picked from the policy's disk queue, and a read can
+    /// hydrate that entry back into memory before the eviction removes it.
+    /// The eviction must then leave the memory entry alone: it is no longer a
+    /// disk entry, and its record is the hydrating read's.
+    #[test]
+    fn disk_victim_hydrated_before_its_removal_is_left_in_memory() {
+        let hydrated = EntryID::from(920usize);
+        let flushed = EntryID::from(921usize);
+        let hydrated_array: ArrayRef = Arc::new(Int32Array::from_iter_values(0..16));
+        let flushed_array: ArrayRef = Arc::new(Int32Array::from_iter_values(16..32));
+        let disk_bytes = arrow_to_bytes(&hydrated_array).unwrap().len() + IDENTITY_TRAILER_LEN;
+        let hook = Arc::new(std::sync::Mutex::new(None::<DiskVictimHook>));
+        let cache = block_on(
+            LiquidCacheBuilder::new()
+                .with_max_memory_bytes(1 << 20)
+                .with_max_disk_bytes(disk_bytes)
+                .with_eviction_policy(Box::new(TranscodeEvict))
+                .with_cache_policy(Box::new(HookAfterDiskVictims {
+                    inner: LiquidPolicy::new(),
+                    hook: hook.clone(),
+                }))
+                .build(),
+        );
+
+        block_on(async {
+            cache
+                .insert(hydrated, 0, hydrated_array.clone())
+                .await
+                .unwrap();
+            cache.flush_all_to_disk().await.unwrap();
+            cache.insert(flushed, 0, flushed_array).await.unwrap();
+        });
+        assert!(matches!(
+            &cache.index().get(&hydrated).unwrap().entry,
+            CacheEntry::DiskArrow { .. }
+        ));
+
+        // Between the advice and the removal, a read hydrates the victim.
+        let reader = cache.clone();
+        let expected = hydrated_array.clone();
+        *hook.lock().unwrap() = Some(Box::new(move |victims: &[EntryID]| {
+            assert_eq!(victims, &[hydrated]);
+            std::thread::spawn(move || {
+                let read = block_on(async { reader.get(&hydrated, 0).await });
+                assert_eq!(read.expect("present").as_ref(), expected.as_ref());
+            })
+            .join()
+            .unwrap();
+        }));
+
+        // Flushing the second entry needs the first one's disk space.
+        assert_eq!(block_on(cache.flush_all_to_disk()), Ok(()));
+
+        assert!(hook.lock().unwrap().is_none(), "the hook never ran");
+        assert!(matches!(
+            &cache.index().get(&hydrated).unwrap().entry,
+            CacheEntry::MemoryArrow(_)
+        ));
+        let read = block_on(async { cache.get(&hydrated, 0).await });
+        assert_eq!(read.expect("present").as_ref(), hydrated_array.as_ref());
+        assert_memory_budget_matches_index(&cache);
     }
 }

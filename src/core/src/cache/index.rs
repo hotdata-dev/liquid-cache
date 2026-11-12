@@ -148,6 +148,35 @@ impl ArtIndex {
         removed.take()
     }
 
+    /// Remove the slot under `entry_id` only if `pred` holds for it.
+    ///
+    /// The check and the removal are one step: a slot installed after `pred`
+    /// looked is not removed unseen, since the tree rejects the removal and
+    /// `pred` is asked again about the slot now there.
+    pub(crate) fn remove_if(
+        &self,
+        entry_id: &EntryID,
+        pred: impl Fn(&Slot) -> bool,
+    ) -> Option<Arc<Slot>> {
+        let guard = self.art.pin();
+        let mut matched = false;
+        let removed = self.art.compute_if_present(
+            *entry_id,
+            |cell| {
+                // The tree calls this again when its node changed under it, so
+                // the last call decides.
+                matched = cell.load().is_some_and(|slot| pred(&slot));
+                if matched { None } else { Some(cell) }
+            },
+            &guard,
+        )?;
+        if !matched {
+            return None;
+        }
+        self.entry_count.fetch_sub(1, Ordering::Relaxed);
+        removed.take()
+    }
+
     pub(crate) fn reset(&self) {
         for k in self.art.keys() {
             self.remove(&k);
@@ -274,5 +303,28 @@ mod tests {
         assert!(!store.contains(&entry_id, 7));
         assert!(store.contains(&entry_id, 8));
         assert_eq!(store.entry_count(), 1);
+    }
+
+    #[test]
+    fn remove_if_removes_only_a_matching_slot() {
+        let store = ArtIndex::new();
+        let entry_id = EntryID::from(1);
+        store.insert(&entry_id, 7, create_test_array(10));
+
+        assert!(
+            store
+                .remove_if(&entry_id, |slot| slot.identity == 8)
+                .is_none()
+        );
+        assert!(store.contains(&entry_id, 7));
+        assert_eq!(store.entry_count(), 1);
+
+        let removed = store
+            .remove_if(&entry_id, |slot| slot.identity == 7)
+            .expect("matching slot is removed");
+        assert_eq!(removed.identity, 7);
+        assert!(store.get(&entry_id).is_none());
+        assert_eq!(store.entry_count(), 0);
+        assert!(store.remove_if(&entry_id, |_| true).is_none());
     }
 }
