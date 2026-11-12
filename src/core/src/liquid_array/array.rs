@@ -59,6 +59,12 @@ pub struct LiquidArray {
 impl LiquidArray {
     /// Transcode a supported Arrow array into Vortex.
     pub fn from_arrow_array(array: &ArrayRef) -> Result<Self, &ArrayRef> {
+        Self::compress(array).map(Self::compacted)
+    }
+
+    /// The compressor's output, which can still share memory with `array`
+    /// and carry spare capacity; see [`Self::compacted`].
+    fn compress(array: &ArrayRef) -> Result<Self, &ArrayRef> {
         if !is_supported(array.data_type()) {
             return Err(array);
         }
@@ -80,6 +86,21 @@ impl LiquidArray {
             }
         };
         Ok(Self { array, arrow_type })
+    }
+
+    /// Detach the array from its source's buffers and from the compressor's
+    /// spare capacity.
+    ///
+    /// The cache charges an entry by `nbytes()`, the sum of its buffers'
+    /// lengths, but the compressor's output can keep more alive: a constant
+    /// string is a zero-copy slice of its whole source buffer (vortex #10599),
+    /// and an FSST codes buffer keeps its growth slack (vortex #11420). Both
+    /// are freed only with the entry. Round-tripping through the IPC
+    /// serialization the disk tier uses drops those allocations. The charge
+    /// stays approximate: `nbytes()` still leaves out per-node overhead.
+    fn compacted(self) -> Self {
+        let bytes = self.to_bytes().into_boxed_slice();
+        Self::from_bytes(Bytes::from(bytes))
     }
 
     /// Deserialize a Vortex-backed Liquid array.
@@ -815,5 +836,86 @@ mod tests {
         let mut header = header_bytes();
         header[4..6].copy_from_slice(&(VERSION + 1).to_le_bytes());
         LiquidArray::from_bytes(Bytes::copy_from_slice(&header));
+    }
+
+    /// A column of one repeated string compresses to a constant. The entry
+    /// must not keep the source column's buffers alive: the cache charges
+    /// it only for the constant, while the source buffers are 8192 rows wide.
+    #[test]
+    fn constant_strings_do_not_pin_the_source_buffers() {
+        for value in ["user", "a value longer than the inline twelve bytes"] {
+            let source = StringViewArray::from_iter_values(std::iter::repeat_n(value, 8192));
+            let views = source.views().inner().clone();
+            let data = source.data_buffers().to_vec();
+            let array: ArrayRef = Arc::new(source);
+
+            let liquid = LiquidArray::from_arrow_array(&array).unwrap();
+            drop(array);
+
+            assert!(
+                liquid.array.as_constant().is_some(),
+                "{value:?} should compress to a constant"
+            );
+            assert!(
+                views.into_mutable().is_ok(),
+                "{value:?}: the entry still holds the source views"
+            );
+            for buffer in data {
+                assert!(
+                    buffer.into_mutable().is_ok(),
+                    "{value:?}: the entry still holds a source data buffer"
+                );
+            }
+            assert_eq!(
+                liquid.to_arrow_array().as_ref(),
+                &StringViewArray::from_iter_values(std::iter::repeat_n(value, 8192)) as &dyn Array
+            );
+        }
+    }
+
+    /// An FSST codes buffer grows by doubling while it is built and keeps
+    /// that spare capacity, which `nbytes()` does not see. The compacted
+    /// entry must not share that allocation.
+    #[test]
+    fn fsst_codes_growth_allocation_is_released() {
+        let mut x: u64 = 1;
+        let strings: Vec<String> = (0..8192)
+            .map(|_| {
+                (0..8)
+                    .map(|_| {
+                        x ^= x << 13;
+                        x ^= x >> 7;
+                        x ^= x << 17;
+                        format!("{x:016x}")
+                    })
+                    .collect()
+            })
+            .collect();
+        let array: ArrayRef = Arc::new(StringViewArray::from_iter_values(&strings));
+
+        let compressed = LiquidArray::compress(&array).unwrap();
+        let fsst = compressed
+            .array
+            .depth_first_traversal()
+            .find(|node| node.encoding_id().as_ref() == "vortex.fsst")
+            .expect("random hex strings should compress with FSST");
+        let codes = fsst
+            .buffers()
+            .into_iter()
+            .max_by_key(|buffer| buffer.len())
+            .unwrap();
+        drop(fsst);
+
+        let liquid = compressed.compacted();
+        let codes = codes
+            .try_into_mut()
+            .expect("the entry still holds the compressor's codes allocation");
+        assert!(
+            codes.capacity() > codes.len() * 3 / 2,
+            "the fixture should leave growth slack: len {} capacity {}",
+            codes.len(),
+            codes.capacity()
+        );
+        assert_eq!(liquid.to_arrow_array().as_ref(), array.as_ref());
     }
 }
