@@ -65,8 +65,149 @@ pub struct LiquidCache {
     observer: Arc<Observer>,
     metadata: Arc<dyn EntryMetadata>,
     store: t4::Store,
+    disk_key_locks: DiskKeyLocks,
+    stray_objects: StrayObjects,
     evict_victims_concurrently: bool,
 }
+
+/// Orders the store operations on one key.
+///
+/// Objects are keyed by entry id alone, so every write of a key lands on the
+/// object the previous one left. A write puts the object and then installs the
+/// record naming it; a reclaim checks that no record names the object and then
+/// deletes it. Unordered, a reclaim can check after a newer write's put and
+/// before its install, and delete the object that record is about to name.
+/// So a write holds its key's lock from the put through the install, and a
+/// reclaim from the check through the delete.
+///
+/// Keys share a fixed set of locks. Nothing holds one while taking another.
+#[derive(Debug)]
+struct DiskKeyLocks {
+    locks: Box<[futures::lock::Mutex<()>]>,
+}
+
+/// A held [`DiskKeyLocks`] lock.
+type DiskKeyGuard<'a> = futures::lock::MutexGuard<'a, ()>;
+
+impl DiskKeyLocks {
+    const LOCKS: usize = 256;
+
+    fn new() -> Self {
+        Self {
+            locks: (0..Self::LOCKS)
+                .map(|_| futures::lock::Mutex::new(()))
+                .collect(),
+        }
+    }
+
+    async fn lock(&self, entry_id: &EntryID) -> DiskKeyGuard<'_> {
+        self.locks[Self::lock_of(entry_id)].lock().await
+    }
+
+    fn lock_of(entry_id: &EntryID) -> usize {
+        // Callers pack fields into entry ids, so mix the bits rather than let
+        // one field pick the lock.
+        let mixed = (usize::from(*entry_id) as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        (mixed >> 56) as usize % Self::LOCKS
+    }
+}
+
+/// Disk budget held for one stored object, released when dropped.
+///
+/// A disk record in the index owns its object's charge. Taking the record out
+/// hands the charge back as one of these, and an operation that reserves disk
+/// holds one until a record takes it over. Every step in between can be
+/// awaited, and a caller can drop the future there; the charge still comes
+/// back.
+#[must_use = "dropping a disk charge releases it"]
+struct DiskCharge<'a> {
+    budget: &'a BudgetAccounting,
+    bytes: usize,
+}
+
+impl DiskCharge<'_> {
+    /// Leave the charge held, by the record now naming the object.
+    fn pass_to_record(self) {
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for DiskCharge<'_> {
+    fn drop(&mut self) {
+        self.budget.release_disk(self.bytes);
+    }
+}
+
+/// An object put in the store whose record is not installed yet: its key's
+/// lock (see [`DiskKeyLocks`]) and its charge. Installing the record releases
+/// the lock and passes the charge to the record; dropping it releases both,
+/// and leaves the object for [`StrayObjects`].
+struct DiskWrite<'a> {
+    key_lock: DiskKeyGuard<'a>,
+    charge: DiskCharge<'a>,
+    unnamed: UnfinishedObject<'a>,
+}
+
+/// Keys whose object an operation was dropped before deleting, or wrote and
+/// was dropped before naming.
+///
+/// The dropped operation gave its charge back (see [`DiskCharge`]), but
+/// nothing else would ever find the object. Every spill first deletes these,
+/// through [`LiquidCache::delete_unnamed`]: disk only grows by spills, so
+/// what they leave is bounded by what was dropped since the last spill.
+#[derive(Debug, Default)]
+struct StrayObjects {
+    keys: crate::sync::Mutex<std::collections::HashSet<EntryID>>,
+}
+
+impl StrayObjects {
+    fn mark(&self, entry_id: EntryID) {
+        self.keys
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(entry_id);
+    }
+
+    fn pop(&self) -> Option<EntryID> {
+        let mut keys = self
+            .keys
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry_id = *keys.iter().next()?;
+        keys.remove(&entry_id);
+        Some(entry_id)
+    }
+}
+
+/// An object a delete or a write has not settled yet. Dropped before
+/// [`Self::settled`], it marks its key in [`StrayObjects`].
+struct UnfinishedObject<'a> {
+    strays: &'a StrayObjects,
+    entry_id: EntryID,
+}
+
+impl UnfinishedObject<'_> {
+    fn settled(self) {
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for UnfinishedObject<'_> {
+    fn drop(&mut self) {
+        self.strays.mark(self.entry_id);
+    }
+}
+
+/// The charge and the object of a disk record that an insert displaced with
+/// a memory one.
+///
+/// The record's object is still in the store and still charged, and nothing
+/// names it any more. Deleting it means waiting out any write in flight for
+/// the key, which an insert cannot do, so it hands this to its caller for
+/// [`LiquidCache::reclaim`]. Dropped unreclaimed, it releases the charge and
+/// leaves the object to [`StrayObjects`].
+#[must_use = "the displaced object stays on disk until reclaimed"]
+struct Orphan<'a>(Option<(DiskCharge<'a>, UnfinishedObject<'a>)>);
 
 /// Outcome of [`LiquidCache::prefetch`].
 pub enum PrefetchResult {
@@ -292,15 +433,20 @@ impl LiquidCache {
                         .write_batch_to_disk(entry_id, identity, &batch, bytes)
                         .await
                     {
-                        Ok(()) => {
-                            self.try_insert(
-                                entry_id,
-                                identity,
-                                CacheEntry::disk_arrow(array.data_type().clone(), disk_bytes),
-                            )
-                            .expect("failed to insert disk arrow entry");
+                        Ok(write) => {
+                            let Orphan(None) = self
+                                .try_insert(
+                                    entry_id,
+                                    identity,
+                                    CacheEntry::disk_arrow(array.data_type().clone(), disk_bytes),
+                                    Some(write),
+                                )
+                                .expect("failed to insert disk arrow entry")
+                            else {
+                                unreachable!("a disk record leaves no orphan");
+                            };
                         }
-                        Err(CacheFull) => self.drop_memory_entry(entry_id, &batch),
+                        Err(CacheFull) => self.drop_memory_entry(entry_id),
                     }
                 }
                 CacheEntry::MemoryLiquid(liquid_array) => {
@@ -310,18 +456,23 @@ impl LiquidCache {
                         .write_batch_to_disk(entry_id, identity, &batch, Bytes::from(liquid_bytes))
                         .await
                     {
-                        Ok(()) => {
-                            self.try_insert(
-                                entry_id,
-                                identity,
-                                CacheEntry::disk_liquid(
-                                    liquid_array.original_arrow_data_type(),
-                                    disk_bytes,
-                                ),
-                            )
-                            .expect("failed to insert disk liquid entry");
+                        Ok(write) => {
+                            let Orphan(None) = self
+                                .try_insert(
+                                    entry_id,
+                                    identity,
+                                    CacheEntry::disk_liquid(
+                                        liquid_array.original_arrow_data_type(),
+                                        disk_bytes,
+                                    ),
+                                    Some(write),
+                                )
+                                .expect("failed to insert disk liquid entry")
+                            else {
+                                unreachable!("a disk record leaves no orphan");
+                            };
                         }
-                        Err(CacheFull) => self.drop_memory_entry(entry_id, &batch),
+                        Err(CacheFull) => self.drop_memory_entry(entry_id),
                     }
                 }
                 CacheEntry::DiskArrow { .. } | CacheEntry::DiskLiquid { .. } => {
@@ -334,13 +485,14 @@ impl LiquidCache {
 }
 
 impl LiquidCache {
-    /// returns the batch that was written to disk
+    /// Returns the batch that replaces `batch`, and the write that put it on
+    /// disk, if any, for installing it.
     async fn write_in_memory_batch_to_disk(
         &self,
         entry_id: EntryID,
         identity: u64,
         batch: CacheEntry,
-    ) -> Result<CacheEntry, CacheFull> {
+    ) -> Result<(CacheEntry, Option<DiskWrite<'_>>), CacheFull> {
         match &batch {
             batch @ CacheEntry::MemoryArrow(_) => {
                 let outcome = self
@@ -353,20 +505,24 @@ impl LiquidCache {
                 else {
                     unreachable!("memory Arrow eviction cannot remove entry");
                 };
-                if let Some(bytes_to_write) = bytes_to_write {
-                    self.write_batch_to_disk(entry_id, identity, &new_batch, bytes_to_write)
-                        .await?;
-                }
-                Ok(new_batch)
+                let write = match bytes_to_write {
+                    Some(bytes_to_write) => Some(
+                        self.write_batch_to_disk(entry_id, identity, &new_batch, bytes_to_write)
+                            .await?,
+                    ),
+                    None => None,
+                };
+                Ok((new_batch, write))
             }
             CacheEntry::MemoryLiquid(liquid_array) => {
                 let liquid_bytes = Bytes::from(liquid_array.to_bytes());
                 let disk_bytes = liquid_bytes.len();
-                self.write_batch_to_disk(entry_id, identity, &batch, liquid_bytes)
+                let write = self
+                    .write_batch_to_disk(entry_id, identity, &batch, liquid_bytes)
                     .await?;
-                Ok(CacheEntry::disk_liquid(
-                    liquid_array.original_arrow_data_type(),
-                    disk_bytes,
+                Ok((
+                    CacheEntry::disk_liquid(liquid_array.original_arrow_data_type(), disk_bytes),
+                    Some(write),
                 ))
             }
             CacheEntry::DiskLiquid { .. } | CacheEntry::DiskArrow { .. } => {
@@ -382,10 +538,17 @@ impl LiquidCache {
         identity: u64,
         mut batch_to_cache: CacheEntry,
     ) -> Result<(), CacheFull> {
+        // A write of this entry to disk, made below, for the next install.
+        let mut write = None;
         loop {
-            let Err(not_inserted) = self.try_insert(entry_id, identity, batch_to_cache) else {
-                return Ok(());
-            };
+            let not_inserted =
+                match self.try_insert(entry_id, identity, batch_to_cache, write.take()) {
+                    Ok(orphan) => {
+                        self.reclaim(orphan).await;
+                        return Ok(());
+                    }
+                    Err(not_inserted) => not_inserted,
+                };
             self.trace(InternalEvent::InsertFailed {
                 entry: entry_id,
                 kind: CachedBatchType::from(&not_inserted),
@@ -396,10 +559,11 @@ impl LiquidCache {
                 // no advice, because the cache is already empty
                 // this can happen if the entry to be inserted is too large, in that case,
                 // we write it to disk
-                let on_disk_batch = self
+                let (on_disk_batch, written) = self
                     .write_in_memory_batch_to_disk(entry_id, identity, not_inserted)
                     .await?;
                 batch_to_cache = on_disk_batch;
+                write = written;
                 continue;
             }
             self.evict_victims(victims).await?;
@@ -438,36 +602,60 @@ impl LiquidCache {
             observer,
             metadata,
             store,
+            disk_key_locks: DiskKeyLocks::new(),
+            stray_objects: StrayObjects::default(),
             evict_victims_concurrently,
         }
     }
 
-    fn try_insert(
-        &self,
+    /// Install `to_insert` under `entry_id`, if the memory budget allows.
+    ///
+    /// `write` is the write that put `to_insert`'s object, if this insert's
+    /// caller made one; the record takes over its charge, and the lock goes
+    /// once the record is installed. If the insert fails, dropping the write
+    /// gives both back.
+    ///
+    /// A disk record this replaces gives up its charge. If `write` put a new
+    /// object over the record's, the charge is released. Otherwise the
+    /// record's object is left unnamed, and the charge is returned as an
+    /// [`Orphan`] for the caller to reclaim.
+    fn try_insert<'a>(
+        &'a self,
         entry_id: EntryID,
         identity: u64,
         to_insert: CacheEntry,
-    ) -> Result<(), CacheEntry> {
+        write: Option<DiskWrite<'a>>,
+    ) -> Result<Orphan<'a>, CacheEntry> {
         let new_memory_size = to_insert.memory_usage_bytes();
-        let cached_batch_type = if let Some(slot) = self.index.get(&entry_id) {
-            let old_memory_size = slot.entry.memory_usage_bytes();
-            if self
+        let reserved = match self.index.get(&entry_id) {
+            Some(slot) => self
                 .budget
-                .try_update_memory_usage(old_memory_size, new_memory_size)
-                .is_err()
-            {
-                return Err(to_insert);
+                .try_update_memory_usage(slot.entry.memory_usage_bytes(), new_memory_size),
+            None => self.budget.try_reserve_memory(new_memory_size),
+        };
+        if reserved.is_err() {
+            return Err(to_insert);
+        }
+        let cached_batch_type = CachedBatchType::from(&to_insert);
+        let displaced = self
+            .index
+            .insert(&entry_id, identity, to_insert)
+            .and_then(|displaced| self.charge_of(&displaced.entry));
+        let orphan = match write {
+            Some(DiskWrite {
+                key_lock,
+                charge,
+                unnamed,
+            }) => {
+                drop(displaced);
+                charge.pass_to_record();
+                unnamed.settled();
+                // Released before the policy hears of the insert, so a policy
+                // that reacts by writing this key does not wait on itself.
+                drop(key_lock);
+                Orphan(None)
             }
-            let batch_type = CachedBatchType::from(&to_insert);
-            self.index.insert(&entry_id, identity, to_insert);
-            batch_type
-        } else {
-            if self.budget.try_reserve_memory(new_memory_size).is_err() {
-                return Err(to_insert);
-            }
-            let batch_type = CachedBatchType::from(&to_insert);
-            self.index.insert(&entry_id, identity, to_insert);
-            batch_type
+            None => Orphan(displaced.map(|charge| (charge, self.unfinished_object(entry_id)))),
         };
 
         self.trace(InternalEvent::InsertSuccess {
@@ -476,21 +664,89 @@ impl LiquidCache {
         });
         self.cache_policy
             .notify_insert(&entry_id, cached_batch_type);
-
-        Ok(())
+        Ok(orphan)
     }
 
-    fn drop_memory_entry(&self, entry_id: EntryID, _expected: &CacheEntry) {
-        let Some(removed) = self.index.remove(&entry_id) else {
+    /// The disk budget a record holds: its object's payload and trailer.
+    fn charged_bytes(entry: &CacheEntry) -> Option<usize> {
+        match entry {
+            CacheEntry::DiskLiquid { disk_bytes, .. }
+            | CacheEntry::DiskArrow { disk_bytes, .. } => Some(disk_bytes + IDENTITY_TRAILER_LEN),
+            CacheEntry::MemoryArrow(_) | CacheEntry::MemoryLiquid(_) => None,
+        }
+    }
+
+    /// The charge of a record just taken out of the index, if it was on disk.
+    fn charge_of(&self, entry: &CacheEntry) -> Option<DiskCharge<'_>> {
+        Self::charged_bytes(entry).map(|bytes| DiskCharge {
+            budget: &self.budget,
+            bytes,
+        })
+    }
+
+    /// Delete the object an [`Orphan`] left, and release its charge.
+    ///
+    /// The orphan's charge is released whether or not its object is deleted:
+    /// a record that names the object by then had it charged by its own write.
+    async fn reclaim(&self, orphan: Orphan<'_>) {
+        let Orphan(Some((charge, unfinished))) = orphan else {
             return;
         };
-        assert!(
-            matches!(
-                &removed.entry,
-                CacheEntry::MemoryArrow(_) | CacheEntry::MemoryLiquid(_)
-            ),
-            "flush should only drop memory entries"
-        );
+        self.delete_unnamed(unfinished).await;
+        drop(charge);
+    }
+
+    /// Delete the object `unfinished` stands for, unless a disk record names
+    /// it.
+    ///
+    /// A record installed since the caller decided to delete names the object
+    /// now at the key: its write put it there over the one the caller meant.
+    /// Dropped before the delete is done, this leaves the key in
+    /// [`StrayObjects`], so a later call finishes it.
+    async fn delete_unnamed(&self, unfinished: UnfinishedObject<'_>) {
+        let entry_id = unfinished.entry_id;
+        let _key_lock = self.disk_key_locks.lock(&entry_id).await;
+        let named = self
+            .index
+            .get(&entry_id)
+            .is_some_and(|slot| Self::charged_bytes(&slot.entry).is_some());
+        if !named {
+            self.store
+                .remove(&entry_id_to_key(&entry_id))
+                .await
+                .expect("disk remove failed");
+        }
+        unfinished.settled();
+    }
+
+    /// Delete the objects of [`StrayObjects`] that no record names. Called
+    /// holding no key lock, as it takes theirs.
+    async fn delete_strays(&self) {
+        while let Some(entry_id) = self.stray_objects.pop() {
+            self.delete_unnamed(self.unfinished_object(entry_id)).await;
+        }
+    }
+
+    /// The object at `entry_id`, left to [`StrayObjects`] unless settled.
+    fn unfinished_object(&self, entry_id: EntryID) -> UnfinishedObject<'_> {
+        UnfinishedObject {
+            strays: &self.stray_objects,
+            entry_id,
+        }
+    }
+
+    /// Remove `entry_id` if the index still holds it in memory.
+    ///
+    /// The flush that calls this read the entry earlier. Another write can
+    /// have spilled it since; that record and its object are the other
+    /// write's, so they are left alone.
+    fn drop_memory_entry(&self, entry_id: EntryID) {
+        let Some(removed) = self
+            .index
+            .remove_if(&entry_id, |slot| Self::charged_bytes(&slot.entry).is_none())
+        else {
+            return;
+        };
         self.budget
             .try_update_memory_usage(removed.entry.memory_usage_bytes(), 0)
             .expect("memory release cannot fail");
@@ -503,16 +759,17 @@ impl LiquidCache {
     /// queue, or a slot loaded before the eviction policy ran. A read can have
     /// hydrated the key back into memory since, under the same identity. That
     /// record holds memory, not disk, and its writer files it with the policy,
-    /// so it is left alone. Its disk reservation is not released here either:
-    /// the hydrating insert replaced the disk record, and with it the only
-    /// byte count this call could release.
+    /// so it is left alone. The hydrating insert displaced the disk record,
+    /// so its reclaim gives that record's disk back, not this call.
+    ///
+    /// The removal and the delete hold the key's lock, so a write of the key
+    /// that follows puts its object after the delete, not before it.
     async fn remove_disk_entry(&self, entry_id: EntryID) {
-        let Some(removed) = self.index.remove_if(&entry_id, |slot| {
-            matches!(
-                slot.entry,
-                CacheEntry::DiskLiquid { .. } | CacheEntry::DiskArrow { .. }
-            )
-        }) else {
+        let key_lock = self.disk_key_locks.lock(&entry_id).await;
+        let Some(removed) = self
+            .index
+            .remove_if(&entry_id, |slot| Self::charged_bytes(&slot.entry).is_some())
+        else {
             return;
         };
         let disk_bytes = match &removed.entry {
@@ -520,12 +777,21 @@ impl LiquidCache {
             | CacheEntry::DiskArrow { disk_bytes, .. } => *disk_bytes,
             _ => unreachable!("remove_if removed a memory entry"),
         };
+        let charge = self.charge_of(&removed.entry);
+        let unfinished = self.unfinished_object(entry_id);
+        // Told while the key is still held: a spill of the key that follows
+        // installs its record and tells the policy only after this. So a
+        // custom policy must not wait on a cache operation from
+        // `notify_remove`; one that spills a key sharing this lock would wait
+        // on itself.
+        self.cache_policy.notify_remove(&entry_id);
         self.store
             .remove(&entry_id_to_key(&entry_id))
             .await
             .expect("disk remove failed");
-        self.budget.release_disk(disk_bytes + IDENTITY_TRAILER_LEN);
-        self.cache_policy.notify_remove(&entry_id);
+        unfinished.settled();
+        drop(key_lock);
+        drop(charge);
         self.trace(InternalEvent::DiskEvict {
             entry: entry_id,
             bytes: disk_bytes,
@@ -587,12 +853,21 @@ impl LiquidCache {
                     entry: new_batch,
                     bytes_to_write,
                 } => {
-                    if let Some(bytes_to_write) = bytes_to_write {
-                        self.write_batch_to_disk(victim, identity, &new_batch, bytes_to_write)
-                            .await?;
-                    }
-                    match self.try_insert(victim, identity, new_batch) {
-                        Ok(()) => {
+                    let write = match bytes_to_write {
+                        Some(bytes_to_write) => Some(
+                            self.write_batch_to_disk(victim, identity, &new_batch, bytes_to_write)
+                                .await?,
+                        ),
+                        // The policy left the record on disk as it was. The
+                        // key may hold something newer by now, and the object
+                        // that record named may be gone, so nothing is
+                        // installed.
+                        None if Self::charged_bytes(&new_batch).is_some() => break,
+                        None => None,
+                    };
+                    match self.try_insert(victim, identity, new_batch, write) {
+                        Ok(orphan) => {
+                            self.reclaim(orphan).await;
                             break;
                         }
                         Err(batch) => {
@@ -767,13 +1042,17 @@ impl LiquidCache {
     /// points. The trailer is what lets a read notice that and miss. It sits
     /// after the payload so the payload keeps the alignment it is read with.
     /// The disk budget is charged for the trailer as well as the payload.
+    ///
+    /// Returns the write for [`Self::try_insert`] to install the record
+    /// naming the object with.
     async fn write_batch_to_disk(
         &self,
         entry_id: EntryID,
         identity: u64,
         batch: &CacheEntry,
         bytes: Bytes,
-    ) -> Result<(), CacheFull> {
+    ) -> Result<DiskWrite<'_>, CacheFull> {
+        self.delete_strays().await;
         let len = bytes.len();
         loop {
             if self
@@ -791,6 +1070,10 @@ impl LiquidCache {
                 self.remove_disk_entry(victim).await;
             }
         }
+        let charge = DiskCharge {
+            budget: &self.budget,
+            bytes: len + IDENTITY_TRAILER_LEN,
+        };
         self.trace(InternalEvent::IoWrite {
             entry: entry_id,
             kind: CachedBatchType::from(batch),
@@ -799,11 +1082,18 @@ impl LiquidCache {
         let mut object = Vec::with_capacity(len + IDENTITY_TRAILER_LEN);
         object.extend_from_slice(&bytes);
         object.extend_from_slice(&identity.to_le_bytes());
+        // Taken only now: removing the victims above takes their keys' locks.
+        let key_lock = self.disk_key_locks.lock(&entry_id).await;
+        let unnamed = self.unfinished_object(entry_id);
         self.store
             .put(entry_id_to_key(&entry_id), object)
             .await
             .expect("write failed");
-        Ok(())
+        Ok(DiskWrite {
+            key_lock,
+            charge,
+            unnamed,
+        })
     }
 
     /// The payload stored under `entry_id`, if it was written for `identity`.
@@ -987,7 +1277,7 @@ impl LiquidCache {
 mod tests {
     use super::*;
     use crate::cache::{
-        CacheEntry, CachePolicy, LiquidCacheBuilder, LiquidPolicy, TranscodeEvict,
+        AlwaysHydrate, CacheEntry, CachePolicy, LiquidCacheBuilder, LiquidPolicy, TranscodeEvict,
         utils::{arrow_to_bytes, create_cache_store, create_test_array, create_test_arrow_array},
     };
     use crate::sync::thread;
@@ -1525,5 +1815,730 @@ mod tests {
         let read = block_on(async { cache.get(&hydrated, 0).await });
         assert_eq!(read.expect("present").as_ref(), hydrated_array.as_ref());
         assert_memory_budget_matches_index(&cache);
+    }
+
+    /// What one round of [`hydrate_and_spill_cycles_hold_one_disk_copy`] left:
+    /// disk charged after the spill, whether the read served the entry, then
+    /// disk charged and objects stored after that read hydrated it.
+    #[derive(Debug, PartialEq)]
+    struct SpillRound {
+        charged_after_spill: usize,
+        served: bool,
+        charged_after_read: usize,
+        objects_after_read: usize,
+    }
+
+    /// A read hydrates a disk entry back into memory, and the next flush
+    /// spills it again. However many rounds that runs, the disk tier holds at
+    /// most the one copy the latest spill wrote: a hydrated entry gives its
+    /// disk copy back, or each round charges another copy until the cap is
+    /// full and spills start failing.
+    #[tokio::test]
+    async fn hydrate_and_spill_cycles_hold_one_disk_copy() {
+        let array: ArrayRef = Arc::new(Int32Array::from_iter_values(0..1024));
+        let one_copy = arrow_to_bytes(&array).unwrap().len() + IDENTITY_TRAILER_LEN;
+        let (cache, store, _directory) = cache_over_counted_store(1 << 20, 4 * one_copy).await;
+        let entry = EntryID::from(930usize);
+        cache.insert(entry, 0, array.clone()).await.unwrap();
+
+        let rounds = 12;
+        let mut observed = Vec::with_capacity(rounds);
+        for _ in 0..rounds {
+            cache.flush_all_to_disk().await.unwrap();
+            let charged_after_spill = cache.stats().disk_usage_bytes;
+            let read = cache.get(&entry, 0).await;
+            if let Some(read) = &read {
+                assert_eq!(read.as_ref(), array.as_ref());
+            }
+            observed.push(SpillRound {
+                charged_after_spill,
+                served: read.is_some(),
+                charged_after_read: cache.stats().disk_usage_bytes,
+                objects_after_read: store.len().await.unwrap(),
+            });
+        }
+
+        let expected: Vec<_> = (0..rounds)
+            .map(|_| SpillRound {
+                charged_after_spill: one_copy,
+                served: true,
+                charged_after_read: 0,
+                objects_after_read: 0,
+            })
+            .collect();
+        assert_eq!(observed, expected);
+    }
+
+    /// A cache that hydrates on every disk read, over a store the test can
+    /// count objects in. The directory must outlive the cache.
+    async fn cache_over_counted_store(
+        max_memory_bytes: usize,
+        max_disk_bytes: usize,
+    ) -> (Arc<LiquidCache>, t4::Store, tempfile::TempDir) {
+        let directory = tempfile::tempdir().unwrap();
+        let store = t4::mount(directory.path().join("cache.t4")).await.unwrap();
+        let cache = LiquidCacheBuilder::new()
+            .with_max_memory_bytes(max_memory_bytes)
+            .with_max_disk_bytes(max_disk_bytes)
+            .with_eviction_policy(Box::new(TranscodeEvict))
+            .with_cache_policy(Box::new(LiquidPolicy::new()))
+            .with_hydration_policy(Box::new(AlwaysHydrate::new()))
+            .with_store(store.clone())
+            .build()
+            .await;
+        (cache, store, directory)
+    }
+
+    /// The disk budget charges exactly the disk records in the index, and the
+    /// store holds exactly the objects they name, each still readable.
+    async fn assert_disk_matches_index(cache: &LiquidCache, store: &t4::Store) {
+        let mut charged = 0;
+        let mut named = Vec::new();
+        cache.index().for_each(|entry_id, slot| {
+            if let Some(bytes) = LiquidCache::charged_bytes(&slot.entry) {
+                charged += bytes;
+                named.push((*entry_id, slot.identity));
+            }
+        });
+        assert_eq!(
+            cache.budget.disk_usage_bytes(),
+            charged,
+            "disk charged for anything but the disk records"
+        );
+        assert_eq!(
+            store.len().await.unwrap(),
+            named.len(),
+            "the store holds objects no disk record names"
+        );
+        for (entry_id, identity) in named {
+            assert!(
+                cache.read_disk_bytes(&entry_id, identity).await.is_some(),
+                "the disk record for {entry_id:?} names an object that is gone"
+            );
+        }
+    }
+
+    /// Poll `future` once, without a runtime to wake it.
+    fn poll_once<F: Future>(future: std::pin::Pin<&mut F>) -> std::task::Poll<F::Output> {
+        future.poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+    }
+
+    /// Yield to the runtime until `condition` holds, failing with `what` if it
+    /// never does.
+    async fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !condition() {
+            assert!(std::time::Instant::now() < deadline, "{what}");
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// An Arrow array's disk record, and the bytes a spill of it writes.
+    fn arrow_spill(array: &ArrayRef) -> (CacheEntry, Bytes) {
+        let bytes = arrow_to_bytes(array).unwrap();
+        (
+            CacheEntry::disk_arrow(array.data_type().clone(), bytes.len()),
+            bytes,
+        )
+    }
+
+    /// Spill `array` under `entry` the way a flush or an eviction does: put
+    /// the object, then install the record naming it.
+    async fn spill(cache: &LiquidCache, entry: EntryID, array: &ArrayRef) {
+        let (record, bytes) = arrow_spill(array);
+        let write = cache
+            .write_batch_to_disk(entry, 0, &record, bytes)
+            .await
+            .unwrap();
+        let Ok(Orphan(None)) = cache.try_insert(entry, 0, record, Some(write)) else {
+            panic!("a written disk record installs, and leaves no orphan");
+        };
+    }
+
+    /// The disk an Arrow array's record is charged.
+    fn arrow_copy(array: &ArrayRef) -> usize {
+        arrow_to_bytes(array).unwrap().len() + IDENTITY_TRAILER_LEN
+    }
+
+    /// A cache holding `array` under `entry` on disk, spilled by a flush.
+    async fn flushed(
+        entry: EntryID,
+        array: &ArrayRef,
+    ) -> (Arc<LiquidCache>, t4::Store, tempfile::TempDir) {
+        let (cache, store, directory) = cache_over_counted_store(1 << 20, 1 << 20).await;
+        cache.insert(entry, 0, array.clone()).await.unwrap();
+        cache.flush_all_to_disk().await.unwrap();
+        assert!(matches!(
+            cache.index().get(&entry).unwrap().entry,
+            CacheEntry::DiskArrow { .. }
+        ));
+        (cache, store, directory)
+    }
+
+    fn is_memory(cache: &LiquidCache, entry: &EntryID) -> bool {
+        cache
+            .index()
+            .get(entry)
+            .is_some_and(|slot| LiquidCache::charged_bytes(&slot.entry).is_none())
+    }
+
+    /// A flush has spilled an entry, and an eviction that read the entry in
+    /// memory before that is spilling it again: its object is put, its record
+    /// not installed yet. A read now hydrates the entry, displacing the
+    /// flush's record, and reclaims that record's object. The index names no
+    /// object at the key at that moment, so a reclaim that went ahead would
+    /// delete the object the eviction's record is about to name. The read
+    /// must wait for that record, and be woken when it is installed.
+    #[tokio::test]
+    async fn a_hydrating_read_waits_for_a_spill_in_flight_on_its_key() {
+        let entry = EntryID::from(940usize);
+        let array: ArrayRef = Arc::new(Int32Array::from_iter_values(0..256));
+        let (cache, store, _directory) = flushed(entry, &array).await;
+
+        let (respilled, bytes) = arrow_spill(&array);
+        let eviction = cache
+            .write_batch_to_disk(entry, 0, &respilled, bytes)
+            .await
+            .unwrap();
+
+        let reader = tokio::spawn({
+            let cache = cache.clone();
+            let expected = array.clone();
+            async move {
+                let read = cache.get(&entry, 0).await.expect("present");
+                assert_eq!(read.as_ref(), expected.as_ref());
+            }
+        });
+        wait_until("the read never hydrated the entry", || {
+            is_memory(&cache, &entry)
+        })
+        .await;
+        assert!(
+            !reader.is_finished(),
+            "the read reclaimed while a spill of its key was in flight"
+        );
+
+        let Ok(Orphan(None)) = cache.try_insert(entry, 0, respilled, Some(eviction)) else {
+            panic!("a written disk record installs, and leaves no orphan");
+        };
+        wait_until("the read was never woken", || reader.is_finished()).await;
+        reader.await.unwrap();
+
+        assert!(matches!(
+            cache.index().get(&entry).unwrap().entry,
+            CacheEntry::DiskArrow { .. }
+        ));
+        assert_disk_matches_index(&cache, &store).await;
+    }
+
+    /// The read above, dropped while it waits to reclaim: a query cancelled
+    /// mid-read. The displaced record's charge still comes back.
+    #[tokio::test]
+    async fn a_read_dropped_while_reclaiming_still_releases_the_charge() {
+        let entry = EntryID::from(945usize);
+        let array: ArrayRef = Arc::new(Int32Array::from_iter_values(0..256));
+        let (cache, store, _directory) = flushed(entry, &array).await;
+
+        let (respilled, bytes) = arrow_spill(&array);
+        let eviction = cache
+            .write_batch_to_disk(entry, 0, &respilled, bytes)
+            .await
+            .unwrap();
+        let reader = tokio::spawn({
+            let cache = cache.clone();
+            async move { cache.get(&entry, 0).await }
+        });
+        wait_until("the read never hydrated the entry", || {
+            is_memory(&cache, &entry)
+        })
+        .await;
+        reader.abort();
+        assert!(reader.await.unwrap_err().is_cancelled());
+
+        let Ok(Orphan(None)) = cache.try_insert(entry, 0, respilled, Some(eviction)) else {
+            panic!("a written disk record installs, and leaves no orphan");
+        };
+        assert_disk_matches_index(&cache, &store).await;
+        assert_eq!(cache.budget.disk_usage_bytes(), arrow_copy(&array));
+
+        // The dropped read left the key to be cleaned up, but the spill's
+        // record names the object there now, so the next spill keeps it.
+        let other = EntryID::from(9450usize);
+        cache.insert(other, 0, array.clone()).await.unwrap();
+        spill(&cache, other, &array).await;
+        assert_disk_matches_index(&cache, &store).await;
+        assert_eq!(cache.budget.disk_usage_bytes(), 2 * arrow_copy(&array));
+    }
+
+    /// The read above, but blocked by a spill of another key that shares the
+    /// entry's lock, so nothing names the entry's old object when the read is
+    /// dropped. The read's charge comes back once, at the drop; the next spill
+    /// deletes the object.
+    #[tokio::test]
+    async fn a_read_dropped_while_reclaiming_leaves_its_object_to_the_next_spill() {
+        let entry = EntryID::from(949usize);
+        let blocker = (950usize..)
+            .map(EntryID::from)
+            .find(|id| DiskKeyLocks::lock_of(id) == DiskKeyLocks::lock_of(&entry))
+            .unwrap();
+        let next = EntryID::from(usize::from(blocker) + 1);
+        let array: ArrayRef = Arc::new(Int32Array::from_iter_values(0..256));
+        let (cache, store, _directory) = flushed(entry, &array).await;
+        cache.insert(blocker, 0, array.clone()).await.unwrap();
+        let (record, bytes) = arrow_spill(&array);
+        let blocking = cache
+            .write_batch_to_disk(blocker, 0, &record, bytes)
+            .await
+            .unwrap();
+
+        let reader = tokio::spawn({
+            let cache = cache.clone();
+            async move { cache.get(&entry, 0).await }
+        });
+        wait_until("the read never hydrated the entry", || {
+            is_memory(&cache, &entry)
+        })
+        .await;
+        reader.abort();
+        assert!(reader.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            cache.budget.disk_usage_bytes(),
+            arrow_copy(&array),
+            "only the blocking spill's reservation is still charged"
+        );
+
+        let Ok(Orphan(None)) = cache.try_insert(blocker, 0, record, Some(blocking)) else {
+            panic!("a written disk record installs, and leaves no orphan");
+        };
+        assert_eq!(store.len().await.unwrap(), 2, "the entry's object is left");
+
+        cache.insert(next, 0, array.clone()).await.unwrap();
+        spill(&cache, next, &array).await;
+        assert_disk_matches_index(&cache, &store).await;
+        assert_eq!(cache.budget.disk_usage_bytes(), 2 * arrow_copy(&array));
+    }
+
+    /// A spill whose record is never installed, because inserting it failed
+    /// or the spill was dropped after its put, leaves its object to the next
+    /// spill.
+    #[tokio::test]
+    async fn a_spill_dropped_after_its_put_leaves_its_object_to_the_next_spill() {
+        let (cache, store, _directory) = cache_over_counted_store(1 << 20, 1 << 20).await;
+        let entry = EntryID::from(951usize);
+        let next = EntryID::from(952usize);
+        let array: ArrayRef = Arc::new(Int32Array::from_iter_values(0..256));
+        cache.insert(entry, 0, array.clone()).await.unwrap();
+
+        let (record, bytes) = arrow_spill(&array);
+        let write = cache
+            .write_batch_to_disk(entry, 0, &record, bytes)
+            .await
+            .unwrap();
+        drop(write);
+        assert_eq!(cache.budget.disk_usage_bytes(), 0);
+        assert_eq!(store.len().await.unwrap(), 1, "the put landed");
+
+        cache.insert(next, 0, array.clone()).await.unwrap();
+        spill(&cache, next, &array).await;
+        assert_disk_matches_index(&cache, &store).await;
+        assert_eq!(cache.budget.disk_usage_bytes(), arrow_copy(&array));
+    }
+
+    /// A spill reserves its disk and then waits for its key, behind another
+    /// spill of the same entry. Dropped there, it gives the reservation back.
+    #[tokio::test]
+    async fn a_spill_dropped_before_its_record_releases_its_reservation() {
+        let (cache, store, _directory) = cache_over_counted_store(1 << 20, 1 << 20).await;
+        let entry = EntryID::from(946usize);
+        let array: ArrayRef = Arc::new(Int32Array::from_iter_values(0..256));
+        cache.insert(entry, 0, array.clone()).await.unwrap();
+
+        let (record, bytes) = arrow_spill(&array);
+        let first = cache
+            .write_batch_to_disk(entry, 0, &record, bytes.clone())
+            .await
+            .unwrap();
+        let mut second = Box::pin(cache.write_batch_to_disk(entry, 0, &record, bytes));
+        assert!(poll_once(second.as_mut()).is_pending());
+        assert_eq!(
+            cache.budget.disk_usage_bytes(),
+            2 * arrow_copy(&array),
+            "the second spill reserved before waiting for the key"
+        );
+        drop(second);
+
+        let Ok(Orphan(None)) = cache.try_insert(entry, 0, record, Some(first)) else {
+            panic!("a written disk record installs, and leaves no orphan");
+        };
+        assert_disk_matches_index(&cache, &store).await;
+        assert_eq!(cache.budget.disk_usage_bytes(), arrow_copy(&array));
+    }
+
+    /// A read hydrates an entry, and a spill of it installs its record before
+    /// the read reclaims the displaced one's object. The object at the key is
+    /// then the spill's, so it stays; the charge the reclaim carries is the
+    /// displaced record's, so it is released.
+    #[tokio::test]
+    async fn a_reclaim_leaves_the_object_a_later_spill_installed() {
+        let entry = EntryID::from(941usize);
+        let array: ArrayRef = Arc::new(Int32Array::from_iter_values(0..256));
+        let (cache, store, _directory) = flushed(entry, &array).await;
+
+        let orphan = cache
+            .try_insert(entry, 0, CacheEntry::memory_arrow(array.clone()), None)
+            .expect("the hydrated entry fits in memory");
+        cache.flush_all_to_disk().await.unwrap();
+        cache.reclaim(orphan).await;
+
+        assert_disk_matches_index(&cache, &store).await;
+        assert_eq!(cache.budget.disk_usage_bytes(), arrow_copy(&array));
+        let read = cache
+            .get(&entry, 0)
+            .await
+            .expect("the spill's object is read");
+        assert_eq!(read.as_ref(), array.as_ref());
+    }
+
+    /// A flush and an eviction can both read the same memory entry before
+    /// either spills it. Both puts land on the key's one object, so the
+    /// second record to install gives back the first one's charge.
+    #[tokio::test]
+    async fn a_second_spill_of_an_entry_releases_the_first_ones_charge() {
+        let (cache, store, _directory) = cache_over_counted_store(1 << 20, 1 << 20).await;
+        let entry = EntryID::from(942usize);
+        let array: ArrayRef = Arc::new(Int32Array::from_iter_values(0..256));
+        cache.insert(entry, 0, array.clone()).await.unwrap();
+
+        for _ in 0..2 {
+            let (record, bytes) = arrow_spill(&array);
+            let write = cache
+                .write_batch_to_disk(entry, 0, &record, bytes)
+                .await
+                .unwrap();
+            let Ok(Orphan(None)) = cache.try_insert(entry, 0, record, Some(write)) else {
+                panic!("a written disk record installs, and leaves no orphan");
+            };
+        }
+
+        assert_disk_matches_index(&cache, &store).await;
+        assert_eq!(cache.budget.disk_usage_bytes(), arrow_copy(&array));
+    }
+
+    type EvictHook = Box<dyn FnOnce() + Send>;
+
+    /// Hands a disk entry back unchanged, writing nothing, after running a
+    /// hook once if one is set; otherwise transcodes like [`TranscodeEvict`].
+    #[derive(Default)]
+    struct KeepDiskEntries {
+        hook: Arc<std::sync::Mutex<Option<EvictHook>>>,
+    }
+
+    impl std::fmt::Debug for KeepDiskEntries {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("KeepDiskEntries").finish()
+        }
+    }
+
+    impl EvictionPolicy for KeepDiskEntries {
+        fn evict(&self, entry: &CacheEntry, lineage: Option<&CacheExpression>) -> EvictionOutcome {
+            match entry {
+                CacheEntry::DiskArrow { .. } | CacheEntry::DiskLiquid { .. } => {
+                    let hook = self.hook.lock().unwrap().take();
+                    if let Some(hook) = hook {
+                        hook();
+                    }
+                    EvictionOutcome::Replace {
+                        entry: entry.clone(),
+                        bytes_to_write: None,
+                    }
+                }
+                _ => TranscodeEvict.evict(entry, lineage),
+            }
+        }
+    }
+
+    /// A cache whose eviction policy is `policy`, over a counted store.
+    async fn cache_keeping_disk_entries(
+        policy: KeepDiskEntries,
+    ) -> (Arc<LiquidCache>, t4::Store, tempfile::TempDir) {
+        let directory = tempfile::tempdir().unwrap();
+        let store = t4::mount(directory.path().join("cache.t4")).await.unwrap();
+        let cache = LiquidCacheBuilder::new()
+            .with_max_memory_bytes(1 << 20)
+            .with_max_disk_bytes(1 << 20)
+            .with_eviction_policy(Box::new(policy))
+            .with_cache_policy(Box::new(LiquidPolicy::new()))
+            .with_hydration_policy(Box::new(AlwaysHydrate::new()))
+            .with_store(store.clone())
+            .build()
+            .await;
+        (cache, store, directory)
+    }
+
+    /// An eviction policy may hand a disk record back unchanged, writing
+    /// nothing. The eviction then leaves the record in place, still naming
+    /// its object and holding its charge, so removing it later releases that
+    /// charge once.
+    #[tokio::test]
+    async fn a_disk_record_an_eviction_keeps_keeps_its_charge() {
+        let (cache, store, _directory) =
+            cache_keeping_disk_entries(KeepDiskEntries::default()).await;
+        let entry = EntryID::from(947usize);
+        let array: ArrayRef = Arc::new(Int32Array::from_iter_values(0..256));
+        cache.insert(entry, 0, array.clone()).await.unwrap();
+        cache.flush_all_to_disk().await.unwrap();
+
+        cache.evict_victims(vec![entry]).await.unwrap();
+        assert_disk_matches_index(&cache, &store).await;
+        assert_eq!(cache.budget.disk_usage_bytes(), arrow_copy(&array));
+
+        cache.remove_disk_entry(entry).await;
+        assert_disk_matches_index(&cache, &store).await;
+        assert_eq!(cache.budget.disk_usage_bytes(), 0);
+    }
+
+    /// An eviction reads a disk record and asks its policy what to do with
+    /// it. Meanwhile a read hydrates the entry, deleting the record's object.
+    /// The policy then hands the record back unchanged. That record is stale:
+    /// installed, it would replace the hydrated entry with a record naming a
+    /// deleted object and holding no charge.
+    #[test]
+    fn a_stale_disk_record_an_eviction_keeps_is_not_reinstalled() {
+        let entry = EntryID::from(948usize);
+        let array: ArrayRef = Arc::new(Int32Array::from_iter_values(0..256));
+        let policy = KeepDiskEntries::default();
+        let hook = policy.hook.clone();
+        let (cache, store, _directory) = block_on(cache_keeping_disk_entries(policy));
+        block_on(async {
+            cache.insert(entry, 0, array.clone()).await.unwrap();
+            cache.flush_all_to_disk().await.unwrap();
+        });
+
+        let reader = cache.clone();
+        *hook.lock().unwrap() = Some(Box::new(move || {
+            std::thread::spawn(move || {
+                let read = block_on(async { reader.get(&entry, 0).await });
+                assert!(read.is_some());
+            })
+            .join()
+            .unwrap();
+        }));
+        block_on(cache.evict_victims(vec![entry])).unwrap();
+
+        assert!(hook.lock().unwrap().is_none(), "the hook never ran");
+        assert!(is_memory(&cache, &entry), "the stale record was installed");
+        block_on(assert_disk_matches_index(&cache, &store));
+    }
+
+    /// A [`LiquidPolicy`] whose `notify_remove`, or `notify_insert` once
+    /// armed, panics once.
+    #[derive(Debug)]
+    struct PanicOnce {
+        inner: LiquidPolicy,
+        on_remove: std::sync::atomic::AtomicBool,
+        on_insert: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl PanicOnce {
+        fn on_remove() -> Self {
+            Self {
+                inner: LiquidPolicy::new(),
+                on_remove: std::sync::atomic::AtomicBool::new(true),
+                on_insert: Arc::default(),
+            }
+        }
+
+        fn on_armed_insert(armed: Arc<std::sync::atomic::AtomicBool>) -> Self {
+            Self {
+                inner: LiquidPolicy::new(),
+                on_remove: std::sync::atomic::AtomicBool::new(false),
+                on_insert: armed,
+            }
+        }
+    }
+
+    /// A cache over a counted store whose cache policy is `policy`.
+    fn cache_with_policy(policy: PanicOnce) -> (Arc<LiquidCache>, t4::Store, tempfile::TempDir) {
+        let directory = tempfile::tempdir().unwrap();
+        let store = block_on(t4::mount(directory.path().join("cache.t4"))).unwrap();
+        let cache = block_on(
+            LiquidCacheBuilder::new()
+                .with_max_memory_bytes(1 << 20)
+                .with_max_disk_bytes(1 << 20)
+                .with_eviction_policy(Box::new(TranscodeEvict))
+                .with_cache_policy(Box::new(policy))
+                .with_store(store.clone())
+                .build(),
+        );
+        (cache, store, directory)
+    }
+
+    impl CachePolicy for PanicOnce {
+        fn find_memory_victim(&self, cnt: usize) -> Vec<EntryID> {
+            self.inner.find_memory_victim(cnt)
+        }
+
+        fn find_disk_victim(&self, cnt: usize) -> Vec<EntryID> {
+            self.inner.find_disk_victim(cnt)
+        }
+
+        fn notify_insert(&self, entry_id: &EntryID, batch_type: CachedBatchType) {
+            if self.on_insert.swap(false, Ordering::SeqCst) {
+                panic!("policy panics on insert");
+            }
+            self.inner.notify_insert(entry_id, batch_type);
+        }
+
+        fn notify_access(&self, entry_id: &EntryID, batch_type: CachedBatchType) {
+            self.inner.notify_access(entry_id, batch_type);
+        }
+
+        fn notify_remove(&self, entry_id: &EntryID) {
+            if self.on_remove.swap(false, Ordering::SeqCst) {
+                panic!("policy panics on removal");
+            }
+            self.inner.notify_remove(entry_id);
+        }
+    }
+
+    /// A disk removal takes the record out of the index, then tells the
+    /// policy. If the policy panics there and the caller carries on, the
+    /// record's object is left for the next spill to delete.
+    #[test]
+    fn a_removal_whose_policy_panics_leaves_its_object_to_the_next_spill() {
+        let entry = EntryID::from(953usize);
+        let next = EntryID::from(954usize);
+        let array: ArrayRef = Arc::new(Int32Array::from_iter_values(0..256));
+        let (cache, store, _directory) = cache_with_policy(PanicOnce::on_remove());
+        block_on(async {
+            cache.insert(entry, 0, array.clone()).await.unwrap();
+            cache.flush_all_to_disk().await.unwrap();
+        });
+
+        let removal = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            block_on(cache.remove_disk_entry(entry))
+        }));
+        assert!(removal.is_err(), "the policy never panicked");
+        assert!(!cache.contains(&entry, 0));
+
+        block_on(async {
+            cache.insert(next, 0, array.clone()).await.unwrap();
+            spill(&cache, next, &array).await;
+            assert_disk_matches_index(&cache, &store).await;
+        });
+        assert_eq!(cache.budget.disk_usage_bytes(), arrow_copy(&array));
+    }
+
+    /// An insert puts a memory record over a disk one, then tells the policy.
+    /// If the policy panics there and the caller carries on, the displaced
+    /// record's charge comes back and its object is left for the next spill.
+    #[test]
+    fn an_insert_whose_policy_panics_leaves_the_displaced_object_to_the_next_spill() {
+        let entry = EntryID::from(955usize);
+        let next = EntryID::from(956usize);
+        let array: ArrayRef = Arc::new(Int32Array::from_iter_values(0..256));
+        let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (cache, store, _directory) =
+            cache_with_policy(PanicOnce::on_armed_insert(armed.clone()));
+        block_on(async {
+            cache.insert(entry, 0, array.clone()).await.unwrap();
+            cache.flush_all_to_disk().await.unwrap();
+        });
+
+        armed.store(true, Ordering::SeqCst);
+        let insert = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            block_on(async { cache.insert(entry, 0, array.clone()).await })
+        }));
+        assert!(insert.is_err(), "the policy never panicked");
+        assert!(is_memory(&cache, &entry));
+        assert_eq!(cache.budget.disk_usage_bytes(), 0);
+
+        block_on(async {
+            cache.insert(next, 0, array.clone()).await.unwrap();
+            spill(&cache, next, &array).await;
+            assert_disk_matches_index(&cache, &store).await;
+        });
+        assert_eq!(cache.budget.disk_usage_bytes(), arrow_copy(&array));
+    }
+
+    /// A flush that cannot reserve disk for an entry drops it from memory.
+    /// While that flush looks for disk victims, an eviction spills the same
+    /// entry in a smaller form that fits. That disk record and its object
+    /// are the eviction's, and the flush leaves them alone.
+    #[test]
+    fn a_failed_flush_leaves_a_record_another_writer_spilled() {
+        let entry = EntryID::from(943usize);
+        let array: ArrayRef = Arc::new(Int32Array::from_iter_values(0..256));
+        let directory = tempfile::tempdir().unwrap();
+        let store = block_on(t4::mount(directory.path().join("cache.t4"))).unwrap();
+        let hook = Arc::new(std::sync::Mutex::new(None::<DiskVictimHook>));
+        let cache = block_on(
+            LiquidCacheBuilder::new()
+                .with_max_memory_bytes(1 << 20)
+                .with_max_disk_bytes(arrow_copy(&array) - 1)
+                .with_eviction_policy(Box::new(TranscodeEvict))
+                .with_cache_policy(Box::new(HookAfterDiskVictims {
+                    inner: LiquidPolicy::new(),
+                    hook: hook.clone(),
+                }))
+                .with_store(store.clone())
+                .build(),
+        );
+        block_on(async { cache.insert(entry, 0, array.clone()).await }).unwrap();
+
+        let evicter = cache.clone();
+        *hook.lock().unwrap() = Some(Box::new(move |_: &[EntryID]| {
+            std::thread::spawn(move || {
+                block_on(async {
+                    // Arrow to Liquid in memory, then Liquid to disk.
+                    evicter.evict_victims(vec![entry]).await.unwrap();
+                    evicter.evict_victims(vec![entry]).await.unwrap();
+                })
+            })
+            .join()
+            .unwrap();
+        }));
+
+        assert_eq!(block_on(cache.flush_all_to_disk()), Ok(()));
+
+        assert!(hook.lock().unwrap().is_none(), "the hook never ran");
+        assert!(matches!(
+            cache.index().get(&entry).unwrap().entry,
+            CacheEntry::DiskLiquid { .. }
+        ));
+        block_on(assert_disk_matches_index(&cache, &store));
+    }
+
+    /// A flush has spilled an entry, and an eviction that read the same
+    /// memory entry earlier is spilling it again: its object is put, its
+    /// record not yet installed. Disk pressure now removes the flush's record.
+    /// A removal that deleted the object then would delete the eviction's,
+    /// and the record the eviction installs next would name nothing. The
+    /// removal must wait for that record, and take it with the object.
+    #[tokio::test]
+    async fn a_disk_removal_waits_for_a_spill_in_flight_on_its_key() {
+        let entry = EntryID::from(944usize);
+        let array: ArrayRef = Arc::new(Int32Array::from_iter_values(0..256));
+        let (cache, store, _directory) = flushed(entry, &array).await;
+
+        let (respilled, bytes) = arrow_spill(&array);
+        let eviction = cache
+            .write_batch_to_disk(entry, 0, &respilled, bytes)
+            .await
+            .unwrap();
+
+        let mut removal = std::pin::pin!(cache.remove_disk_entry(entry));
+        assert!(
+            poll_once(removal.as_mut()).is_pending(),
+            "the removal went ahead while a spill of its key was in flight"
+        );
+
+        let Ok(Orphan(None)) = cache.try_insert(entry, 0, respilled, Some(eviction)) else {
+            panic!("a written disk record installs, and leaves no orphan");
+        };
+        removal.await;
+
+        assert!(!cache.contains(&entry, 0));
+        assert_disk_matches_index(&cache, &store).await;
     }
 }

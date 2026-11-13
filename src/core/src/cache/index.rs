@@ -121,7 +121,16 @@ impl ArtIndex {
 
     /// Store `batch` under `entry_id` for `identity`, replacing whatever held
     /// the key, including a slot held by another identity.
-    pub(crate) fn insert(&self, entry_id: &EntryID, identity: u64, batch: CacheEntry) {
+    ///
+    /// Returns the slot this insert replaced. The tree hands a replaced slot
+    /// to exactly one insert or removal, so whatever the slot held is the
+    /// caller's alone to give back.
+    pub(crate) fn insert(
+        &self,
+        entry_id: &EntryID,
+        identity: u64,
+        batch: CacheEntry,
+    ) -> Option<Arc<Slot>> {
         let guard = self.art.pin();
         let slot = Slot {
             identity,
@@ -132,11 +141,10 @@ impl ArtIndex {
             .insert(*entry_id, Arc::new(Cell::new(slot)), &guard)
             .expect("Insertion failed");
         match existing {
-            Some(replaced) => {
-                replaced.take();
-            }
+            Some(replaced) => replaced.take(),
             None => {
                 self.entry_count.fetch_add(1, Ordering::Relaxed);
+                None
             }
         }
     }
