@@ -626,11 +626,19 @@ impl LiquidCache {
         to_insert: CacheEntry,
         write: Option<DiskWrite<'a>>,
     ) -> Result<Orphan<'a>, CacheEntry> {
+        debug_assert!(
+            write.is_some() || Self::charged_bytes(&to_insert).is_none(),
+            "a disk record is installed only by the write that charged it"
+        );
         let new_memory_size = to_insert.memory_usage_bytes();
         let reserved = match self.index.get(&entry_id) {
             Some(slot) => self
                 .budget
                 .try_update_memory_usage(slot.entry.memory_usage_bytes(), new_memory_size),
+            // A disk record holds no memory, so it installs however full the
+            // memory budget reads. Its write cannot then be dropped, taking
+            // its charge, while the caller retries the record.
+            None if new_memory_size == 0 => Ok(()),
             None => self.budget.try_reserve_memory(new_memory_size),
         };
         if reserved.is_err() {
@@ -2197,6 +2205,34 @@ mod tests {
             .await
             .expect("the spill's object is read");
         assert_eq!(read.as_ref(), array.as_ref());
+    }
+
+    /// A spill installs its disk record even when the memory budget reads over
+    /// its limit, as drift in the memory accounting can leave it. Refused, the
+    /// spill would drop its write and with it the charge, and a retry would
+    /// then install the record holding no charge.
+    #[tokio::test]
+    async fn a_spill_installs_its_record_when_the_memory_budget_reads_full() {
+        let (cache, store, _directory) = cache_over_counted_store(1 << 20, 1 << 20).await;
+        let entry = EntryID::from(957usize);
+        let array: ArrayRef = Arc::new(Int32Array::from_iter_values(0..256));
+        cache
+            .budget
+            .try_update_memory_usage(1, 0)
+            .expect("a release cannot fail");
+        assert!(cache.budget.memory_usage_bytes() > cache.config.max_memory_bytes());
+
+        let (record, bytes) = arrow_spill(&array);
+        let write = cache
+            .write_batch_to_disk(entry, 0, &record, bytes)
+            .await
+            .unwrap();
+        let Ok(Orphan(None)) = cache.try_insert(entry, 0, record, Some(write)) else {
+            panic!("a written disk record installs, and leaves no orphan");
+        };
+
+        assert_disk_matches_index(&cache, &store).await;
+        assert_eq!(cache.budget.disk_usage_bytes(), arrow_copy(&array));
     }
 
     /// A flush and an eviction can both read the same memory entry before
