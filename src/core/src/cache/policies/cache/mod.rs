@@ -25,6 +25,9 @@ pub trait CachePolicy: std::fmt::Debug + Send + Sync {
     fn notify_access(&self, _entry_id: &EntryID, _batch_type: CachedBatchType) {}
 
     /// Notify the cache policy that an entry was removed.
+    ///
+    /// The cache can call this while holding a lock on the entry's disk
+    /// object, so an implementation must not wait on a cache operation here.
     fn notify_remove(&self, _entry_id: &EntryID) {}
 }
 
