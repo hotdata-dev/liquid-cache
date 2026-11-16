@@ -27,7 +27,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-dir", type=Path, default=Path("benchmark/tpcds/data"), help="Output root for tables")
     parser.add_argument("--answers-dir", type=Path, help="Output root for answer Parquet files (optional)")
     parser.add_argument("--queries-dir", type=Path, default=Path("benchmark/tpcds/queries"), help="Directory containing qNN.sql files")
-    parser.add_argument("--manifest", type=Optional[Path], default=None, help="Path to write manifest.json")
+    parser.add_argument("--manifest", type=Path, default=None, help="Path to write manifest.json")
     parser.add_argument("--duckdb", type=Path, help="Optional path to DuckDB executable")
     parser.add_argument("--seed", type=int, help="Optional seed if DuckDB supports deterministic dsdgen")
     parser.add_argument("--overwrite", action="store_true", help="Allow overwriting existing Parquet/manifest files")

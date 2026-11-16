@@ -22,7 +22,10 @@ use datafusion::{
     },
     physical_expr::{PhysicalExpr, projection::ProjectionExprs, utils::collect_columns},
     physical_optimizer::{PhysicalOptimizerRule, pruning::PruningPredicateBuilder},
-    physical_plan::ExecutionPlan,
+    physical_plan::{
+        ChildrenPropertiesMode, ExecutionPlan, ReplaceChildrenOptions, SortOrderPushdownResult,
+        sorts::sort::SortExec,
+    },
 };
 
 pub(crate) use lineage::HintAnalyzer;
@@ -144,7 +147,7 @@ impl PhysicalOptimizerRule for LocalModeOptimizer {
     fn optimize(
         &self,
         plan: Arc<dyn ExecutionPlan>,
-        _config: &ConfigOptions,
+        config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>, datafusion::error::DataFusionError> {
         let analysis = HintAnalyzer::analyze(&plan);
         let cache = self.cache.clone();
@@ -170,7 +173,12 @@ impl PhysicalOptimizerRule for LocalModeOptimizer {
             }
             convert_parquet_scan(node, &cache, hints, prefetch)
         };
-        Ok(lineage::rewrite_with_hints(plan, &mut convert, &analysis))
+        let plan = lineage::rewrite_with_hints(plan, &mut convert, &analysis);
+        if config.optimizer.enable_sort_pushdown {
+            push_topk_sorts_into_scans(plan)
+        } else {
+            Ok(plan)
+        }
     }
 
     fn name(&self) -> &str {
@@ -180,6 +188,55 @@ impl PhysicalOptimizerRule for LocalModeOptimizer {
     fn schema_check(&self) -> bool {
         true
     }
+}
+
+/// Offer each TopK's sort to its input again, now that the scans below it are
+/// liquid, and take the input back only when it answers `Inexact`.
+///
+/// [`LocalModeOptimizer`] runs after DataFusion's `PushdownSort`, which already
+/// marked the *parquet* sources under a TopK to approximate its sort.
+/// `ParquetSource` keeps that mark private, so the liquid source that replaced
+/// it starts without one, and its files would be handed out in listing order:
+/// for `ORDER BY ts DESC LIMIT n` that reaches the newest file last and opens
+/// most of the others first.
+///
+/// This is not a second run of `PushdownSort`, on purpose. That rule rebuilds
+/// the `SortExec` on an `Inexact` answer, and a rebuilt TopK creates a new
+/// dynamic filter, while the scan below still holds the old one, which
+/// DataFusion's filter pushdown attached before this rule ran. Nothing would
+/// update the scan's filter again, so the scan would prune nothing. Here the
+/// `SortExec` is kept and only its input is replaced (`replace_children` keeps
+/// the filter expression), so the scan's filter stays the TopK's.
+///
+/// Only a sort with a fetch (a TopK) is offered: without a limit every row is
+/// read anyway, so the order of the files changes nothing. `Exact` and
+/// `Unsupported` answers leave the plan as it is; an `Exact` input was already
+/// handled by DataFusion's own pass, which removed its `SortExec`.
+fn push_topk_sorts_into_scans(
+    plan: Arc<dyn ExecutionPlan>,
+) -> Result<Arc<dyn ExecutionPlan>, datafusion::error::DataFusionError> {
+    plan.transform_down(|node| {
+        let Some(sort) = node.downcast_ref::<SortExec>() else {
+            return Ok(Transformed::no(node));
+        };
+        if sort.fetch().is_none() {
+            return Ok(Transformed::no(node));
+        }
+        match sort.input().try_pushdown_sort(sort.expr())? {
+            SortOrderPushdownResult::Inexact { inner } => {
+                // Recompute: an `Inexact` scan drops its declared ordering.
+                let node = Arc::clone(&node).replace_children(
+                    vec![inner],
+                    ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+                )?;
+                Ok(Transformed::new(node, true, TreeNodeRecursion::Jump))
+            }
+            SortOrderPushdownResult::Exact { .. } | SortOrderPushdownResult::Unsupported => {
+                Ok(Transformed::no(node))
+            }
+        }
+    })
+    .map(|t| t.data)
 }
 
 /// Rewrite the data source plan to use liquid cache, attaching `hints` (keyed by
@@ -1185,6 +1242,268 @@ mod tests {
             convert_parquet_scan(&positional, &cache, ColumnLineages::default(), true).is_none(),
             "a scan reading a virtual column must stay on ParquetSource"
         );
+    }
+
+    /// Four files of one column `ts`, each holding a disjoint range of 100
+    /// values, named so that listing (path) order is oldest first:
+    /// `a` 0..99, `b` 100..199, `c` 200..299, `d` 300..399. That is how a
+    /// time-partitioned table lists its files, and it is the order in which a
+    /// newest-first TopK reaches the file it needs last.
+    fn write_time_sliced_files(dir: &Path) {
+        let schema = Arc::new(Schema::new(vec![Field::new("ts", DataType::Int32, false)]));
+        for (i, name) in ["a", "b", "c", "d"].iter().enumerate() {
+            let start = i as i32 * 100;
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from_iter_values(start..start + 100))],
+            )
+            .unwrap();
+            let file = File::create(dir.join(format!("{name}.parquet"))).unwrap();
+            let mut writer = ArrowWriter::try_new(file, schema.clone(), None).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+        }
+    }
+
+    /// Plan `sql` over the files of [`write_time_sliced_files`] as table `t`,
+    /// split across two file groups the way a multi-partition scan is, then run
+    /// [`LocalModeOptimizer`] on it as the last rule, as a session does.
+    async fn plan_time_sliced(
+        dir: &Path,
+        sql: &str,
+        enable_sort_pushdown: bool,
+    ) -> (Arc<dyn ExecutionPlan>, SessionContext) {
+        let mut config = SessionConfig::new()
+            .with_target_partitions(2)
+            .with_collect_statistics(true);
+        config.options_mut().optimizer.repartition_file_min_size = 0;
+        config.options_mut().optimizer.enable_sort_pushdown = enable_sort_pushdown;
+        let ctx = SessionContext::new_with_config(config);
+        ctx.register_parquet("t", dir.to_str().unwrap(), Default::default())
+            .await
+            .unwrap();
+        let plan = ctx
+            .sql(sql)
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let cache = make_cache(dir).await;
+        let plan = LocalModeOptimizer::new(cache)
+            .with_prefetch(false)
+            .optimize(plan, ctx.state().config_options())
+            .unwrap();
+        (plan, ctx)
+    }
+
+    /// The single liquid scan's config in `plan`.
+    fn liquid_scan(plan: &Arc<dyn ExecutionPlan>) -> FileScanConfig {
+        let mut found = None;
+        plan.apply(|node| {
+            if let Some(exec) = node.downcast_ref::<DataSourceExec>()
+                && let Some(cfg) = exec.data_source().downcast_ref::<FileScanConfig>()
+                && cfg
+                    .file_source()
+                    .downcast_ref::<LiquidParquetSource>()
+                    .is_some()
+            {
+                found = Some(cfg.clone());
+                return Ok(TreeNodeRecursion::Stop);
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })
+        .unwrap();
+        found.expect("plan has a liquid scan")
+    }
+
+    /// File names in the order the scan's shared work queue hands them out:
+    /// the file groups concatenated, then the file source's `reorder_files`,
+    /// which is what `SharedWorkSource::from_config` does.
+    fn work_queue_order(cfg: &FileScanConfig) -> Vec<String> {
+        let files: Vec<PartitionedFile> = cfg
+            .file_groups
+            .iter()
+            .flat_map(|group| group.iter().cloned())
+            .collect();
+        cfg.file_source()
+            .reorder_files(files)
+            .iter()
+            .map(|f| {
+                f.object_meta
+                    .location
+                    .filename()
+                    .unwrap()
+                    .trim_end_matches(".parquet")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// Under `ORDER BY ts DESC LIMIT 1` the liquid scan must keep the sort that
+    /// DataFusion pushed into the parquet scan it replaced, and hand its files
+    /// out newest first across all file groups. Without that the queue is the
+    /// groups one after another (each newest first inside, so `b a d c` here),
+    /// and the file holding the answer comes after files the TopK's dynamic
+    /// filter could have skipped: on a 30-day span table that opened 22 to 28
+    /// of a day's 62 files for one timestamp.
+    #[tokio::test]
+    async fn liquid_scan_hands_out_files_newest_first_under_a_topk() {
+        let dir = tempfile::tempdir().unwrap();
+        write_time_sliced_files(dir.path());
+        let (plan, ctx) = plan_time_sliced(
+            dir.path(),
+            "SELECT ts FROM t ORDER BY ts DESC LIMIT 1",
+            true,
+        )
+        .await;
+
+        let cfg = liquid_scan(&plan);
+        assert!(
+            cfg.file_groups.len() >= 2,
+            "the case under test spans several file groups: {:?}",
+            cfg.file_groups
+        );
+        let source = cfg
+            .file_source()
+            .downcast_ref::<LiquidParquetSource>()
+            .unwrap();
+        assert!(
+            source.sort_order_for_reorder().is_some(),
+            "the liquid scan lost the pushed sort"
+        );
+        assert_eq!(work_queue_order(&cfg), ["d", "c", "b", "a"]);
+        let displayed = DisplayableExecutionPlan::new(plan.as_ref())
+            .indent(true)
+            .to_string();
+        assert!(
+            displayed.contains("sort_order_for_reorder=[ts@0 DESC"),
+            "{displayed}"
+        );
+
+        // The reorder only changes which file is read first: the answer is the same.
+        let batches = collect(plan, ctx.task_ctx()).await.unwrap();
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 1);
+        let ts = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(ts.value(0), 399);
+    }
+
+    /// The point of the order: once the newest files are read, the TopK's
+    /// dynamic filter rules out the rest before they are opened. With two
+    /// workers taking `d` and `c` first, `b` and `a` must be skipped, so at
+    /// most two of the four files are opened. Read in listing order (`b a d c`
+    /// across the two groups) three or four are; and a TopK whose filter is not
+    /// the one the scan holds (what rebuilding the `SortExec` would cause)
+    /// opens all four.
+    #[tokio::test]
+    async fn liquid_topk_skips_the_older_files() {
+        let dir = tempfile::tempdir().unwrap();
+        write_time_sliced_files(dir.path());
+        let (plan, ctx) = plan_time_sliced(
+            dir.path(),
+            "SELECT ts FROM t ORDER BY ts DESC LIMIT 1",
+            true,
+        )
+        .await;
+        let batches = collect(Arc::clone(&plan), ctx.task_ctx()).await.unwrap();
+        let ts = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(ts.value(0), 399);
+
+        let metrics = DisplayableExecutionPlan::with_metrics(plan.as_ref())
+            .indent(true)
+            .to_string();
+        let pruned = metrics
+            .split("files_ranges_pruned_statistics=")
+            .nth(1)
+            .unwrap_or_else(|| panic!("no file pruning metric in:\n{metrics}"));
+        let numbers: Vec<usize> = pruned
+            .split(|c: char| !c.is_ascii_digit())
+            .filter(|s| !s.is_empty())
+            .take(2)
+            .map(|s| s.parse().unwrap())
+            .collect();
+        let (total, opened) = (numbers[0], numbers[1]);
+        assert_eq!(total, 4, "{metrics}");
+        assert!(opened <= 2, "opened {opened} of {total} files:\n{metrics}");
+    }
+
+    /// Ascending is the mirror image: oldest file first.
+    #[tokio::test]
+    async fn liquid_scan_hands_out_files_oldest_first_for_an_ascending_topk() {
+        let dir = tempfile::tempdir().unwrap();
+        write_time_sliced_files(dir.path());
+        let (plan, _ctx) =
+            plan_time_sliced(dir.path(), "SELECT ts FROM t ORDER BY ts ASC LIMIT 1", true).await;
+        assert_eq!(work_queue_order(&liquid_scan(&plan)), ["a", "b", "c", "d"]);
+    }
+
+    /// With sort pushdown turned off the rule pushes nothing either: the liquid
+    /// scan keeps no sort and the queue keeps listing order.
+    #[tokio::test]
+    async fn liquid_scan_keeps_listing_order_when_sort_pushdown_is_off() {
+        let dir = tempfile::tempdir().unwrap();
+        write_time_sliced_files(dir.path());
+        let (plan, _ctx) = plan_time_sliced(
+            dir.path(),
+            "SELECT ts FROM t ORDER BY ts DESC LIMIT 1",
+            false,
+        )
+        .await;
+        let cfg = liquid_scan(&plan);
+        let source = cfg
+            .file_source()
+            .downcast_ref::<LiquidParquetSource>()
+            .unwrap();
+        assert!(source.sort_order_for_reorder().is_none());
+        assert_eq!(work_queue_order(&cfg), ["a", "b", "c", "d"]);
+    }
+
+    /// A scan with no sort above it is left as it was.
+    #[tokio::test]
+    async fn liquid_scan_without_a_sort_keeps_no_sort_order() {
+        let dir = tempfile::tempdir().unwrap();
+        write_time_sliced_files(dir.path());
+        let (plan, _ctx) =
+            plan_time_sliced(dir.path(), "SELECT ts FROM t WHERE ts > 150", true).await;
+        let cfg = liquid_scan(&plan);
+        let source = cfg
+            .file_source()
+            .downcast_ref::<LiquidParquetSource>()
+            .unwrap();
+        assert!(source.sort_order_for_reorder().is_none());
+        assert_eq!(work_queue_order(&cfg), ["a", "b", "c", "d"]);
+    }
+
+    /// A sort on an expression, not a plain column, cannot be ordered by file
+    /// statistics, so the liquid scan declines it.
+    #[tokio::test]
+    async fn liquid_scan_declines_a_sort_on_an_expression() {
+        let dir = tempfile::tempdir().unwrap();
+        write_time_sliced_files(dir.path());
+        let (plan, ctx) = plan_time_sliced(
+            dir.path(),
+            "SELECT ts FROM t ORDER BY ts % 7 DESC LIMIT 1",
+            true,
+        )
+        .await;
+        let source = liquid_scan(&plan)
+            .file_source()
+            .downcast_ref::<LiquidParquetSource>()
+            .unwrap()
+            .clone();
+        assert!(source.sort_order_for_reorder().is_none());
+        let batches = collect(plan, ctx.task_ctx()).await.unwrap();
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 1);
     }
 }
 

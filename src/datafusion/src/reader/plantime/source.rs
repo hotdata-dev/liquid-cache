@@ -1,6 +1,7 @@
 use super::LiquidMorselizer;
 use crate::cache::{ColumnLineages, LiquidCacheParquetRef};
 use datafusion::{
+    common::ScalarValue,
     common::{internal_err, tree_node::TreeNodeRecursion},
     config::{ConfigOptions, TableParquetOptions},
     datasource::{
@@ -13,13 +14,15 @@ use datafusion::{
     error::Result,
     physical_expr::projection::ProjectionExprs,
     physical_expr::utils::conjunction,
+    physical_expr::{EquivalenceProperties, LexOrdering, PhysicalSortExpr, expressions::Column},
     physical_expr_adapter::DefaultPhysicalExprAdapterFactory,
     physical_plan::{
-        DisplayFormatType, PhysicalExpr, apply_expression_roots,
+        DisplayFormatType, PhysicalExpr, SortOrderPushdownResult, apply_expression_roots,
         filter_pushdown::{FilterPushdownPropagation, PushedDown, PushedDownPredicate},
         metrics::ExecutionPlanMetricsSet,
     },
 };
+use datafusion_datasource::PartitionedFile;
 use datafusion_datasource::morsel::Morselizer;
 use object_store::ObjectStore;
 use std::{
@@ -41,6 +44,10 @@ pub struct LiquidParquetSource {
     span: Option<Arc<fastrace::Span>>,
     lineages: Arc<ColumnLineages>,
     prefetch: bool,
+    /// The sort a parent `SortExec` asked this scan to approximate (set by
+    /// [`FileSource::try_pushdown_sort`]). Drives [`FileSource::reorder_files`],
+    /// which orders the shared work queue so a TopK sees its best files first.
+    sort_order_for_reorder: Option<LexOrdering>,
 }
 
 impl LiquidParquetSource {
@@ -119,6 +126,10 @@ impl LiquidParquetSource {
             span: None,
             lineages: Arc::default(),
             prefetch: true,
+            // A `ParquetSource` keeps its own pushed sort private, so it cannot
+            // be carried over here. `LocalModeOptimizer` pushes the sorts down
+            // again once the scans are liquid.
+            sort_order_for_reorder: None,
         };
 
         if let Some(predicate) = predicate {
@@ -132,6 +143,76 @@ impl LiquidParquetSource {
     pub fn predicate(&self) -> Option<Arc<dyn PhysicalExpr>> {
         self.predicate.clone()
     }
+
+    /// The sort this scan was asked to approximate, if any.
+    pub fn sort_order_for_reorder(&self) -> Option<&LexOrdering> {
+        self.sort_order_for_reorder.as_ref()
+    }
+}
+
+/// Order `files` so the files most likely to hold a TopK's rows come first:
+/// by the per-file `min` of each leading plain-column sort key, in the key's
+/// direction (largest `min` first for a descending key). Files without that
+/// statistic go last.
+///
+/// This mirrors `reorder_files_by_min_statistics` in
+/// `datafusion-datasource-parquet`, which is crate-private. Sharing the same
+/// order with DataFusion's own reader keeps a liquid scan's TopK behaviour the
+/// same as a plain parquet scan's: the files that tighten the dynamic filter
+/// the most are opened first, and every file the filter then rules out is
+/// skipped without being opened.
+fn reorder_files_by_min_statistics(
+    mut files: Vec<PartitionedFile>,
+    sort_order: Option<&LexOrdering>,
+    table_schema: &arrow_schema::Schema,
+) -> Vec<PartitionedFile> {
+    let Some(sort_order) = sort_order else {
+        return files;
+    };
+    // The longest prefix of plain columns that resolve in the table schema;
+    // the leading key is required.
+    let mut keys: Vec<(usize, bool)> = Vec::new();
+    for sort_expr in sort_order.iter() {
+        let Some(col) = sort_expr.expr.downcast_ref::<Column>() else {
+            break;
+        };
+        match table_schema.index_of(col.name()) {
+            Ok(idx) => keys.push((idx, sort_expr.options.descending)),
+            Err(_) => break,
+        }
+    }
+    if keys.is_empty() {
+        return files;
+    }
+
+    let file_min = |file: &PartitionedFile, idx: usize| -> Option<ScalarValue> {
+        file.statistics
+            .as_ref()?
+            .column_statistics
+            .get(idx)?
+            .min_value
+            .get_value()
+            .cloned()
+    };
+    files.sort_by(|a, b| {
+        for &(idx, descending) in &keys {
+            let ord = match (file_min(a, idx), file_min(b, idx)) {
+                (Some(va), Some(vb)) => {
+                    let cmp = va.partial_cmp(&vb).unwrap_or(std::cmp::Ordering::Equal);
+                    if descending { cmp.reverse() } else { cmp }
+                }
+                // Files with statistics first, whatever the direction.
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            };
+            if ord != std::cmp::Ordering::Equal {
+                return ord;
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
+    files
 }
 
 impl FileSource for LiquidParquetSource {
@@ -228,6 +309,9 @@ impl FileSource for LiquidParquetSource {
                 if let Some(predicate) = self.filter() {
                     write!(f, ", predicate={predicate}")?;
                 }
+                if let Some(sort_order) = &self.sort_order_for_reorder {
+                    write!(f, ", sort_order_for_reorder=[{sort_order}]")?;
+                }
                 Ok(())
             }
             DisplayFormatType::TreeRender => Ok(()),
@@ -274,6 +358,69 @@ impl FileSource for LiquidParquetSource {
         .with_updated_node(source))
     }
 
+    /// Approximate a sort for a parent TopK by ordering the files it reads.
+    ///
+    /// Mirrors `ParquetSource::try_pushdown_sort`, minus the row-group work
+    /// this reader does not do: when the request's leading key is a plain
+    /// column of the file schema, answer `Inexact` and remember the request,
+    /// so [`Self::reorder_files`] puts the files with the best statistics at
+    /// the front of the shared work queue. The parent `SortExec` stays, so the
+    /// result is the same; the TopK's dynamic filter just tightens after the
+    /// first files instead of the last.
+    ///
+    /// Everything else stays `Unsupported`, which leaves today's behaviour:
+    /// - a request the source's own ordering already satisfies, where
+    ///   `FileScanConfig` sorts the file groups by statistics and may drop the
+    ///   `SortExec` (an `Inexact` answer here would forbid that);
+    /// - a request whose proper prefix the ordering satisfies, so the
+    ///   `SortExec`'s prefix-aware early stop still applies (the same reason
+    ///   `ParquetSource` declines it);
+    /// - a leading key that is not a plain file column, which statistics
+    ///   cannot order.
+    fn try_pushdown_sort(
+        &self,
+        order: &[PhysicalSortExpr],
+        eq_properties: &EquivalenceProperties,
+    ) -> Result<SortOrderPushdownResult<Arc<dyn FileSource>>> {
+        let Some(sort_order) = LexOrdering::new(order.iter().cloned()) else {
+            return Ok(SortOrderPushdownResult::Unsupported);
+        };
+        if eq_properties.ordering_satisfy(order.iter().cloned())? {
+            return Ok(SortOrderPushdownResult::Unsupported);
+        }
+        for prefix_len in 1..order.len() {
+            if eq_properties.ordering_satisfy(order[..prefix_len].iter().cloned())? {
+                return Ok(SortOrderPushdownResult::Unsupported);
+            }
+        }
+        let leading_is_file_column = sort_order
+            .first()
+            .expr
+            .downcast_ref::<Column>()
+            .is_some_and(|col| {
+                self.table_schema
+                    .file_schema()
+                    .field_with_name(col.name())
+                    .is_ok()
+            });
+        if !leading_is_file_column {
+            return Ok(SortOrderPushdownResult::Unsupported);
+        }
+        let mut source = self.clone();
+        source.sort_order_for_reorder = Some(sort_order);
+        Ok(SortOrderPushdownResult::Inexact {
+            inner: Arc::new(source) as Arc<dyn FileSource>,
+        })
+    }
+
+    fn reorder_files(&self, files: Vec<PartitionedFile>) -> Vec<PartitionedFile> {
+        reorder_files_by_min_statistics(
+            files,
+            self.sort_order_for_reorder.as_ref(),
+            self.table_schema.table_schema(),
+        )
+    }
+
     fn apply_expressions(
         &self,
         f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
@@ -284,5 +431,110 @@ impl FileSource for LiquidParquetSource {
                 .chain(self.projection.iter().map(|projection| &projection.expr)),
             f,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_schema::SortOptions;
+    use arrow_schema::{DataType, Field, Schema};
+    use datafusion::common::{ColumnStatistics, Statistics, stats::Precision};
+    use datafusion::logical_expr::Operator;
+    use datafusion::physical_expr::expressions::{BinaryExpr, Literal};
+
+    fn schema() -> Schema {
+        Schema::new(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("ts", DataType::Int64, true),
+        ])
+    }
+
+    /// A file whose `ts` column has `min` (`None` = no statistic).
+    fn file(name: &str, ts_min: Option<i64>) -> PartitionedFile {
+        let file = PartitionedFile::new(name, 100);
+        let Some(min) = ts_min else {
+            return file;
+        };
+        let ts = ColumnStatistics {
+            min_value: Precision::Exact(ScalarValue::Int64(Some(min))),
+            ..ColumnStatistics::new_unknown()
+        };
+        file.with_statistics(Arc::new(Statistics {
+            num_rows: Precision::Absent,
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![ColumnStatistics::new_unknown(), ts],
+        }))
+    }
+
+    fn names(files: &[PartitionedFile]) -> Vec<&str> {
+        files
+            .iter()
+            .map(|f| f.object_meta.location.as_ref())
+            .collect()
+    }
+
+    fn ts_order(descending: bool) -> LexOrdering {
+        LexOrdering::new(vec![PhysicalSortExpr::new(
+            Arc::new(Column::new("ts", 1)),
+            SortOptions {
+                descending,
+                nulls_first: false,
+            },
+        )])
+        .unwrap()
+    }
+
+    fn files() -> Vec<PartitionedFile> {
+        vec![
+            file("mid", Some(50)),
+            file("none", None),
+            file("old", Some(10)),
+            file("new", Some(90)),
+        ]
+    }
+
+    #[test]
+    fn descending_puts_the_largest_min_first_and_missing_stats_last() {
+        let order = ts_order(true);
+        let sorted = reorder_files_by_min_statistics(files(), Some(&order), &schema());
+        assert_eq!(names(&sorted), ["new", "mid", "old", "none"]);
+    }
+
+    #[test]
+    fn ascending_puts_the_smallest_min_first_and_missing_stats_last() {
+        let order = ts_order(false);
+        let sorted = reorder_files_by_min_statistics(files(), Some(&order), &schema());
+        assert_eq!(names(&sorted), ["old", "mid", "new", "none"]);
+    }
+
+    #[test]
+    fn no_sort_order_keeps_the_given_order() {
+        let sorted = reorder_files_by_min_statistics(files(), None, &schema());
+        assert_eq!(names(&sorted), ["mid", "none", "old", "new"]);
+    }
+
+    #[test]
+    fn a_leading_expression_keeps_the_given_order() {
+        let expr: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("ts", 1)),
+            Operator::Plus,
+            Arc::new(Literal::new(ScalarValue::Int64(Some(1)))),
+        ));
+        let order =
+            LexOrdering::new(vec![PhysicalSortExpr::new(expr, SortOptions::default())]).unwrap();
+        let sorted = reorder_files_by_min_statistics(files(), Some(&order), &schema());
+        assert_eq!(names(&sorted), ["mid", "none", "old", "new"]);
+    }
+
+    #[test]
+    fn a_column_missing_from_the_schema_keeps_the_given_order() {
+        let order = LexOrdering::new(vec![PhysicalSortExpr::new(
+            Arc::new(Column::new("gone", 5)),
+            SortOptions::default(),
+        )])
+        .unwrap();
+        let sorted = reorder_files_by_min_statistics(files(), Some(&order), &schema());
+        assert_eq!(names(&sorted), ["mid", "none", "old", "new"]);
     }
 }
