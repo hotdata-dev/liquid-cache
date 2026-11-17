@@ -19,6 +19,7 @@ use vortex_arrow::ArrowSessionExt;
 use vortex_btrblocks::BtrBlocksCompressor;
 use vortex_buffer::{Alignment, BitBuffer, ByteBuffer, ByteBufferMut};
 use vortex_error::VortexResult;
+use vortex_fsst::FSST;
 use vortex_ipc::messages::{BufMessageReader, DecoderMessage, EncoderMessage, MessageEncoder};
 use vortex_mask::Mask;
 use vortex_session::VortexSession;
@@ -60,6 +61,8 @@ fn session() -> VortexSession {
 pub struct LiquidArray {
     array: vortex_array::ArrayRef,
     arrow_type: DataType,
+    /// What [`Self::get_array_memory_size`] reports; see [`heap_size`].
+    memory_size: usize,
 }
 
 impl LiquidArray {
@@ -91,7 +94,13 @@ impl LiquidArray {
                 return Err(array);
             }
         };
-        Ok(Self { array, arrow_type })
+        // Only the compacted array is ever charged; this one is transient.
+        let memory_size = array.nbytes() as usize + size_of::<Self>();
+        Ok(Self {
+            array,
+            arrow_type,
+            memory_size,
+        })
     }
 
     /// Detach the array from its source's buffers and from the compressor's
@@ -102,8 +111,8 @@ impl LiquidArray {
     /// string is a zero-copy slice of its whole source buffer (vortex #10599),
     /// and an FSST codes buffer keeps its growth slack (vortex #11420). Both
     /// are freed only with the entry. Round-tripping through the
-    /// serialization the disk tier uses drops those allocations. The charge
-    /// stays approximate: `nbytes()` still leaves out per-node overhead.
+    /// serialization the disk tier uses drops those allocations, and leaves
+    /// an array whose heap [`heap_size`] can account for.
     fn compacted(self) -> Self {
         let (alignment, pieces) = self.encode();
         let len = pieces.iter().map(ByteBuffer::len).sum();
@@ -167,7 +176,12 @@ impl LiquidArray {
             .expect("valid Vortex array segment")
             .decode(&dtype, row_count, &ReadContext::new(encodings), &SESSION)
             .expect("valid Vortex array");
-        Self { array, arrow_type }
+        let memory_size = heap_size(&array, &block) + size_of::<Self>();
+        Self {
+            array,
+            arrow_type,
+            memory_size,
+        }
     }
 
     /// The serialized form, as pieces to write contiguously into a block
@@ -346,7 +360,7 @@ impl LiquidArray {
 impl LiquidArray {
     /// Get the memory size of the Liquid array.
     pub fn get_array_memory_size(&self) -> usize {
-        self.array.nbytes() as usize + size_of::<Self>()
+        self.memory_size
     }
 
     /// Get the length of the Liquid array.
@@ -424,6 +438,53 @@ fn header_bytes(alignment: Alignment) -> [u8; HEADER_SIZE] {
     bytes[4..6].copy_from_slice(&VERSION.to_le_bytes());
     bytes[ALIGNMENT_OFFSET] = alignment.exponent();
     bytes
+}
+
+/// Heap each node of a decoded Vortex tree holds besides its buffers: the
+/// shared array allocation, its statistics set, slots and dtype. Measured
+/// with a counting allocator (`tests/liquid_array_memory.rs`).
+const NODE_HEAP: usize = 640;
+/// Heap an FSST node holds besides that: the decoder re-pads its symbol
+/// table to the full 256 entries of 8-byte symbols and 1-byte lengths, each
+/// in an allocation of its own, outside the block.
+const FSST_SYMBOL_TABLE_HEAP: usize = 4800;
+
+/// The heap a decoded array holds: the block, if any buffer still points
+/// into it, every buffer that does not, and per-node overhead.
+///
+/// `nbytes()`, the sum of buffer lengths, leaves out the block's framing and
+/// padding and all per-node heap. For a well-compressed column that is most
+/// of what the entry holds: a few hundred bytes of buffers can sit under
+/// several kilobytes of nodes.
+fn heap_size(array: &vortex_array::ArrayRef, block: &ByteBuffer) -> usize {
+    let block_start = block.as_ptr() as usize;
+    let block_range = block_start..block_start + block.len();
+    let mut block_held = false;
+    let mut size = 0;
+    for node in array.depth_first_traversal() {
+        size += NODE_HEAP;
+        let fsst = node.is::<FSST>();
+        if fsst {
+            size += FSST_SYMBOL_TABLE_HEAP;
+        }
+        for (index, buffer) in node.buffers().iter().enumerate() {
+            let start = buffer.as_ptr() as usize;
+            if !buffer.is_empty()
+                && block_range.contains(&start)
+                && start + buffer.len() <= block_range.end
+            {
+                block_held = true;
+            } else if !(fsst && index < 2) {
+                // FSST's first two buffers are the symbol table, counted
+                // above at its padded size.
+                size += buffer.len();
+            }
+        }
+    }
+    if block_held {
+        size += block.len();
+    }
+    size
 }
 
 fn read_u32(bytes: &[u8], at: usize) -> u32 {

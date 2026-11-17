@@ -776,7 +776,8 @@ mod tests {
     }
 
     /// Cache `first` and `second` as columns 0 and 1 of a cache they fill,
-    /// then a dummy column 2 wider than either. Eviction takes only as many
+    /// then a dummy column 2 that transcoding either one alone does not make
+    /// room for, and transcoding both does. Eviction takes only as many
     /// victims as the dummy needs room for, so it transcodes both to Liquid.
     async fn insert_liquid_columns(
         row_group: &CachedRowGroupRef,
@@ -784,10 +785,20 @@ mod tests {
         first: ArrayRef,
         second: ArrayRef,
     ) {
-        let widest = first
-            .get_array_memory_size()
-            .max(second.get_array_memory_size());
-        let dummy = dummy(widest / std::mem::size_of::<i32>() + 16);
+        let freed = |array: &ArrayRef| {
+            let liquid = liquid_cache::liquid_array::LiquidArray::from_arrow_array(array)
+                .expect("the column transcodes to Liquid");
+            array.get_array_memory_size() - liquid.get_array_memory_size()
+        };
+        let (freed_first, freed_second) = (freed(&first), freed(&second));
+        let (more, less) = (freed_first.max(freed_second), freed_first.min(freed_second));
+        let dummy = dummy((more + less / 2) / std::mem::size_of::<i32>());
+        let dummy_size = dummy.get_array_memory_size();
+        assert!(
+            more < dummy_size && dummy_size <= more + less,
+            "a {dummy_size}-byte dummy does not need both columns transcoded \
+             (they free {freed_first} and {freed_second} bytes)"
+        );
         for (column_id, array) in [first, second, dummy].into_iter().enumerate() {
             row_group
                 .get_column(column_id as u64)
@@ -837,7 +848,9 @@ mod tests {
 
     #[tokio::test]
     async fn or_fast_path_on_strings() {
-        let batch_size = 128;
+        // Large enough that the Liquid form of each column, with its
+        // per-node overhead, is smaller than its Arrow form.
+        let batch_size = 1024;
         let schema = Arc::new(Schema::new(vec![
             Field::new("city", DataType::Utf8View, false),
             Field::new("name", DataType::Utf8View, false),
