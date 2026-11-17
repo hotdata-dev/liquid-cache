@@ -1375,6 +1375,16 @@ mod tests {
         }
     }
 
+    /// The last batch the scan read found the cache full, and was cached:
+    /// with no disk tier, older batches were dropped to make room for it.
+    async fn assert_full_cache_made_room(
+        row_group0: &CachedRowGroupRef,
+        row_group1: &CachedRowGroupRef,
+    ) {
+        assert!(contains(row_group1, 1, 0).await);
+        assert!(!contains(row_group0, 0, 0).await);
+    }
+
     async fn contains(row_group: &CachedRowGroupRef, column_id: usize, batch_idx: u16) -> bool {
         row_group
             .get_column(column_id as u64)
@@ -1595,7 +1605,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cache_full_keeps_inserted_batches_and_skips_failed_inserts() {
+    async fn cache_full_drops_the_oldest_batch_to_admit_the_newest() {
         let one_array_memory = Arc::new(Int32Array::from(vec![0, 1, 2, 3])).get_array_memory_size();
         let planned = plan_test_file(PlanOptions {
             max_memory_bytes: one_array_memory * 3,
@@ -1609,10 +1619,7 @@ mod tests {
         let (a, b) = collect_columns(planned.morsels).await;
         assert_eq!(a, vec![0, 1, 2, 3, 4, 5, 6, 7]);
         assert_eq!(b, vec![10, 11, 12, 13, 14, 15, 16, 17]);
-        assert!(contains(&row_group0, 0, 0).await);
-        assert!(contains(&row_group0, 1, 0).await);
-        assert!(contains(&row_group1, 0, 0).await);
-        assert!(!contains(&row_group1, 1, 0).await);
+        assert_full_cache_made_room(&row_group0, &row_group1).await;
     }
 
     #[tokio::test]
@@ -1630,10 +1637,7 @@ mod tests {
         let (a, b) = collect_columns(planned.morsels).await;
         assert_eq!(a, vec![3, 4, 5, 6, 7]);
         assert_eq!(b, vec![13, 14, 15, 16, 17]);
-        assert!(contains(&row_group0, 0, 0).await);
-        assert!(contains(&row_group0, 1, 0).await);
-        assert!(contains(&row_group1, 0, 0).await);
-        assert!(!contains(&row_group1, 1, 0).await);
+        assert_full_cache_made_room(&row_group0, &row_group1).await;
     }
 
     #[tokio::test]
@@ -1672,10 +1676,7 @@ mod tests {
             collect_columns(planned.morsels).await.0,
             vec![3, 4, 5, 6, 7]
         );
-        assert!(contains(&row_group0, 0, 0).await);
-        assert!(contains(&row_group0, 1, 0).await);
-        assert!(contains(&row_group1, 0, 0).await);
-        assert!(!contains(&row_group1, 1, 0).await);
+        assert_full_cache_made_room(&row_group0, &row_group1).await;
     }
 
     #[tokio::test]
