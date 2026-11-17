@@ -525,6 +525,11 @@ impl LiquidCache {
                 Ok((new_batch, write))
             }
             CacheEntry::MemoryLiquid(liquid_array) => {
+                // With no disk tier the write below can only fail; it is
+                // refused before the array is serialised for it.
+                if self.config.max_disk_bytes() == 0 {
+                    return Err(CacheFull);
+                }
                 let liquid_bytes = Bytes::from(liquid_array.to_bytes());
                 let disk_bytes = liquid_bytes.len();
                 let write = self
