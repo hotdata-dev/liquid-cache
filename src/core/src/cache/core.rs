@@ -2218,9 +2218,7 @@ mod tests {
         let array: ArrayRef = Arc::new(Int32Array::from_iter_values(0..256));
         cache
             .budget
-            .try_update_memory_usage(1, 0)
-            .expect("a release cannot fail");
-        assert!(cache.budget.memory_usage_bytes() > cache.config.max_memory_bytes());
+            .set_memory_usage(cache.config.max_memory_bytes() + 1);
 
         let (record, bytes) = arrow_spill(&array);
         let write = cache

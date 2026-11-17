@@ -33,23 +33,20 @@ impl BudgetAccounting {
         self.used_disk_bytes.store(0, Ordering::Relaxed);
     }
 
+    /// Set the memory usage outright, as accounting drift could leave it.
+    #[cfg(test)]
+    pub(super) fn set_memory_usage(&self, bytes: usize) {
+        self.used_memory_bytes.store(bytes, Ordering::Relaxed);
+    }
+
     /// Try to reserve memory in the cache.
     /// Returns ok if the memory was reserved, err if the memory budget is full.
     pub(super) fn try_reserve_memory(&self, request_bytes: usize) -> Result<(), ()> {
-        let used = self.used_memory_bytes.load(Ordering::Relaxed);
-        if used + request_bytes > self.max_memory_bytes {
-            return Err(());
-        }
-
-        match self.used_memory_bytes.compare_exchange(
-            used,
-            used + request_bytes,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => Ok(()),
-            Err(_) => self.try_reserve_memory(request_bytes),
-        }
+        reserve(
+            &self.used_memory_bytes,
+            request_bytes,
+            self.max_memory_bytes,
+        )
     }
 
     /// Adjust memory usage after transcoding.
@@ -64,8 +61,7 @@ impl BudgetAccounting {
             self.try_reserve_memory(diff)?;
             Ok(())
         } else {
-            self.used_memory_bytes
-                .fetch_sub(old_size - new_size, Ordering::Relaxed);
+            release(&self.used_memory_bytes, old_size - new_size);
             Ok(())
         }
     }
@@ -79,26 +75,38 @@ impl BudgetAccounting {
     }
 
     pub(super) fn try_reserve_disk(&self, request_bytes: usize) -> Result<(), ()> {
-        let used = self.used_disk_bytes.load(Ordering::Relaxed);
-        if used + request_bytes > self.max_disk_bytes {
+        let reserved = reserve(&self.used_disk_bytes, request_bytes, self.max_disk_bytes);
+        if reserved.is_err() {
             self.observer.on_disk_reservation_failure();
-            return Err(());
         }
-
-        match self.used_disk_bytes.compare_exchange(
-            used,
-            used + request_bytes,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => Ok(()),
-            Err(_) => self.try_reserve_disk(request_bytes),
-        }
+        reserved
     }
 
     pub(super) fn release_disk(&self, bytes: usize) {
-        self.used_disk_bytes.fetch_sub(bytes, Ordering::Relaxed);
+        release(&self.used_disk_bytes, bytes);
     }
+}
+
+/// Add `request_bytes` to `used` if the sum stays within `max_bytes`.
+fn reserve(used: &AtomicUsize, request_bytes: usize, max_bytes: usize) -> Result<(), ()> {
+    used.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+        used.checked_add(request_bytes)
+            .filter(|&reserved| reserved <= max_bytes)
+    })
+    .map(|_| ())
+    .map_err(|_| ())
+}
+
+/// Take `bytes` off `used`, stopping at zero.
+///
+/// A release larger than the usage means a charge was given back twice or
+/// never taken. Wrapping would leave the usage near `usize::MAX`, and the tier
+/// would refuse every reservation from then on; stopping at zero keeps the
+/// error to the size of the mismatch.
+fn release(used: &AtomicUsize, bytes: usize) {
+    let _ = used.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+        Some(used.saturating_sub(bytes))
+    });
 }
 
 #[cfg(test)]
@@ -216,5 +224,50 @@ mod tests {
         assert_eq!(budget.disk_usage_bytes(), 750);
         assert!(budget.try_reserve_disk(250).is_ok());
         assert_eq!(budget.disk_usage_bytes(), 1000);
+    }
+
+    /// A release larger than the charge is an accounting error elsewhere, but
+    /// it must not wrap the counter to near `usize::MAX`: the tier would then
+    /// refuse every reservation for good.
+    #[test]
+    fn releasing_more_memory_than_charged_leaves_usage_at_zero() {
+        let budget = test_budget(1000, usize::MAX);
+        budget.try_reserve_memory(100).unwrap();
+
+        budget
+            .try_update_memory_usage(300, 0)
+            .expect("a release cannot fail");
+
+        assert_eq!(budget.memory_usage_bytes(), 0);
+        assert!(budget.try_reserve_memory(1000).is_ok());
+        assert_eq!(budget.memory_usage_bytes(), 1000);
+    }
+
+    #[test]
+    fn releasing_more_disk_than_charged_leaves_usage_at_zero() {
+        let budget = test_budget(usize::MAX, 1000);
+        budget.try_reserve_disk(100).unwrap();
+
+        budget.release_disk(300);
+
+        assert_eq!(budget.disk_usage_bytes(), 0);
+        assert!(budget.try_reserve_disk(1000).is_ok());
+        assert_eq!(budget.disk_usage_bytes(), 1000);
+    }
+
+    /// A reservation whose sum with the usage does not fit a `usize` is
+    /// refused, not wrapped into a small usage (or a panic in debug builds).
+    #[test]
+    fn a_reservation_past_usize_max_is_refused() {
+        let budget = test_budget(usize::MAX, usize::MAX);
+        budget.try_reserve_memory(usize::MAX - 1).unwrap();
+        budget.try_reserve_disk(usize::MAX - 1).unwrap();
+
+        assert!(budget.try_reserve_memory(2).is_err());
+        assert!(budget.try_reserve_disk(2).is_err());
+        assert!(budget.try_update_memory_usage(0, 2).is_err());
+
+        assert_eq!(budget.memory_usage_bytes(), usize::MAX - 1);
+        assert_eq!(budget.disk_usage_bytes(), usize::MAX - 1);
     }
 }
