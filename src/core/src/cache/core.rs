@@ -631,10 +631,17 @@ impl LiquidCache {
             "a disk record is installed only by the write that charged it"
         );
         let new_memory_size = to_insert.memory_usage_bytes();
-        let reserved = match self.index.get(&entry_id) {
-            Some(slot) => self
+        // The memory of the slot this insert expects to replace. Another
+        // insert of the key can replace that slot before this one lands, so
+        // the budget is settled below against the slot actually displaced.
+        let assumed_release = self
+            .index
+            .get(&entry_id)
+            .map(|slot| slot.entry.memory_usage_bytes());
+        let reserved = match assumed_release {
+            Some(old_size) => self
                 .budget
-                .try_update_memory_usage(slot.entry.memory_usage_bytes(), new_memory_size),
+                .try_update_memory_usage(old_size, new_memory_size),
             // A disk record holds no memory, so it installs however full the
             // memory budget reads. Its write cannot then be dropped, taking
             // its charge, while the caller retries the record.
@@ -645,10 +652,14 @@ impl LiquidCache {
             return Err(to_insert);
         }
         let cached_batch_type = CachedBatchType::from(&to_insert);
-        let displaced = self
-            .index
-            .insert(&entry_id, identity, to_insert)
-            .and_then(|displaced| self.charge_of(&displaced.entry));
+        let displaced = self.index.insert(&entry_id, identity, to_insert);
+        self.budget.settle_memory_release(
+            assumed_release.unwrap_or(0),
+            displaced
+                .as_ref()
+                .map_or(0, |slot| slot.entry.memory_usage_bytes()),
+        );
+        let displaced = displaced.and_then(|displaced| self.charge_of(&displaced.entry));
         let orphan = match write {
             Some(DiskWrite {
                 key_lock,
@@ -2574,5 +2585,80 @@ mod tests {
 
         assert!(!cache.contains(&entry, 0));
         assert_disk_matches_index(&cache, &store).await;
+    }
+
+    /// A cache with no disk tier, and the builder's production policies
+    /// otherwise.
+    #[cfg(not(feature = "shuttle"))]
+    async fn memory_only_cache(max_memory_bytes: usize) -> Arc<LiquidCache> {
+        LiquidCacheBuilder::new()
+            .with_max_memory_bytes(max_memory_bytes)
+            .with_max_disk_bytes(0)
+            .with_eviction_policy(Box::new(TranscodeEvict))
+            .with_cache_policy(Box::new(LiquidPolicy::new()))
+            .with_hydration_policy(Box::new(AlwaysHydrate::new()))
+            .build()
+            .await
+    }
+
+    /// Rounds a race test runs. Each round is one chance at the interleaving
+    /// it looks for, so a pass means only that no round hit it.
+    #[cfg(not(feature = "shuttle"))]
+    const RACE_ROUNDS: usize = 2_000;
+
+    /// Run `first` and `second` on two threads, released together.
+    #[cfg(not(feature = "shuttle"))]
+    fn race(first: impl FnOnce() + Send, second: impl FnOnce() + Send) {
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                barrier.wait();
+                first();
+            });
+            scope.spawn(|| {
+                barrier.wait();
+                second();
+            });
+        });
+    }
+
+    /// Two scans cache the same absent key at once, as `CachedColumn::insert`
+    /// allows: it checks `contains` and inserts as separate steps. Both
+    /// inserts can read the key absent and reserve the full size, but only
+    /// one entry survives, so the one displaced must give its memory back.
+    #[cfg(not(feature = "shuttle"))]
+    #[test]
+    fn two_inserts_of_one_absent_key_charge_it_once() {
+        let cache = block_on(memory_only_cache(1 << 34));
+        for round in 0..RACE_ROUNDS {
+            let key = EntryID::from(round);
+            let insert = || block_on(cache.insert_inner(key, 0, create_test_array(100))).unwrap();
+            race(insert, insert);
+            assert_memory_budget_matches_index(&cache);
+        }
+    }
+
+    /// An eviction transcodes a key in memory while a scan inserts the key
+    /// again. Whichever install lands last must leave the budget charging
+    /// what it installed, not what the slot held when it was read.
+    #[cfg(not(feature = "shuttle"))]
+    #[test]
+    fn an_eviction_racing_a_reinsert_keeps_the_budget_matching_the_index() {
+        let cache = block_on(memory_only_cache(1 << 34));
+        for round in 0..RACE_ROUNDS {
+            let key = EntryID::from(round);
+            block_on(cache.insert_inner(key, 0, create_test_array(100))).unwrap();
+            race(
+                || block_on(cache.evict_victims(vec![key])).unwrap(),
+                // Inserted several times so that one of them straddles the
+                // eviction's install.
+                || {
+                    for _ in 0..32 {
+                        block_on(cache.insert_inner(key, 0, create_test_array(100))).unwrap();
+                    }
+                },
+            );
+            assert_memory_budget_matches_index(&cache);
+        }
     }
 }

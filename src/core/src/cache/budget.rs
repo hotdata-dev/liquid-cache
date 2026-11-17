@@ -66,6 +66,26 @@ impl BudgetAccounting {
         }
     }
 
+    /// Correct a memory update made against the wrong replaced size.
+    ///
+    /// An insert updates the usage by its new size less the size of the slot
+    /// it read, but another insert of the key can replace that slot before
+    /// this one lands. `assumed` is the size the update released, `released`
+    /// the size of the slot actually displaced. The difference is applied
+    /// whatever the limit: the entry is installed, and the usage has to say
+    /// what it holds.
+    pub(super) fn settle_memory_release(&self, assumed: usize, released: usize) {
+        if released > assumed {
+            release(&self.used_memory_bytes, released - assumed);
+        } else if assumed > released {
+            let _ =
+                self.used_memory_bytes
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                        Some(used.saturating_add(assumed - released))
+                    });
+        }
+    }
+
     pub fn memory_usage_bytes(&self) -> usize {
         self.used_memory_bytes.load(Ordering::Relaxed)
     }
@@ -253,6 +273,26 @@ mod tests {
         assert_eq!(budget.disk_usage_bytes(), 0);
         assert!(budget.try_reserve_disk(1000).is_ok());
         assert_eq!(budget.disk_usage_bytes(), 1000);
+    }
+
+    /// An insert that released less than the displaced slot held gives the
+    /// rest back; one that released more takes the difference back, even past
+    /// the limit, since the entry it charges is already installed.
+    #[test]
+    fn settling_a_release_charges_what_was_actually_displaced() {
+        let budget = test_budget(1000, usize::MAX);
+        budget.try_reserve_memory(900).unwrap();
+
+        budget.settle_memory_release(100, 400);
+        assert_eq!(budget.memory_usage_bytes(), 600);
+
+        budget.settle_memory_release(400, 100);
+        assert_eq!(budget.memory_usage_bytes(), 900);
+
+        budget.settle_memory_release(0, 0);
+        budget.settle_memory_release(300, 0);
+        assert_eq!(budget.memory_usage_bytes(), 1200);
+        assert!(budget.try_reserve_memory(1).is_err());
     }
 
     /// A reservation whose sum with the usage does not fit a `usize` is
