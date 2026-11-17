@@ -202,8 +202,18 @@ fn entry_ids(cache: &LiquidCacheParquetRef) -> HashSet<usize> {
     ids
 }
 
+/// The cache charges exactly the memory its entries hold, and no more than
+/// its budget. Called once no query is running.
 fn assert_within_budget(cache: &LiquidCacheParquetRef, after: &str) {
     let used = cache.storage().stats().memory_usage_bytes;
+    let mut held = 0;
+    cache
+        .storage()
+        .for_each_entry(|_, entry| held += entry.memory_usage_bytes());
+    assert_eq!(
+        used, held,
+        "after {after} the cache charges {used} bytes for entries holding {held}"
+    );
     assert!(
         used <= MEMORY_BYTES,
         "after {after} the cache charges {used} bytes, over its {MEMORY_BYTES}"

@@ -648,10 +648,14 @@ impl LiquidCache {
             "a disk record is installed only by the write that charged it"
         );
         let new_memory_size = to_insert.memory_usage_bytes();
-        let reserved = match self.index.get(&entry_id) {
-            Some(slot) => self
+        let assumed_old_size = self
+            .index
+            .get(&entry_id)
+            .map(|slot| slot.entry.memory_usage_bytes());
+        let reserved = match assumed_old_size {
+            Some(old_size) => self
                 .budget
-                .try_update_memory_usage(slot.entry.memory_usage_bytes(), new_memory_size),
+                .try_update_memory_usage(old_size, new_memory_size),
             // A disk record holds no memory, so it installs however full the
             // memory budget reads. Its write cannot then be dropped, taking
             // its charge, while the caller retries the record.
@@ -662,10 +666,24 @@ impl LiquidCache {
             return Err(to_insert);
         }
         let cached_batch_type = CachedBatchType::from(&to_insert);
-        let displaced = self
-            .index
-            .insert(&entry_id, identity, to_insert)
-            .and_then(|displaced| self.charge_of(&displaced.entry));
+        let displaced = self.index.insert(&entry_id, identity, to_insert);
+        // The charge above assumed the slot read before it. Another write can
+        // have replaced or removed that slot since, so the charge is settled
+        // against the slot this insert actually displaced: the budget then
+        // counts exactly the entries the index holds.
+        let actual_old_size = displaced
+            .as_ref()
+            .map_or(0, |slot| slot.entry.memory_usage_bytes());
+        let assumed_old_size = assumed_old_size.unwrap_or(0);
+        if assumed_old_size > actual_old_size {
+            self.budget
+                .charge_memory(assumed_old_size - actual_old_size);
+        } else if actual_old_size > assumed_old_size {
+            self.budget
+                .try_update_memory_usage(actual_old_size - assumed_old_size, 0)
+                .expect("memory release cannot fail");
+        }
+        let displaced = displaced.and_then(|displaced| self.charge_of(&displaced.entry));
         let orphan = match write {
             Some(DiskWrite {
                 key_lock,
@@ -777,6 +795,14 @@ impl LiquidCache {
             .try_update_memory_usage(removed.entry.memory_usage_bytes(), 0)
             .expect("memory release cannot fail");
         self.cache_policy.notify_remove(&entry_id);
+        // A write can have installed the key again, and told the policy,
+        // between the removal and the notice above, which then took the new
+        // entry out of the policy too. An entry the policy does not know is
+        // never evicted, so it is told again; a policy files a key once.
+        if let Some(slot) = self.index.get(&entry_id) {
+            self.cache_policy
+                .notify_insert(&entry_id, CachedBatchType::from(&slot.entry));
+        }
     }
 
     /// Remove `entry_id` if the index still holds it in memory.
@@ -1761,6 +1787,56 @@ mod tests {
         cache.drop_memory_victim(key, &current);
         assert!(cache.index().get(&key).is_none());
         assert_eq!(cache.budget.memory_usage_bytes(), 0);
+    }
+
+    /// Many writers on a few keys of a full memory-only cache, so inserts,
+    /// replacements and evictions of one key overlap. Afterwards the budget
+    /// charges exactly what the index holds, and the cache still admits.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn overlapping_writes_to_a_full_memory_only_cache_keep_its_accounting() {
+        let budget = 256 << 10;
+        let cache = Arc::new(
+            LiquidCacheBuilder::new()
+                .with_max_memory_bytes(budget)
+                .with_max_disk_bytes(0)
+                .with_eviction_policy(Box::new(TranscodeEvict))
+                .with_cache_policy(Box::new(LiquidPolicy::new()))
+                .build()
+                .await,
+        );
+        let mut tasks = Vec::new();
+        for writer in 0..16i64 {
+            let cache = Arc::clone(&cache);
+            tasks.push(tokio::spawn(async move {
+                for round in 0..400i64 {
+                    let key = EntryID::from(((writer * 7 + round) % 24) as usize);
+                    let len = 512 + ((writer + round) % 4) as usize * 512;
+                    let _ = cache
+                        .insert(
+                            key,
+                            (round % 2) as u64,
+                            int64_array(len, writer * 1000 + round),
+                        )
+                        .await;
+                    tokio::task::yield_now().await;
+                }
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+
+        let mut held = 0;
+        cache.for_each_entry(|_, entry| held += entry.memory_usage_bytes());
+        assert_eq!(cache.budget.memory_usage_bytes(), held);
+        assert!(held <= budget);
+
+        let fresh = EntryID::from(10_000usize);
+        cache
+            .insert(fresh, 0, int64_array(1024, 77))
+            .await
+            .expect("a fresh entry was refused");
+        assert!(cache.contains(&fresh, 0));
     }
 
     #[tokio::test]

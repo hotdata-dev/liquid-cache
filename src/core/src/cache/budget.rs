@@ -52,6 +52,12 @@ impl BudgetAccounting {
         }
     }
 
+    /// Charge `bytes` of memory whatever the budget reads: for memory an
+    /// entry already holds, which the budget missed.
+    pub(super) fn charge_memory(&self, bytes: usize) {
+        self.used_memory_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
     /// Adjust memory usage after transcoding.
     /// Returns ok if the usage was adjusted, err if the memory budget is full when new_size is larger than old_size.
     pub(super) fn try_update_memory_usage(
