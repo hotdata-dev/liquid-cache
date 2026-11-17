@@ -875,6 +875,13 @@ impl LiquidCache {
         &self.index
     }
 
+    /// Evict `victims`, failing only if none of them could be evicted.
+    ///
+    /// One victim failing says nothing about the room the others made: with
+    /// no disk tier a Liquid victim always fails, while an Arrow victim
+    /// beside it transcodes and frees memory. So the caller retries its
+    /// insert after any victim was evicted. Sequential eviction stops at the
+    /// first failure, as later victims would fail the same way.
     #[fastrace::trace]
     async fn evict_victims(&self, victims: Vec<EntryID>) -> Result<(), CacheFull> {
         self.trace(InternalEvent::EvictionBegin {
@@ -884,25 +891,27 @@ impl LiquidCache {
             cache: self,
             pending: victims.clone(),
         };
+        let mut evicted_any = false;
         if self.evict_victims_concurrently {
             let mut evictions = futures::stream::iter(victims)
                 .map(|victim| async move { (victim, self.evict_victim_inner(victim).await) })
                 .buffer_unordered(usize::MAX);
-            let mut outcome = Ok(());
             while let Some((victim, result)) = evictions.next().await {
-                match result {
-                    Ok(()) => lease.evicted(victim),
-                    Err(error) => outcome = Err(error),
+                if result.is_ok() {
+                    lease.evicted(victim);
+                    evicted_any = true;
                 }
             }
-            outcome
         } else {
             for victim in victims {
-                self.evict_victim_inner(victim).await?;
+                if self.evict_victim_inner(victim).await.is_err() {
+                    break;
+                }
                 lease.evicted(victim);
+                evicted_any = true;
             }
-            Ok(())
         }
+        if evicted_any { Ok(()) } else { Err(CacheFull) }
     }
 
     async fn evict_victim_inner(&self, victim: EntryID) -> Result<(), CacheFull> {
@@ -2804,6 +2813,61 @@ mod tests {
             ids,
             "entries held in memory are no longer offered as victims"
         );
+    }
+
+    /// Values that do not compress, so Liquid saves little over Arrow.
+    fn incompressible_array(rows: u64) -> ArrayRef {
+        Arc::new(arrow::array::Int64Array::from_iter_values(
+            (0..rows).map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15) as i64),
+        ))
+    }
+
+    fn liquid_entry(array: &ArrayRef) -> CacheEntry {
+        CacheEntry::memory_liquid(Arc::new(
+            crate::liquid_array::LiquidArray::from_arrow_array(array).unwrap(),
+        ))
+    }
+
+    /// With no disk tier, an insert's victims are a mix: Arrow entries it can
+    /// transcode, and Liquid ones it cannot move. Transcoding the Arrow
+    /// victims can free all the room the insert needs; the Liquid victims
+    /// failing must not then refuse it.
+    #[tokio::test]
+    async fn an_insert_that_eviction_made_room_for_is_not_refused() {
+        for concurrently in [false, true] {
+            // Transcodes to a fraction of its Arrow size.
+            let compressible = create_test_arrow_array(4096);
+            let incompressible = incompressible_array(4096);
+            let arrow = CacheEntry::memory_arrow(compressible.clone()).memory_usage_bytes();
+            let transcoded = liquid_entry(&compressible).memory_usage_bytes();
+            let liquid = liquid_entry(&incompressible).memory_usage_bytes();
+            assert!(transcoded < arrow / 4, "the Arrow entry barely compresses");
+            let cache =
+                memory_only_cache_evicting(arrow + 2 * liquid + transcoded, concurrently).await;
+            let arrow_id = EntryID::from(0usize);
+            cache
+                .insert_inner(arrow_id, 0, CacheEntry::memory_arrow(compressible.clone()))
+                .await
+                .unwrap();
+            for id in 1usize..3 {
+                cache
+                    .insert_inner(EntryID::from(id), 0, liquid_entry(&incompressible))
+                    .await
+                    .unwrap();
+            }
+
+            let new = EntryID::from(3usize);
+            let inserted = cache.insert(new, 0, compressible.clone()).await;
+
+            assert_eq!(inserted, Ok(()), "concurrently={concurrently}");
+            assert!(cache.contains(&new, 0));
+            assert!(matches!(
+                cache.index().get(&arrow_id).unwrap().entry,
+                CacheEntry::MemoryLiquid(_)
+            ));
+            assert_memory_budget_matches_index(&cache);
+            assert_eq!(drain_memory_victims(&cache), memory_keys(&cache));
+        }
     }
 
     /// Rounds a race test runs. Each round is one chance at the interleaving
