@@ -37,7 +37,7 @@ impl BudgetAccounting {
     /// Returns ok if the memory was reserved, err if the memory budget is full.
     pub(super) fn try_reserve_memory(&self, request_bytes: usize) -> Result<(), ()> {
         let used = self.used_memory_bytes.load(Ordering::Relaxed);
-        if used + request_bytes > self.max_memory_bytes {
+        if used.saturating_add(request_bytes) > self.max_memory_bytes {
             return Err(());
         }
 

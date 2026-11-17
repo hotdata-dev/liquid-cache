@@ -653,39 +653,37 @@ impl LiquidCache {
             "a disk record is installed only by the write that charged it"
         );
         let new_memory_size = to_insert.memory_usage_bytes();
+        // Only growth over the slot read here is reserved up front, against
+        // the budget. The rest is settled once the insert has displaced
+        // whatever slot is there by then, which another write can have
+        // replaced or removed since: the budget then counts exactly the
+        // entries the index holds. Settling after the insert can only
+        // over-read the budget for a moment, never under-read it.
+        //
+        // A disk record holds no memory, so it installs however full the
+        // memory budget reads. Its write cannot then be dropped, taking its
+        // charge, while the caller retries the record.
         let assumed_old_size = self
             .index
             .get(&entry_id)
-            .map(|slot| slot.entry.memory_usage_bytes());
-        let reserved = match assumed_old_size {
-            Some(old_size) => self
-                .budget
-                .try_update_memory_usage(old_size, new_memory_size),
-            // A disk record holds no memory, so it installs however full the
-            // memory budget reads. Its write cannot then be dropped, taking
-            // its charge, while the caller retries the record.
-            None if new_memory_size == 0 => Ok(()),
-            None => self.budget.try_reserve_memory(new_memory_size),
-        };
-        if reserved.is_err() {
+            .map_or(0, |slot| slot.entry.memory_usage_bytes());
+        let reserved = new_memory_size.saturating_sub(assumed_old_size);
+        if reserved > 0 && self.budget.try_reserve_memory(reserved).is_err() {
             return Err(to_insert);
         }
         let cached_batch_type = CachedBatchType::from(&to_insert);
         let displaced = self.index.insert(&entry_id, identity, to_insert);
-        // The charge above assumed the slot read before it. Another write can
-        // have replaced or removed that slot since, so the charge is settled
-        // against the slot this insert actually displaced: the budget then
-        // counts exactly the entries the index holds.
         let actual_old_size = displaced
             .as_ref()
             .map_or(0, |slot| slot.entry.memory_usage_bytes());
-        let assumed_old_size = assumed_old_size.unwrap_or(0);
-        if assumed_old_size > actual_old_size {
+        // The insert's net change is `new - actual_old`, of which `reserved`
+        // is charged already.
+        let remaining = new_memory_size as i128 - actual_old_size as i128 - reserved as i128;
+        if remaining > 0 {
+            self.budget.charge_memory(remaining as usize);
+        } else if remaining < 0 {
             self.budget
-                .charge_memory(assumed_old_size - actual_old_size);
-        } else if actual_old_size > assumed_old_size {
-            self.budget
-                .try_update_memory_usage(actual_old_size - assumed_old_size, 0)
+                .try_update_memory_usage((-remaining) as usize, 0)
                 .expect("memory release cannot fail");
         }
         let displaced = displaced.and_then(|displaced| self.charge_of(&displaced.entry));
@@ -1814,7 +1812,7 @@ mod tests {
             let cache = Arc::clone(&cache);
             tasks.push(tokio::spawn(async move {
                 for round in 0..400i64 {
-                    let key = EntryID::from(((writer * 7 + round) % 24) as usize);
+                    let key = EntryID::from(((writer * 3 + round) % 8) as usize);
                     let len = 512 + ((writer + round) % 4) as usize * 512;
                     let _ = cache
                         .insert(
@@ -1842,6 +1840,21 @@ mod tests {
             .await
             .expect("a fresh entry was refused");
         assert!(cache.contains(&fresh, 0));
+
+        // Every entry the index holds is one the policy can still pick: an
+        // entry it lost is never evicted.
+        let known: std::collections::HashSet<usize> = cache
+            .cache_policy
+            .find_memory_victim(100_000)
+            .into_iter()
+            .map(usize::from)
+            .collect();
+        cache.for_each_entry(|id, _| {
+            assert!(
+                known.contains(&usize::from(*id)),
+                "entry {id:?} is cached but unknown to the policy"
+            );
+        });
     }
 
     #[tokio::test]
@@ -1977,6 +1990,81 @@ mod tests {
         fn notify_remove(&self, entry_id: &EntryID) {
             self.inner.notify_remove(entry_id);
         }
+    }
+
+    type BeforeRemoveHook = Box<dyn FnOnce() + Send>;
+
+    /// A [`LiquidPolicy`] that runs a hook once, when told of a removal and
+    /// before it acts on the notice.
+    struct HookBeforeRemove {
+        inner: LiquidPolicy,
+        hook: Arc<std::sync::Mutex<Option<BeforeRemoveHook>>>,
+    }
+
+    impl std::fmt::Debug for HookBeforeRemove {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("HookBeforeRemove").finish()
+        }
+    }
+
+    impl CachePolicy for HookBeforeRemove {
+        fn find_memory_victim(&self, cnt: usize) -> Vec<EntryID> {
+            self.inner.find_memory_victim(cnt)
+        }
+
+        fn notify_insert(&self, entry_id: &EntryID, batch_type: CachedBatchType) {
+            self.inner.notify_insert(entry_id, batch_type);
+        }
+
+        fn notify_remove(&self, entry_id: &EntryID) {
+            let hook = self.hook.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+            self.inner.notify_remove(entry_id);
+        }
+    }
+
+    /// A write installs the key again, and tells the policy, between a
+    /// victim's removal and the removal's notice to the policy. The notice
+    /// then takes the new entry out of the policy too; the drop files it
+    /// again, so it stays evictable.
+    #[tokio::test]
+    async fn a_key_written_again_while_its_victim_is_dropped_stays_evictable() {
+        let hook = Arc::new(std::sync::Mutex::new(None::<BeforeRemoveHook>));
+        let cache = Arc::new(
+            LiquidCacheBuilder::new()
+                .with_max_memory_bytes(1 << 20)
+                .with_max_disk_bytes(0)
+                .with_cache_policy(Box::new(HookBeforeRemove {
+                    inner: LiquidPolicy::new(),
+                    hook: hook.clone(),
+                }))
+                .build()
+                .await,
+        );
+        let key = EntryID::from(5usize);
+        cache.insert(key, 0, int64_array(64, 1)).await.unwrap();
+        let observed = cache.index().get(&key).unwrap().entry.clone();
+
+        let writer = Arc::clone(&cache);
+        let newer = int64_array(64, 2);
+        let installed = newer.clone();
+        *hook.lock().unwrap() = Some(Box::new(move || {
+            let Ok(Orphan(None)) =
+                writer.try_insert(key, 0, CacheEntry::memory_arrow(installed), None)
+            else {
+                panic!("the write was refused or displaced a disk record");
+            };
+        }));
+
+        cache.drop_memory_victim(key, &observed);
+
+        assert!(hook.lock().unwrap().is_none(), "the hook never ran");
+        let slot = cache.index().get(&key).expect("the newer entry is cached");
+        assert!(matches!(&slot.entry, CacheEntry::MemoryArrow(a) if Arc::ptr_eq(a, &newer)));
+        assert_eq!(cache.cache_policy.find_memory_victim(8), vec![key]);
+        assert_memory_budget_matches_index(&cache);
     }
 
     /// The memory budget equals what the index's memory entries hold.
