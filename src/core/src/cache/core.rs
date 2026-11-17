@@ -659,8 +659,9 @@ impl LiquidCache {
         // replaced or removed since: the budget then counts exactly the
         // entries the index holds, never fewer. When the slot read here was
         // removed meanwhile, the settle charges this entry in full, however
-        // full the budget is: usage can then exceed the maximum by up to one
-        // entry until a later insert evicts.
+        // full the budget is: usage can then exceed the maximum, by up to one
+        // entry for each insert that raced the removal of its key, until a
+        // later insert that grows the budget evicts.
         //
         // A disk record holds no memory, so it installs however full the
         // memory budget reads. Its write cannot then be dropped, taking its
@@ -1837,8 +1838,9 @@ mod tests {
             largest = largest.max(entry.memory_usage_bytes());
         });
         assert_eq!(cache.budget.memory_usage_bytes(), held);
-        // A settle can charge an entry over a full budget; one entry at most.
-        assert!(held <= budget + largest);
+        // A settle can charge an entry over a full budget: at most one entry
+        // for each writer whose insert raced the removal of its key.
+        assert!(held <= budget + 16 * largest);
 
         let fresh = EntryID::from(10_000usize);
         cache

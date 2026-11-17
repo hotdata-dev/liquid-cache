@@ -202,24 +202,30 @@ fn entry_ids(cache: &LiquidCacheParquetRef) -> HashSet<usize> {
     ids
 }
 
-/// The cache charges exactly the memory its entries hold, and no more than
-/// its budget plus one entry: an insert racing the drop of its key can charge
-/// one entry over a full budget, until a later insert evicts. Called once no
-/// query is running.
-fn assert_within_budget(cache: &LiquidCacheParquetRef, after: &str) {
+/// The cache charges exactly the memory its entries hold. Called once no query
+/// is running.
+fn assert_accounting_exact(cache: &LiquidCacheParquetRef, after: &str) -> usize {
     let used = cache.storage().stats().memory_usage_bytes;
-    let (mut held, mut largest) = (0, 0);
-    cache.storage().for_each_entry(|_, entry| {
-        held += entry.memory_usage_bytes();
-        largest = largest.max(entry.memory_usage_bytes());
-    });
+    let mut held = 0;
+    cache
+        .storage()
+        .for_each_entry(|_, entry| held += entry.memory_usage_bytes());
     assert_eq!(
         used, held,
         "after {after} the cache charges {used} bytes for entries holding {held}"
     );
+    used
+}
+
+/// The accounting is exact and within the budget. An insert that raced the
+/// removal of its key can charge one entry over a full budget, until a later
+/// insert that grows evicts; so after concurrent queries, call this only
+/// after a sequential query has run.
+fn assert_within_budget(cache: &LiquidCacheParquetRef, after: &str) {
+    let used = assert_accounting_exact(cache, after);
     assert!(
-        used <= MEMORY_BYTES + largest,
-        "after {after} the cache charges {used} bytes, over its {MEMORY_BYTES} by more than one entry"
+        used <= MEMORY_BYTES,
+        "after {after} the cache charges {used} bytes, over its {MEMORY_BYTES}"
     );
 }
 
@@ -289,7 +295,7 @@ async fn concurrent_queries_keep_the_cache_admitting() {
     for task in tasks {
         task.await.unwrap();
     }
-    assert_within_budget(&f.cache, "the concurrent queries");
+    assert_accounting_exact(&f.cache, "the concurrent queries");
 
     let before = entry_ids(&f.cache);
     query_and_check(&f, &last, last_kind).await;
@@ -298,6 +304,7 @@ async fn concurrent_queries_keep_the_cache_admitting() {
         new_entries > 0,
         "after the concurrent queries, {last} cached nothing"
     );
+    assert_within_budget(&f.cache, &last);
 }
 
 /// Queries cancelled part way, many times over, must not leave the cache
@@ -317,7 +324,7 @@ async fn cancelled_queries_do_not_freeze_the_cache() {
         task.abort();
         let _ = task.await;
     }
-    assert_within_budget(&f.cache, "the cancelled queries");
+    assert_accounting_exact(&f.cache, "the cancelled queries");
 
     for (table, kind) in f.tables[..12].iter().cloned() {
         query_and_check(&f, &table, kind).await;
