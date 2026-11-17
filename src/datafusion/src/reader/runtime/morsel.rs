@@ -10,7 +10,7 @@ use parquet::{
         ProjectionMask,
         arrow_reader::{ArrowPredicate, RowSelection, RowSelector},
     },
-    basic::Type as PhysicalType,
+    basic::{ConvertedType, LogicalType, Type as PhysicalType},
     file::metadata::{ColumnChunkMetaData, ParquetMetaData},
 };
 
@@ -174,44 +174,56 @@ impl LiquidRowGroupPlanner {
 /// Parquet's `uncompressed_size` is the size of the *encoded* pages, so a
 /// dictionary- or RLE-encoded column decodes to many times that: 32K rows of
 /// a 20-value, 64-byte string column encode to ~22 KB and decode to ~2.2 MB.
-/// A prefetch pins the decoded arrays, so this sizes them from the physical
+/// A prefetch pins the decoded arrays, so this sizes them from the column's
 /// type instead:
 ///
-/// - fixed width: `num_values × width`;
+/// - decimals, whatever their physical type: 16 bytes per value, or 32 above
+///   precision 38. That is the `Decimal128`/`Decimal256` the reader produces
+///   by default; a schema that narrows them only makes this an over-count;
+/// - other fixed-width types: `num_values × width`;
 /// - byte arrays: 16 bytes per value (an offset or a view, whichever Arrow
-///   type the column decodes to) plus the variable-length data, taken from
-///   `unencoded_byte_array_data_bytes` when the writer recorded it, otherwise
-///   from the longer of the chunk's min/max values, otherwise left at the
-///   encoded size;
+///   type the column decodes to) plus the variable-length data. The data is
+///   `unencoded_byte_array_data_bytes` when the writer recorded it. Otherwise
+///   it is a best guess, the larger of the encoded size and `non-null values ×
+///   the longer of the chunk's min/max`. Min/max are ordered by value, not
+///   length, and are often truncated, so that guess can still under-count a
+///   dictionary-encoded column whose values vary in length;
 ///
 /// plus a validity bitmap. The result is never below `uncompressed_size`.
 pub(crate) fn decoded_column_bytes(column: &ColumnChunkMetaData) -> usize {
     let encoded = usize::try_from(column.uncompressed_size()).unwrap_or(0);
     let values = usize::try_from(column.num_values()).unwrap_or(0);
     let fixed_width = |width: usize| values.saturating_mul(width);
-    let decoded = match column.column_type() {
-        PhysicalType::BOOLEAN => values.div_ceil(8),
-        PhysicalType::INT32 | PhysicalType::FLOAT => fixed_width(4),
-        PhysicalType::INT64 | PhysicalType::DOUBLE => fixed_width(8),
-        PhysicalType::INT96 => fixed_width(16),
-        PhysicalType::FIXED_LEN_BYTE_ARRAY => {
-            fixed_width(usize::try_from(column.column_descr().type_length()).unwrap_or(0))
+    let descr = column.column_descr();
+    let decimal_precision = match descr.logical_type_ref() {
+        Some(LogicalType::Decimal(decimal)) => Some(decimal.precision),
+        _ => (descr.converted_type() == ConvertedType::DECIMAL).then(|| descr.type_precision()),
+    };
+    let decoded = match (decimal_precision, column.column_type()) {
+        (Some(precision), _) => fixed_width(if precision > 38 { 32 } else { 16 }),
+        (None, PhysicalType::BOOLEAN) => values.div_ceil(8),
+        (None, PhysicalType::INT32 | PhysicalType::FLOAT) => fixed_width(4),
+        (None, PhysicalType::INT64 | PhysicalType::DOUBLE) => fixed_width(8),
+        (None, PhysicalType::INT96) => fixed_width(16),
+        (None, PhysicalType::FIXED_LEN_BYTE_ARRAY) => {
+            fixed_width(usize::try_from(descr.type_length()).unwrap_or(0))
         }
-        PhysicalType::BYTE_ARRAY => {
+        (None, PhysicalType::BYTE_ARRAY) => {
             let data = column
                 .unencoded_byte_array_data_bytes()
                 .and_then(|bytes| usize::try_from(bytes).ok())
-                .or_else(|| {
-                    let stats = column.statistics()?;
-                    let non_null =
-                        values.saturating_sub(stats.null_count_opt().unwrap_or(0) as usize);
-                    let longest = stats
-                        .min_bytes_opt()
-                        .map(<[u8]>::len)
-                        .max(stats.max_bytes_opt().map(<[u8]>::len))?;
-                    Some(non_null.saturating_mul(longest))
-                })
-                .unwrap_or(encoded);
+                .unwrap_or_else(|| {
+                    let from_min_max = column.statistics().and_then(|stats| {
+                        let non_null =
+                            values.saturating_sub(stats.null_count_opt().unwrap_or(0) as usize);
+                        let longest = stats
+                            .min_bytes_opt()
+                            .map(<[u8]>::len)
+                            .max(stats.max_bytes_opt().map(<[u8]>::len))?;
+                        Some(non_null.saturating_mul(longest))
+                    });
+                    from_min_max.unwrap_or(0).max(encoded)
+                });
             fixed_width(16).saturating_add(data)
         }
     };

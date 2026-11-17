@@ -1774,6 +1774,133 @@ mod tests {
         }
     }
 
+    /// Decimals are stored as INT32, INT64 or fixed-length bytes but decode to
+    /// 16- or 32-byte Arrow decimals; the estimate must cover what the reader
+    /// actually produces, whatever the physical type.
+    #[test]
+    fn decoded_column_bytes_covers_decimals() {
+        use crate::reader::runtime::decoded_column_bytes;
+        use arrow::array::{Decimal128Array, Decimal256Array};
+        use arrow::datatypes::i256;
+        let rows = 4096;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("d5", DataType::Decimal128(5, 2), false),
+            Field::new("d15", DataType::Decimal128(15, 2), false),
+            Field::new("d30", DataType::Decimal128(30, 2), false),
+            Field::new("d50", DataType::Decimal256(50, 2), false),
+        ]));
+        let values = |precision: u8| {
+            Decimal128Array::from_iter_values((0..rows as i128).map(|v| v % 997))
+                .with_precision_and_scale(precision, 2)
+                .unwrap()
+        };
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(values(5)),
+                Arc::new(values(15)),
+                Arc::new(values(30)),
+                Arc::new(
+                    Decimal256Array::from_iter_values(
+                        (0..rows as i128).map(|v| i256::from_i128(v % 997)),
+                    )
+                    .with_precision_and_scale(50, 2)
+                    .unwrap(),
+                ),
+            ],
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("decimals.parquet");
+        let mut writer =
+            ArrowWriter::try_new(File::create(&path).unwrap(), Arc::clone(&schema), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        // What the reader decodes, not what was written.
+        let decoded = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+            File::open(&path).unwrap(),
+        )
+        .unwrap()
+        .with_batch_size(rows)
+        .build()
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+        let metadata = file_metadata(&path);
+        for (index, column) in metadata.row_group(0).columns().iter().enumerate() {
+            let name = schema.field(index).name();
+            let estimate = decoded_column_bytes(column);
+            let array = decoded.column(index);
+            let decoded_bytes = array.to_data().get_slice_memory_size().unwrap();
+            println!(
+                "{name}: physical={:?} decoded_type={:?} encoded={} decoded={decoded_bytes} \
+                 estimate={estimate}",
+                column.column_type(),
+                array.data_type(),
+                column.uncompressed_size()
+            );
+            assert!(
+                estimate >= decoded_bytes,
+                "{name} ({:?}, decoded as {:?}): estimated {estimate} bytes for \
+                 {decoded_bytes} decoded",
+                column.column_type(),
+                array.data_type()
+            );
+        }
+    }
+
+    /// Without `unencoded_byte_array_data_bytes` the string data must not be
+    /// sized from the min/max values alone: they are ordered by value, not by
+    /// length, and writers truncate them. Here both are one byte long while
+    /// every value is 100 bytes, which the plain-encoded size still shows.
+    #[test]
+    fn decoded_column_bytes_without_data_size_does_not_trust_min_max() {
+        use crate::reader::runtime::decoded_column_bytes;
+        use parquet::basic::{LogicalType, Type as PhysicalType};
+        use parquet::data_type::ByteArray;
+        use parquet::file::metadata::ColumnChunkMetaData;
+        use parquet::file::statistics::Statistics;
+        use parquet::schema::types::{ColumnDescriptor, ColumnPath, Type};
+
+        let rows: usize = 4096;
+        let value_len: usize = 100;
+        let field = Type::primitive_type_builder("s", PhysicalType::BYTE_ARRAY)
+            .with_logical_type(Some(LogicalType::String))
+            .build()
+            .unwrap();
+        let descr = Arc::new(ColumnDescriptor::new(
+            Arc::new(field),
+            0,
+            0,
+            ColumnPath::from("s"),
+        ));
+        // Plain encoding: a 4-byte length before each value.
+        let encoded = rows * (4 + value_len);
+        let column = ColumnChunkMetaData::builder(descr)
+            .set_num_values(rows as i64)
+            .set_total_uncompressed_size(encoded as i64)
+            .set_statistics(Statistics::byte_array(
+                Some(ByteArray::from("a")),
+                Some(ByteArray::from("b")),
+                None,
+                Some(0),
+                false,
+            ))
+            .build()
+            .unwrap();
+        assert!(column.unencoded_byte_array_data_bytes().is_none());
+
+        let estimate = decoded_column_bytes(&column);
+        // A `Utf8View` of 100-byte values: a 16-byte view plus the value each.
+        let decoded = rows * (16 + value_len);
+        assert!(
+            estimate >= decoded,
+            "estimated {estimate} bytes for {decoded} decoded ({encoded} encoded)"
+        );
+    }
+
     #[tokio::test]
     async fn cache_full_keeps_inserted_batches_and_skips_failed_inserts() {
         let one_array_memory = Arc::new(Int32Array::from(vec![0, 1, 2, 3])).get_array_memory_size();
