@@ -222,6 +222,18 @@ impl LiquidCacheServiceInner {
     pub(crate) fn add_execution_stats(&self, execution_stats: ExecutionStats) {
         self.execution_stats.write().unwrap().push(execution_stats);
     }
+
+    /// Test-only: how many registered plans the service still holds.
+    #[cfg(test)]
+    pub(crate) fn execution_plans_len(&self) -> usize {
+        self.execution_plans.read().unwrap().len()
+    }
+
+    /// Test-only: how many execution stats the service still holds.
+    #[cfg(test)]
+    pub(crate) fn execution_stats_len(&self) -> usize {
+        self.execution_stats.read().unwrap().len()
+    }
 }
 
 #[cfg(test)]

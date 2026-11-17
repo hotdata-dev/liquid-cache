@@ -644,6 +644,19 @@ fn plan_row_group_morsels(planned: PlannedRowGroups) -> Result<Option<MorselPlan
         return Ok(None);
     }
 
+    #[cfg(test)]
+    test_estimates::record(
+        queue
+            .iter()
+            .map(|(row_group_idx, _)| {
+                (
+                    *row_group_idx,
+                    row_group_planner.estimated_bytes(*row_group_idx),
+                )
+            })
+            .collect(),
+    );
+
     let chain = LiquidRowGroupChain {
         planner: row_group_planner,
         queue,
@@ -656,6 +669,25 @@ fn plan_row_group_morsels(planned: PlannedRowGroups) -> Result<Option<MorselPlan
         MorselPlan::new().with_planners(vec![Box::new(chain)])
     };
     Ok(Some(plan))
+}
+
+/// Test-only: the prefetch estimate of every row group the last file planned on
+/// this thread queued, as `(row group index, estimated_bytes)`.
+#[cfg(test)]
+pub(crate) mod test_estimates {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static LAST: RefCell<Vec<(usize, usize)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(crate) fn record(estimates: Vec<(usize, usize)>) {
+        LAST.with(|last| *last.borrow_mut() = estimates);
+    }
+
+    pub(crate) fn last() -> Vec<(usize, usize)> {
+        LAST.with(|last| last.borrow().clone())
+    }
 }
 
 struct LiquidRowGroupChain {
@@ -1044,6 +1076,28 @@ mod tests {
         writer.close().unwrap();
     }
 
+    fn write_row_groups_file(path: &std::path::Path, schema: SchemaRef, rows: &[usize]) {
+        let file = File::create(path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, Arc::clone(&schema), None).unwrap();
+        let mut next = 0i32;
+        for rows in rows {
+            let a = (next..next + *rows as i32).collect::<Vec<_>>();
+            let b = a.iter().map(|value| value + 100_000).collect::<Vec<_>>();
+            next += *rows as i32;
+            writer
+                .write(
+                    &RecordBatch::try_new(
+                        Arc::clone(&schema),
+                        vec![Arc::new(Int32Array::from(a)), Arc::new(Int32Array::from(b))],
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            writer.flush().unwrap();
+        }
+        writer.close().unwrap();
+    }
+
     fn write_single_row_group_file(path: &std::path::Path, schema: SchemaRef, a: Vec<i32>) {
         let file = File::create(path).unwrap();
         let b = a.iter().map(|value| value + 1000).collect::<Vec<_>>();
@@ -1079,6 +1133,98 @@ mod tests {
         predicate: Option<Arc<dyn PhysicalExpr>>,
         projection_columns: Vec<usize>,
         single_row_group_values: Option<Vec<i32>>,
+        /// Rows per row group for a multi-row-group file (takes precedence).
+        row_group_rows: Option<Vec<usize>>,
+        prefetch: bool,
+        shared_cache: Option<Arc<LiquidCacheParquet>>,
+        /// A file of any schema, one row group per batch (takes precedence).
+        custom_file: Option<CustomFile>,
+        /// Batch size of the cache and of the morselizer.
+        batch_size: usize,
+        /// Counts the bytes the scan requests from the file, footer excluded.
+        requested_bytes: Option<Arc<std::sync::atomic::AtomicU64>>,
+        access_plan: Option<ParquetAccessPlan>,
+    }
+
+    struct CustomFile {
+        schema: SchemaRef,
+        row_groups: Vec<RecordBatch>,
+        properties: Option<parquet::file::properties::WriterProperties>,
+    }
+
+    fn write_custom_file(path: &std::path::Path, file: &CustomFile) {
+        let mut writer = ArrowWriter::try_new(
+            File::create(path).unwrap(),
+            Arc::clone(&file.schema),
+            file.properties.clone(),
+        )
+        .unwrap();
+        for row_group in &file.row_groups {
+            writer.write(row_group).unwrap();
+            writer.flush().unwrap();
+        }
+        writer.close().unwrap();
+    }
+
+    type FileBytes = <object_store::PutPayload as IntoIterator>::Item;
+
+    #[derive(Debug)]
+    struct CountingReaderFactory {
+        inner: DefaultParquetFileReaderFactory,
+        requested_bytes: Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl ParquetFileReaderFactory for CountingReaderFactory {
+        fn create_reader(
+            &self,
+            partition_index: usize,
+            partitioned_file: PartitionedFile,
+            metadata_size_hint: Option<usize>,
+            metrics: &ExecutionPlanMetricsSet,
+        ) -> Result<Box<dyn AsyncFileReader + Send>> {
+            Ok(Box::new(CountingReader {
+                inner: self.inner.create_reader(
+                    partition_index,
+                    partitioned_file,
+                    metadata_size_hint,
+                    metrics,
+                )?,
+                requested_bytes: Arc::clone(&self.requested_bytes),
+            }))
+        }
+    }
+
+    struct CountingReader {
+        inner: Box<dyn AsyncFileReader + Send>,
+        requested_bytes: Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl AsyncFileReader for CountingReader {
+        fn get_bytes(
+            &mut self,
+            range: std::ops::Range<u64>,
+        ) -> BoxFuture<'_, parquet::errors::Result<FileBytes>> {
+            self.requested_bytes
+                .fetch_add(range.end - range.start, Ordering::Relaxed);
+            self.inner.get_bytes(range)
+        }
+
+        fn get_byte_ranges(
+            &mut self,
+            ranges: Vec<std::ops::Range<u64>>,
+        ) -> BoxFuture<'_, parquet::errors::Result<Vec<FileBytes>>> {
+            let bytes: u64 = ranges.iter().map(|range| range.end - range.start).sum();
+            self.requested_bytes.fetch_add(bytes, Ordering::Relaxed);
+            self.inner.get_byte_ranges(ranges)
+        }
+
+        fn get_metadata<'a>(
+            &'a mut self,
+            options: Option<&'a ArrowReaderOptions>,
+        ) -> BoxFuture<'a, parquet::errors::Result<Arc<parquet::file::metadata::ParquetMetaData>>>
+        {
+            self.inner.get_metadata(options)
+        }
     }
 
     impl Default for PlanOptions {
@@ -1089,6 +1235,13 @@ mod tests {
                 predicate: None,
                 projection_columns: vec![0, 1],
                 single_row_group_values: None,
+                row_group_rows: None,
+                prefetch: true,
+                shared_cache: None,
+                custom_file: None,
+                batch_size: 4,
+                requested_bytes: None,
+                access_plan: None,
             }
         }
     }
@@ -1098,10 +1251,19 @@ mod tests {
         max_memory_bytes: usize,
         max_disk_bytes: usize,
     ) -> Arc<LiquidCacheParquet> {
+        create_test_cache_with_batch_size(path, max_memory_bytes, max_disk_bytes, 4).await
+    }
+
+    async fn create_test_cache_with_batch_size(
+        path: &std::path::Path,
+        max_memory_bytes: usize,
+        max_disk_bytes: usize,
+        batch_size: usize,
+    ) -> Arc<LiquidCacheParquet> {
         let store = t4::mount(path.join("liquid_cache.t4")).await.unwrap();
         Arc::new(
             LiquidCacheParquet::new(
-                4,
+                batch_size,
                 max_memory_bytes,
                 max_disk_bytes,
                 store,
@@ -1114,39 +1276,60 @@ mod tests {
     }
 
     async fn prepare_test_file(options: PlanOptions) -> TestFilePlanner {
-        let schema = schema();
+        let schema = match &options.custom_file {
+            Some(custom) => Arc::clone(&custom.schema),
+            None => schema(),
+        };
         let tmp_dir = tempfile::tempdir().unwrap();
         let file_id = NEXT_FILE_ID.fetch_add(1, Ordering::Relaxed);
         let file_name = "data.parquet".to_string();
         let parquet_path = tmp_dir.path().join(&file_name);
-        if let Some(values) = options.single_row_group_values {
+        if let Some(custom) = &options.custom_file {
+            write_custom_file(&parquet_path, custom);
+        } else if let Some(rows) = options.row_group_rows {
+            write_row_groups_file(&parquet_path, Arc::clone(&schema), &rows);
+        } else if let Some(values) = options.single_row_group_values {
             write_single_row_group_file(&parquet_path, Arc::clone(&schema), values);
         } else {
             write_two_row_group_file(&parquet_path, Arc::clone(&schema));
         }
-        let partitioned_file = PartitionedFile::new(
+        let mut partitioned_file = PartitionedFile::new(
             file_name.clone(),
             std::fs::metadata(&parquet_path).unwrap().len(),
         );
+        if let Some(access_plan) = options.access_plan {
+            partitioned_file = partitioned_file.with_extension(access_plan);
+        }
         let object_store = Arc::new(LocalFileSystem::new_with_prefix(tmp_dir.path()).unwrap());
-        let cache = create_test_cache(
-            tmp_dir.path(),
-            options.max_memory_bytes,
-            options.max_disk_bytes,
-        )
-        .await;
+        let cache = match options.shared_cache {
+            Some(cache) => cache,
+            None => {
+                create_test_cache_with_batch_size(
+                    tmp_dir.path(),
+                    options.max_memory_bytes,
+                    options.max_disk_bytes,
+                    options.batch_size,
+                )
+                .await
+            }
+        };
+        let reader_factory: Arc<dyn ParquetFileReaderFactory> = match options.requested_bytes {
+            Some(requested_bytes) => Arc::new(CountingReaderFactory {
+                inner: DefaultParquetFileReaderFactory::new(object_store),
+                requested_bytes,
+            }),
+            None => Arc::new(DefaultParquetFileReaderFactory::new(object_store)),
+        };
         let metrics = ExecutionPlanMetricsSet::new();
         let object_store_url = ObjectStoreUrl::parse(format!("test-{file_id}:///")).unwrap();
         let morselizer = LiquidMorselizer {
             partition_index: 0,
             projection: ProjectionExprs::from_indices(&options.projection_columns, schema.as_ref()),
-            batch_size: 4,
+            batch_size: options.batch_size,
             predicate: options.predicate,
             table_schema: TableSchema::from(Arc::clone(&schema)),
             metrics: metrics.clone(),
-            parquet_file_reader_factory: Arc::new(DefaultParquetFileReaderFactory::new(
-                object_store,
-            )),
+            parquet_file_reader_factory: reader_factory,
             object_store_url: object_store_url.clone(),
             reorder_filters: false,
             enable_bloom_filter: true,
@@ -1154,7 +1337,7 @@ mod tests {
             expr_adapter_factory: Arc::new(DefaultPhysicalExprAdapterFactory),
             span: None,
             lineages: Arc::default(),
-            prefetch: true,
+            prefetch: options.prefetch,
         };
         let cached_file = cache.register_or_get_file(
             ParquetFileIdentity::new(object_store_url, file_name),
@@ -1748,5 +1931,629 @@ mod tests {
             .create_morselizer(object_store, &base_config, 0)
             .unwrap();
         assert!(morselizer.plan_file(file).is_ok());
+    }
+
+    // ---- snapshot memory-accounting reproductions ----
+
+    fn one_array_memory() -> usize {
+        Arc::new(Int32Array::from(vec![0, 1, 2, 3])).get_array_memory_size()
+    }
+
+    #[tokio::test]
+    async fn repro_prefetch_snapshots_exceed_memory_budget() {
+        use crate::cache::snapshot_test_registry::live_totals;
+        const ROWS: usize = 128; // 32 batches of 4 rows, 2 columns
+        let max = one_array_memory() * 4; // two batches of two columns
+        let file = prepare_test_file(PlanOptions {
+            max_memory_bytes: max,
+            row_group_rows: Some(vec![ROWS, ROWS]),
+            ..Default::default()
+        })
+        .await;
+
+        // Completes the (ungated) prefetch of row group 0.
+        let chain = advance_to_row_group_chain(file.planner).await;
+        let (maps, entries, s) = live_totals();
+        let b = file.cache.memory_usage_bytes();
+        println!(
+            "[prefetch rg0] max_memory_bytes={max} snapshot_maps={maps} snapshot_entries={entries} \
+             S(snapshot bytes)={s} B(cache memory_usage_bytes)={b} S+B={} S/max={:.2}",
+            s + b,
+            s as f64 / max as f64
+        );
+
+        // Plan row group 0's morsel; the gate decides whether row group 1 is prefetched.
+        let mut first = chain.plan().unwrap().unwrap();
+        let morsels = first.take_morsels();
+        let gate_passed = match first.take_pending_planner() {
+            Some(pending) => {
+                let _next = pending.await.unwrap();
+                let (maps, entries, s2) = live_totals();
+                let b2 = file.cache.memory_usage_bytes();
+                println!(
+                    "[prefetch rg1, rg0 morsel alive] max_memory_bytes={max} snapshot_maps={maps} \
+                     snapshot_entries={entries} S={s2} B={b2} S+B={} S/max={:.2}",
+                    s2 + b2,
+                    s2 as f64 / max as f64
+                );
+                true
+            }
+            None => false,
+        };
+        println!("[prefetch rg1] headroom gate passed = {gate_passed}");
+        drop(morsels);
+
+        assert!(
+            b <= max,
+            "cache itself is over budget: B={b} max={max} (not the claim under test)"
+        );
+        assert!(
+            s + b <= max,
+            "snapshots pin memory outside the budget: S={s} + B={b} = {} > max_memory_bytes={max} \
+             ({entries} snapshot entries, S/max={:.2})",
+            s + b,
+            s as f64 / max as f64
+        );
+    }
+
+    #[tokio::test]
+    async fn repro_cache_full_reader_parks_whole_row_group_in_snapshots() {
+        use crate::cache::snapshot_test_registry::live_totals;
+        const ROWS: usize = 64; // K = 16 batches of 4 rows, 2 columns
+        let file = prepare_test_file(PlanOptions {
+            max_memory_bytes: 1,
+            max_disk_bytes: 0,
+            row_group_rows: Some(vec![ROWS]),
+            prefetch: false,
+            ..Default::default()
+        })
+        .await;
+        let max = file.cache.max_memory_bytes();
+        let mut morsels = drive_planner(file.planner).await;
+        assert_eq!(morsels.len(), 1);
+        let mut stream = morsels.pop().unwrap().into_stream();
+
+        let mut batches = 0;
+        let mut after_last = (0, 0, 0);
+        while let Some(batch) = stream.next().await {
+            batch.unwrap();
+            batches += 1;
+            after_last = live_totals();
+            println!(
+                "[cache-full] after batch {batches}: snapshot_entries={} snapshot_bytes={}",
+                after_last.1, after_last.2
+            );
+        }
+        let after_end = live_totals();
+        let b = file.cache.memory_usage_bytes();
+        println!(
+            "[cache-full] K={batches} batches; after last batch: entries={} bytes={}; \
+             after stream end (not dropped): entries={} bytes={}; \
+             cache memory_usage_bytes={b} max_memory_bytes={max} disk_usage_bytes={}",
+            after_last.1,
+            after_last.2,
+            after_end.1,
+            after_end.2,
+            file.cache.disk_usage_bytes()
+        );
+        assert_eq!(batches, ROWS / 4);
+        drop(stream);
+        println!("[cache-full] after stream drop: {:?}", live_totals());
+
+        let one_batch_entries = 2; // two columns
+        assert!(
+            after_last.1 <= one_batch_entries,
+            "CacheFull path parked {} entries ({} bytes) in the snapshot map after {batches} \
+             batches; expected at most {one_batch_entries} (one batch). \
+             cache memory_usage_bytes={b}, max_memory_bytes={max}",
+            after_last.1,
+            after_last.2
+        );
+    }
+
+    #[tokio::test]
+    async fn repro_concurrent_prefetch_snapshots_exceed_memory_budget() {
+        use crate::cache::snapshot_test_registry::live_totals;
+        const PARTITIONS: usize = 4;
+        const ROWS: usize = 128; // 32 batches, 2 columns per row group
+        // Decoded size of one row group: headroom for about one prefetch.
+        let max = one_array_memory() * 2 * (ROWS / 4);
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = create_test_cache(cache_dir.path(), max, usize::MAX).await;
+
+        let mut files = Vec::new();
+        for _ in 0..PARTITIONS {
+            files.push(
+                prepare_test_file(PlanOptions {
+                    row_group_rows: Some(vec![ROWS, ROWS]),
+                    shared_cache: Some(Arc::clone(&cache)),
+                    ..Default::default()
+                })
+                .await,
+            );
+        }
+        let mut keep = Vec::new();
+        let mut planners = Vec::new();
+        for file in files {
+            planners.push(file.planner);
+            keep.push((file.cached_file, file.tmp_dir));
+        }
+
+        // First row group of every file: prefetched concurrently, never gated.
+        let chains =
+            futures::future::join_all(planners.into_iter().map(advance_to_row_group_chain)).await;
+        let (maps, entries, s) = live_totals();
+        let b = cache.memory_usage_bytes();
+        println!(
+            "[concurrent rg0 x{PARTITIONS}] max_memory_bytes={max} snapshot_maps={maps} \
+             snapshot_entries={entries} S={s} B={b} S+B={} S/max={:.2}",
+            s + b,
+            s as f64 / max as f64
+        );
+
+        // Second row group: gated on headroom, with no reservation.
+        let mut morsels = Vec::new();
+        let mut pending = Vec::new();
+        let mut skipped = 0;
+        for chain in chains {
+            let mut plan = chain.plan().unwrap().unwrap();
+            morsels.extend(plan.take_morsels());
+            match plan.take_pending_planner() {
+                Some(future) => pending.push(future),
+                None => skipped += 1,
+            }
+        }
+        let admitted = pending.len();
+        let _next = futures::future::join_all(pending).await;
+        let (maps2, entries2, s2) = live_totals();
+        let b2 = cache.memory_usage_bytes();
+        println!(
+            "[concurrent rg1] gate admitted={admitted} skipped={skipped}; snapshot_maps={maps2} \
+             snapshot_entries={entries2} S={s2} B={b2} S+B={} S/max={:.2} (rg0 morsels still alive)",
+            s2 + b2,
+            s2 as f64 / max as f64
+        );
+        drop(morsels);
+        drop(keep);
+
+        assert!(
+            s + b <= max,
+            "{PARTITIONS} concurrent prefetches pin S={s} snapshot bytes + B={b} cache bytes = {} \
+             > max_memory_bytes={max} (S/max={:.2}); after rg1: S={s2} B={b2}, gate \
+             admitted={admitted} skipped={skipped}",
+            s + b,
+            s as f64 / max as f64
+        );
+    }
+
+    // ---- audit: memory accounting of the DataFusion layer ----
+
+    async fn drain_morsels(morsels: Vec<Box<dyn Morsel>>) -> usize {
+        let mut rows = 0;
+        for morsel in morsels {
+            let mut stream = morsel.into_stream();
+            while let Some(batch) = stream.next().await {
+                rows += batch.unwrap().num_rows();
+            }
+        }
+        rows
+    }
+
+    fn file_metadata(path: &std::path::Path) -> Arc<parquet::file::metadata::ParquetMetaData> {
+        Arc::clone(
+            parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+                File::open(path).unwrap(),
+            )
+            .unwrap()
+            .metadata(),
+        )
+    }
+
+    /// Finding 2: a snapshot pins the array a cache entry held, so evicting the
+    /// entry releases the budget and none of the memory.
+    #[tokio::test]
+    async fn audit_evicting_snapshotted_entries_releases_or_charges_them() {
+        use crate::cache::snapshot_test_registry::live_totals;
+        const ROWS: usize = 128; // 32 batches of 4 rows, 2 columns
+        let file = prepare_test_file(PlanOptions {
+            row_group_rows: Some(vec![ROWS, ROWS]),
+            ..Default::default()
+        })
+        .await;
+        // Prefetches row group 0: every batch is cached and snapshotted.
+        let chain = advance_to_row_group_chain(file.planner).await;
+        let (_, entries_before, s_before) = live_totals();
+        let b_before = file.cache.memory_usage_bytes();
+        let mut cached_arrays = Vec::new();
+        file.cache.storage().for_each_entry(|_, entry| {
+            if let liquid_cache::cache::CacheEntry::MemoryArrow(array) = entry {
+                cached_arrays.push(Arc::downgrade(array));
+            }
+        });
+
+        // Evict everything the cache holds.
+        file.cache.flush_data().await.unwrap();
+
+        let (_, entries_after, s_after) = live_totals();
+        let b_after = file.cache.memory_usage_bytes();
+        let still_allocated = cached_arrays
+            .iter()
+            .filter(|array| array.upgrade().is_some())
+            .count();
+        println!(
+            "[audit evict] before flush: snapshot_entries={entries_before} S={s_before} \
+             B(memory_usage_bytes)={b_before} cached_memory_arrays={}; after flush_data: \
+             snapshot_entries={entries_after} S={s_after} B={b_after} disk_usage_bytes={} \
+             evicted_arrays_still_allocated={still_allocated}/{}",
+            cached_arrays.len(),
+            file.cache.disk_usage_bytes(),
+            cached_arrays.len()
+        );
+        assert!(entries_before > 0, "prefetch produced no snapshots");
+        assert!(
+            s_after == 0 || b_after >= s_after,
+            "eviction freed the budget but none of the memory: after flush_data the cache charges \
+             B={b_after} bytes (was {b_before}) while {entries_after} snapshot entries still pin \
+             S={s_after} bytes (was {s_before}); {still_allocated}/{} evicted arrays are still \
+             allocated",
+            cached_arrays.len()
+        );
+        drop(chain);
+    }
+
+    /// Finding 3: `estimated_bytes` sums parquet `uncompressed_size`, which for a
+    /// dictionary/RLE string column is a small fraction of the decoded Arrow size.
+    #[tokio::test]
+    async fn audit_prefetch_estimate_covers_decoded_dictionary_strings() {
+        use crate::cache::snapshot_test_registry::live_totals;
+        const BATCH: usize = 8192;
+        const ROWS: usize = BATCH * 4;
+        const DISTINCT: usize = 20;
+        let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, false)]));
+        let values = (0..ROWS)
+            .map(|row| format!("{:0>64}", row % DISTINCT))
+            .collect::<Vec<_>>();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(arrow::array::StringArray::from(values))],
+        )
+        .unwrap();
+        let file = prepare_test_file(PlanOptions {
+            custom_file: Some(CustomFile {
+                schema,
+                row_groups: vec![batch],
+                properties: None,
+            }),
+            batch_size: BATCH,
+            projection_columns: vec![0],
+            ..Default::default()
+        })
+        .await;
+        let path = file.tmp_dir.path().join("data.parquet");
+
+        // Prefetches the only row group into snapshots (the budget is unlimited).
+        let chain = advance_to_row_group_chain(file.planner).await;
+        let estimates = super::test_estimates::last();
+        let estimate = estimates[0].1;
+        let (_, snapshot_entries, snapshot_bytes) = live_totals();
+
+        // Independent decode of the same row group at the cache's batch size.
+        let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+            File::open(&path).unwrap(),
+        )
+        .unwrap()
+        .with_batch_size(BATCH)
+        .build()
+        .unwrap();
+        let mut decoded = 0;
+        for batch in reader {
+            decoded += batch.unwrap().column(0).get_array_memory_size();
+        }
+        let metadata = file_metadata(&path);
+        let column = metadata.row_group(0).column(0);
+        println!(
+            "[audit estimate] rows={ROWS} distinct={DISTINCT} value_len=64 cache_type={:?} \
+             encodings={:?} parquet compressed_size={} uncompressed_size={} \
+             estimated_bytes={estimate} snapshot_entries={snapshot_entries} \
+             snapshot_bytes(actual prefetch)={snapshot_bytes} decoded_arrow_bytes(plain reader)=\
+             {decoded} estimate/snapshot={:.4} estimate/decoded={:.4}",
+            file.cached_file.schema().field(0).data_type(),
+            column.encodings().collect::<Vec<_>>(),
+            column.compressed_size(),
+            column.uncompressed_size(),
+            estimate as f64 / snapshot_bytes as f64,
+            estimate as f64 / decoded as f64
+        );
+        assert_eq!(estimates.len(), 1);
+        assert_eq!(
+            snapshot_entries,
+            ROWS / BATCH,
+            "prefetch did not snapshot the whole row group"
+        );
+        assert!(
+            estimate * 2 >= snapshot_bytes,
+            "prefetch estimate {estimate} bytes is {:.4}x the {snapshot_bytes} bytes the prefetch \
+             actually pinned ({decoded} bytes decoded by a plain reader, ratio {:.4}); expected \
+             at least 0.5x",
+            estimate as f64 / snapshot_bytes as f64,
+            estimate as f64 / decoded as f64
+        );
+        drop(chain);
+    }
+
+    /// Finding 4: the first row group of a file is prefetched without asking
+    /// whether the cache has room for it.
+    #[tokio::test]
+    async fn audit_first_row_group_prefetch_is_bounded_by_headroom() {
+        use crate::cache::snapshot_test_registry::live_totals;
+        const ROWS: usize = 128; // 32 batches of 4 rows, 2 columns
+        let row_group_bytes = one_array_memory() * 2 * (ROWS / 4);
+
+        // Scenario A: a cache sized for one row group, filled by another file.
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = create_test_cache(cache_dir.path(), row_group_bytes, usize::MAX).await;
+        let warm = prepare_test_file(PlanOptions {
+            row_group_rows: Some(vec![ROWS]),
+            prefetch: false,
+            shared_cache: Some(Arc::clone(&cache)),
+            ..Default::default()
+        })
+        .await;
+        let warm_rows = drain_morsels(drive_planner(warm.planner).await).await;
+        let (_, _, leftover) = live_totals();
+        let max = cache.max_memory_bytes();
+        let used = cache.memory_usage_bytes();
+        let headroom = max.saturating_sub(used);
+
+        let cold = prepare_test_file(PlanOptions {
+            row_group_rows: Some(vec![ROWS, ROWS]),
+            shared_cache: Some(Arc::clone(&cache)),
+            ..Default::default()
+        })
+        .await;
+        let chain_a = advance_to_row_group_chain(cold.planner).await;
+        let estimate = super::test_estimates::last()[0].1;
+        let (_, entries_a, total_a) = live_totals();
+        let s_a = total_a - leftover;
+        let b_a = cache.memory_usage_bytes();
+        println!(
+            "[audit first rg / full cache] warm_rows={warm_rows} max_memory_bytes={max} \
+             used_before_open={used} headroom_before_open={headroom} estimated_bytes(rg0)=\
+             {estimate} -> after open: snapshot_entries={entries_a} S={s_a} B={b_a} S+B={} \
+             (S+B)/max={:.2} disk_usage_bytes={}",
+            s_a + b_a,
+            (s_a + b_a) as f64 / max as f64,
+            cache.disk_usage_bytes()
+        );
+
+        // Scenario B: nothing can be cached at all (1 byte of memory, no disk).
+        let full = prepare_test_file(PlanOptions {
+            max_memory_bytes: 1,
+            max_disk_bytes: 0,
+            row_group_rows: Some(vec![ROWS, ROWS]),
+            ..Default::default()
+        })
+        .await;
+        let chain_b = advance_to_row_group_chain(full.planner).await;
+        let estimate_b = super::test_estimates::last()[0].1;
+        let (_, entries_total, total_b) = live_totals();
+        let (entries_b, s_b) = (entries_total - entries_a, total_b - total_a);
+        println!(
+            "[audit first rg / 1-byte cache] max_memory_bytes=1 max_disk_bytes=0 headroom=1 \
+             estimated_bytes(rg0)={estimate_b} -> after open: snapshot_entries={entries_b} \
+             S={s_b} B={}",
+            full.cache.memory_usage_bytes()
+        );
+
+        assert!(
+            s_a <= headroom && s_b <= 1,
+            "first-row-group prefetch ignores headroom: (A) cache at {used}/{max} bytes \
+             (headroom {headroom}, estimate {estimate}) still pinned S={s_a} bytes in \
+             {entries_a} snapshot entries, S+B={} = {:.2}x max; (B) a 1-byte cache with no disk \
+             (headroom 1, estimate {estimate_b}) pinned S={s_b} bytes in {entries_b} entries",
+            s_a + b_a,
+            (s_a + b_a) as f64 / max as f64
+        );
+        drop((chain_a, chain_b));
+    }
+
+    fn deduplicated_bytes(
+        data: &arrow::array::ArrayData,
+        seen: &mut std::collections::HashSet<usize>,
+    ) -> usize {
+        let mut bytes = 0;
+        for buffer in data.buffers() {
+            if seen.insert(buffer.data_ptr().as_ptr() as usize) {
+                bytes += buffer.capacity();
+            }
+        }
+        if let Some(nulls) = data.nulls() {
+            let buffer = nulls.buffer();
+            if seen.insert(buffer.data_ptr().as_ptr() as usize) {
+                bytes += buffer.capacity();
+            }
+        }
+        for child in data.child_data() {
+            bytes += deduplicated_bytes(child, seen);
+        }
+        bytes
+    }
+
+    /// Finding 8: every batch of a dictionary column shares one values buffer,
+    /// and each cache entry is charged for all of it.
+    #[tokio::test]
+    async fn audit_shared_dictionary_is_charged_once() {
+        const BATCH: usize = 1024;
+        const BATCHES: usize = 32;
+        const DISTINCT: usize = 4096;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "d",
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            false,
+        )]));
+        let dictionary = arrow::array::StringArray::from(
+            (0..DISTINCT)
+                .map(|value| format!("{value:0>256}"))
+                .collect::<Vec<_>>(),
+        );
+        let dictionary_bytes = dictionary.get_array_memory_size();
+        let keys = Int32Array::from_iter_values(
+            (0..BATCH * BATCHES).map(|row| (row.wrapping_mul(2654435761) % DISTINCT) as i32),
+        );
+        let array = arrow::array::DictionaryArray::<arrow::datatypes::Int32Type>::try_new(
+            keys,
+            Arc::new(dictionary),
+        )
+        .unwrap();
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(array)]).unwrap();
+        let file = prepare_test_file(PlanOptions {
+            custom_file: Some(CustomFile {
+                schema,
+                row_groups: vec![batch],
+                properties: Some(
+                    parquet::file::properties::WriterProperties::builder()
+                        .set_dictionary_page_size_limit(8 << 20)
+                        .build(),
+                ),
+            }),
+            batch_size: BATCH,
+            projection_columns: vec![0],
+            prefetch: false,
+            ..Default::default()
+        })
+        .await;
+        let path = file.tmp_dir.path().join("data.parquet");
+        let rows = drain_morsels(drive_planner(file.planner).await).await;
+        assert_eq!(rows, BATCH * BATCHES);
+
+        let mut seen = std::collections::HashSet::new();
+        let mut entries = 0;
+        let mut summed = 0;
+        let mut deduplicated = 0;
+        let mut kinds = std::collections::BTreeSet::new();
+        file.cache.storage().for_each_entry(|_, entry| {
+            entries += 1;
+            summed += entry.memory_usage_bytes();
+            match entry {
+                liquid_cache::cache::CacheEntry::MemoryArrow(array) => {
+                    kinds.insert(format!("MemoryArrow({})", array.data_type()));
+                    deduplicated += deduplicated_bytes(&array.to_data(), &mut seen);
+                }
+                other => {
+                    kinds.insert(format!("{other}"));
+                    deduplicated += other.memory_usage_bytes();
+                }
+            }
+        });
+        let charged = file.cache.memory_usage_bytes();
+        let metadata = file_metadata(&path);
+        let column = metadata.row_group(0).column(0);
+        println!(
+            "[audit dictionary] batches={BATCHES} rows_per_batch={BATCH} dictionary_values=\
+             {DISTINCT} dictionary_bytes={dictionary_bytes} parquet encodings={:?} \
+             uncompressed_size={} cache_entries={entries} kinds={kinds:?} distinct_buffers={} \
+             charged(memory_usage_bytes)={charged} sum_over_entries={summed} \
+             deduplicated_real_bytes={deduplicated} charged/real={:.2} \
+             charged/dictionary={:.2}",
+            column.encodings().collect::<Vec<_>>(),
+            column.uncompressed_size(),
+            seen.len(),
+            charged as f64 / deduplicated as f64,
+            charged as f64 / dictionary_bytes as f64
+        );
+        assert_eq!(entries, BATCHES);
+        assert!(
+            charged <= 2 * deduplicated,
+            "cache charges {charged} bytes for {entries} batches that really hold \
+             {deduplicated} bytes ({} distinct buffers): {:.2}x, i.e. {:.2}x the \
+             {dictionary_bytes}-byte dictionary",
+            seen.len(),
+            charged as f64 / deduplicated as f64,
+            charged as f64 / dictionary_bytes as f64
+        );
+    }
+
+    /// Finding 10: a cache miss on one batch rebuilds the parquet stream over the
+    /// rest of the row group, and that stream fetches all of it up front.
+    #[tokio::test]
+    async fn audit_fallback_fetches_only_the_selected_batch() {
+        use parquet::arrow::arrow_reader::RowSelector;
+        const BATCH: usize = 1024;
+        const BATCHES: usize = 100;
+        const TARGET: usize = 50;
+        let rows = BATCH * BATCHES;
+        let schema = schema();
+        let scrambled = |seed: u32| {
+            Int32Array::from_iter_values(
+                (0..rows as u32).map(move |row| (row ^ seed).wrapping_mul(2654435761) as i32),
+            )
+        };
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(scrambled(0)), Arc::new(scrambled(0x5bd1e995))],
+        )
+        .unwrap();
+        let mut access_plan = ParquetAccessPlan::new_all(1);
+        access_plan.scan_selection(
+            0,
+            RowSelection::from(vec![
+                RowSelector::skip(TARGET * BATCH),
+                RowSelector::select(BATCH),
+                RowSelector::skip(rows - (TARGET + 1) * BATCH),
+            ]),
+        );
+        let requested = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let file = prepare_test_file(PlanOptions {
+            custom_file: Some(CustomFile {
+                schema,
+                row_groups: vec![batch],
+                properties: Some(
+                    parquet::file::properties::WriterProperties::builder()
+                        .set_dictionary_enabled(false)
+                        .set_data_page_row_count_limit(BATCH)
+                        .set_write_batch_size(BATCH)
+                        .build(),
+                ),
+            }),
+            batch_size: BATCH,
+            prefetch: false,
+            requested_bytes: Some(Arc::clone(&requested)),
+            access_plan: Some(access_plan),
+            ..Default::default()
+        })
+        .await;
+        let path = file.tmp_dir.path().join("data.parquet");
+
+        let morsels = drive_planner(file.planner).await;
+        let planning_bytes = requested.swap(0, Ordering::Relaxed);
+        let produced = drain_morsels(morsels).await;
+        let scan_bytes = requested.load(Ordering::Relaxed) as usize;
+
+        let metadata = file_metadata(&path);
+        let row_group = metadata.row_group(0);
+        let chunk_bytes: usize = row_group
+            .columns()
+            .iter()
+            .map(|column| column.compressed_size() as usize)
+            .sum();
+        let share = chunk_bytes / BATCHES;
+        println!(
+            "[audit fallback] row_group_rows={rows} batches={BATCHES} selected_batch={TARGET} \
+             rows_produced={produced} column_chunk_bytes(2 columns)={chunk_bytes} \
+             one_batch_share={share} bytes_requested_planning={planning_bytes} \
+             bytes_requested_scan={scan_bytes} scan/share={:.1} scan/row_group={:.2} \
+             cache_entries={}",
+            scan_bytes as f64 / share as f64,
+            scan_bytes as f64 / chunk_bytes as f64,
+            file.cache.storage().stats().total_entries
+        );
+        assert_eq!(produced, BATCH);
+        assert!(
+            scan_bytes <= 3 * share,
+            "reading 1 of {BATCHES} batches requested {scan_bytes} bytes = {:.1}x that batch's \
+             {share}-byte share ({:.0}% of the {chunk_bytes}-byte row group); expected <= 3x",
+            scan_bytes as f64 / share as f64,
+            100.0 * scan_bytes as f64 / chunk_bytes as f64
+        );
     }
 }

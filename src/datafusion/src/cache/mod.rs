@@ -86,6 +86,59 @@ impl RowGroupSnapshots {
     }
 }
 
+#[cfg(test)]
+impl RowGroupSnapshots {
+    /// Test-only: (entry count, sum of `CacheEntry::memory_usage_bytes`).
+    pub(crate) fn test_entry_count_and_bytes(&self) -> (usize, usize) {
+        let entries = self.entries.read().unwrap();
+        let bytes = entries.values().map(|e| e.memory_usage_bytes()).sum();
+        (entries.len(), bytes)
+    }
+}
+
+/// Test-only registry of every snapshot map handed to a row group on this
+/// thread. `#[tokio::test]` is single-threaded, so each test sees only its own.
+#[cfg(test)]
+pub(crate) mod snapshot_test_registry {
+    use super::RowGroupSnapshots;
+    use std::cell::RefCell;
+    use std::sync::{Arc, Weak};
+
+    thread_local! {
+        static LIVE: RefCell<Vec<Weak<RowGroupSnapshots>>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(crate) fn register(snapshots: &Arc<RowGroupSnapshots>) {
+        LIVE.with(|live| {
+            let mut live = live.borrow_mut();
+            let ptr = Arc::as_ptr(snapshots);
+            if !live.iter().any(|weak| weak.as_ptr() == ptr) {
+                live.push(Arc::downgrade(snapshots));
+            }
+        });
+    }
+
+    /// (live non-empty maps, entries, bytes) over maps that are still alive.
+    pub(crate) fn live_totals() -> (usize, usize, usize) {
+        LIVE.with(|live| {
+            let mut maps = 0;
+            let mut entries = 0;
+            let mut bytes = 0;
+            for weak in live.borrow().iter() {
+                if let Some(snapshots) = weak.upgrade() {
+                    let (count, size) = snapshots.test_entry_count_and_bytes();
+                    if count > 0 {
+                        maps += 1;
+                    }
+                    entries += count;
+                    bytes += size;
+                }
+            }
+            (maps, entries, bytes)
+        })
+    }
+}
+
 #[derive(Default, Debug)]
 struct ColumnMaps {
     // invariant: Arc::ptr_eq(map[field.name()], map[field.id()])
@@ -334,6 +387,9 @@ impl CachedFile {
             })
             .collect();
 
+        #[cfg(test)]
+        snapshot_test_registry::register(&snapshots);
+
         Arc::new(CachedRowGroup::new(
             self.cache_store.clone(),
             row_group_id,
@@ -366,6 +422,10 @@ pub struct LiquidCacheParquet {
     cache_store: Arc<LiquidCache>,
 
     current_file_id: AtomicU64,
+
+    /// Test-only handle on the lineage metadata the core cache owns.
+    #[cfg(test)]
+    test_metadata: Arc<ParquetCacheMetadata>,
 }
 
 /// A reference to the main cache structure.
@@ -410,6 +470,8 @@ impl LiquidCacheParquet {
     ) -> Self {
         assert!(batch_size.is_power_of_two());
         let metadata = Arc::new(ParquetCacheMetadata::new());
+        #[cfg(test)]
+        let test_metadata = Arc::clone(&metadata);
         let cache_storage = LiquidCacheBuilder::new()
             .with_batch_size(batch_size)
             .with_max_memory_bytes(max_memory_bytes)
@@ -427,6 +489,8 @@ impl LiquidCacheParquet {
             files: Mutex::new(AHashMap::new()),
             cache_store: cache_storage,
             current_file_id: AtomicU64::new(0),
+            #[cfg(test)]
+            test_metadata,
         }
     }
 
@@ -1021,5 +1085,207 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(read.as_ref(), colliding_data.as_ref());
+    }
+
+    // ---- audit: unbounded maps, file-id aliasing, insert race ----
+
+    async fn audit_cache(batch_size: usize, dir: &std::path::Path) -> Arc<LiquidCacheParquet> {
+        let store = t4::mount(dir.join("liquid_cache.t4")).await.unwrap();
+        Arc::new(
+            LiquidCacheParquet::new(
+                batch_size,
+                usize::MAX,
+                usize::MAX,
+                store,
+                Box::new(LiquidPolicy::new()),
+                Box::new(TranscodeEvict),
+                Box::new(AlwaysHydrate::new()),
+            )
+            .await,
+        )
+    }
+
+    fn audit_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]))
+    }
+
+    fn audit_identity(file: usize) -> ParquetFileIdentity {
+        ParquetFileIdentity::new(
+            ObjectStoreUrl::local_filesystem(),
+            format!("audit/file-{file}.parquet"),
+        )
+    }
+
+    /// Finding 5: `expression_hints` gains one key per (file, row group,
+    /// predicate column) and nothing ever removes one.
+    #[tokio::test]
+    async fn audit_expression_hints_are_pruned_when_cache_is_emptied() {
+        const FILES: usize = 50;
+        const ROW_GROUPS: u64 = 20;
+        let dir = tempfile::tempdir().unwrap();
+        let cache = audit_cache(1024, dir.path()).await;
+        for file in 0..FILES {
+            let file = cache.register_or_get_file(audit_identity(file), audit_schema());
+            for row_group in 0..ROW_GROUPS {
+                // Column 0 is a predicate column; no data is ever inserted.
+                drop(file.create_row_group(row_group, vec![0]));
+            }
+        }
+        let registered = cache.test_metadata.test_hint_counts();
+        cache.flush_data().await.unwrap();
+        let after_flush = cache.test_metadata.test_hint_counts();
+        let entries_before_reset = cache.storage().stats().total_entries;
+        unsafe { cache.reset() };
+        let after_reset = cache.test_metadata.test_hint_counts();
+        println!(
+            "[audit hints] files={FILES} row_groups={ROW_GROUPS} predicate_columns=1 \
+             cache_entries={entries_before_reset} leased_file_ids_after_reset={} \
+             hint (columns, expressions, longest_history): registered={registered:?} \
+             after_flush_data={after_flush:?} after_reset={after_reset:?}",
+            cache.leased_file_ids()
+        );
+        assert_eq!(
+            after_reset.0, 0,
+            "expression_hints still tracks {} column paths ({} expressions) after flush_data() + \
+             reset() of a cache holding {entries_before_reset} entries; registered={}",
+            after_reset.0, after_reset.1, registered.0
+        );
+    }
+
+    /// Finding 5, second half: the per-column history is capped (claimed cap 16).
+    /// Expected to PASS: it verifies the cap rather than refuting it.
+    #[tokio::test]
+    async fn audit_expression_hint_history_is_capped_per_column() {
+        const CALLS: usize = 1000;
+        let dir = tempfile::tempdir().unwrap();
+        let cache = audit_cache(1024, dir.path()).await;
+        let file = cache.register_or_get_file(audit_identity(0), audit_schema());
+        for _ in 0..CALLS {
+            drop(file.create_row_group(0, vec![0]));
+        }
+        let (columns, expressions, longest) = cache.test_metadata.test_hint_counts();
+        println!(
+            "[audit hints cap] {CALLS} constructions of one row group: columns={columns} \
+             expressions={expressions} longest_history={longest}"
+        );
+        assert_eq!(columns, 1);
+        assert!(
+            longest <= 16,
+            "history grew to {longest} after {CALLS} constructions"
+        );
+    }
+
+    /// Finding 6a: `files` gains an entry per distinct file and only `reset()`
+    /// ever removes one.
+    #[tokio::test]
+    async fn audit_file_registry_shrinks_once_files_hold_no_data() {
+        const FILES: usize = 10_000;
+        let dir = tempfile::tempdir().unwrap();
+        let cache = audit_cache(1024, dir.path()).await;
+        for file in 0..FILES {
+            drop(cache.register_or_get_file(audit_identity(file), audit_schema()));
+        }
+        let registered = cache.leased_file_ids();
+        cache.flush_data().await.unwrap();
+        let after_flush = cache.leased_file_ids();
+        let stats = cache.storage().stats();
+        println!(
+            "[audit files] registered={registered} leased_file_ids after flush_data={after_flush} \
+             cache_entries={} memory_usage_bytes={} disk_usage_bytes={} (no handle alive, no data)",
+            stats.total_entries, stats.memory_usage_bytes, stats.disk_usage_bytes
+        );
+        assert_eq!(
+            after_flush, 0,
+            "files map still holds {after_flush} of {registered} identities although the cache \
+             has {} entries and every CachedFile handle was dropped",
+            stats.total_entries
+        );
+    }
+
+    /// Finding 7: `CachedColumn::insert` is `contains` then insert, so tasks that
+    /// miss the same batch together all insert it.
+    #[test]
+    fn audit_concurrent_inserts_keep_budget_equal_to_entries() {
+        const ROUNDS: usize = 4000;
+        const THREADS: usize = 4;
+        const ROWS: usize = 1024;
+        let dir = tempfile::tempdir().unwrap();
+        let setup = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let cache = setup.block_on(audit_cache(ROWS, dir.path()));
+        let file = cache.register_or_get_file(audit_identity(0), audit_schema());
+        let column = file.create_row_group(0, vec![]).get_column(0).unwrap();
+        let barrier = std::sync::Barrier::new(THREADS);
+
+        let accepted: Vec<Vec<bool>> = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..THREADS)
+                .map(|thread| {
+                    let column = &column;
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        let runtime = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .unwrap();
+                        let mut accepted = Vec::with_capacity(ROUNDS);
+                        for round in 0..ROUNDS {
+                            let array: ArrayRef = Arc::new(Int32Array::from_iter_values(
+                                (0..ROWS).map(|row| (row * (thread + 1) + round) as i32),
+                            ));
+                            barrier.wait();
+                            let result = runtime
+                                .block_on(column.insert(BatchID::from_raw(round as u16), array));
+                            accepted.push(result.is_ok());
+                        }
+                        accepted
+                    })
+                })
+                .collect();
+            workers.into_iter().map(|w| w.join().unwrap()).collect()
+        });
+
+        let mut double_inserts = 0usize;
+        let mut extra_inserts = 0usize;
+        for round in 0..ROUNDS {
+            let ok = accepted.iter().filter(|thread| thread[round]).count();
+            assert!(ok >= 1, "round {round}: nobody inserted");
+            if ok > 1 {
+                double_inserts += 1;
+                extra_inserts += ok - 1;
+            }
+        }
+        let charged = cache.memory_usage_bytes();
+        let mut held = 0usize;
+        let mut entries = 0usize;
+        cache.storage().for_each_entry(|_, entry| {
+            entries += 1;
+            held += entry.memory_usage_bytes();
+        });
+        let one = Int32Array::from_iter_values(0..ROWS as i32).get_array_memory_size();
+        println!(
+            "[audit double insert] rounds={ROUNDS} threads={THREADS} \
+             rounds_with_more_than_one_accepted_insert={double_inserts} ({:.1}%) \
+             extra_inserts={extra_inserts} entries={entries} one_array_bytes={one} \
+             charged(memory_usage_bytes)={charged} held(sum over entries)={held} \
+             overcharge={} ({:.2} arrays)",
+            100.0 * double_inserts as f64 / ROUNDS as f64,
+            charged as i64 - held as i64,
+            (charged as f64 - held as f64) / one as f64
+        );
+        assert_eq!(entries, ROUNDS);
+        assert_eq!(
+            charged,
+            held,
+            "budget charges {charged} bytes but entries hold {held}: {} bytes ({:.2} arrays) \
+             charged for nothing after {double_inserts}/{ROUNDS} rounds accepted more than one \
+             insert of the same batch ({extra_inserts} extra inserts)",
+            charged as i64 - held as i64,
+            (charged as f64 - held as f64) / one as f64
+        );
     }
 }

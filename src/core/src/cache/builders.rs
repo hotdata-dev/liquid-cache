@@ -136,6 +136,8 @@ impl LiquidCacheBuilder {
             Some(store) => store,
             None => {
                 let cache_dir = tempfile::tempdir().unwrap().keep();
+                #[cfg(test)]
+                AUDIT_TEMP_DIRS.with(|dirs| dirs.borrow_mut().push(cache_dir.clone()));
                 let store_path = cache_dir.join("liquid_cache.t4");
                 t4::mount(&store_path)
                     .await
@@ -158,6 +160,17 @@ impl LiquidCacheBuilder {
         ))
     }
 }
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: the temporary directories `build()` created on this thread.
+    pub(crate) static AUDIT_TEMP_DIRS: std::cell::RefCell<Vec<std::path::PathBuf>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+#[path = "builders_audit_tests.rs"]
+mod audit_tests;
 
 /// Returns half of the total system memory in bytes.
 ///
@@ -516,5 +529,56 @@ mod tests {
             .unwrap()
             .as_string_view();
         assert_eq!(typed_str_out.value(0), "s1");
+    }
+
+    /// The memory limit the kernel enforces on this process's cgroup, if it
+    /// is finite: cgroup v2 first, then v1.
+    #[cfg(target_os = "linux")]
+    fn cgroup_memory_limit() -> Option<(u64, &'static str)> {
+        const V2: &str = "/sys/fs/cgroup/memory.max";
+        const V1: &str = "/sys/fs/cgroup/memory/memory.limit_in_bytes";
+        for path in [V2, V1] {
+            let Ok(raw) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            let raw = raw.trim();
+            println!("audit: {path} = {raw}");
+            // v2 spells "no limit" as `max`; v1 as a page-rounded i64::MAX.
+            return match raw.parse::<u64>() {
+                Ok(limit) if limit < (1 << 60) => Some((limit, path)),
+                _ => None,
+            };
+        }
+        None
+    }
+
+    /// A process in a memory-limited container is killed at the container's
+    /// limit, not the machine's, so the default budget has to come from the
+    /// former.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn audit_default_memory_respects_cgroup_limit() {
+        let mut sys = sysinfo::System::new();
+        sys.refresh_memory();
+        let total = sys.total_memory();
+        let default = default_max_memory_bytes() as u64;
+        println!("audit: sysinfo total_memory      = {total}");
+        println!("audit: default_max_memory_bytes  = {default}");
+        println!(
+            "audit: sysinfo cgroup_limits()   = {:?}",
+            sys.cgroup_limits()
+        );
+
+        let Some((limit, source)) = cgroup_memory_limit() else {
+            println!("audit: no finite cgroup memory limit; nothing to check");
+            return;
+        };
+        println!("audit: cgroup limit ({source}) = {limit}");
+        assert!(
+            default <= limit / 2,
+            "default memory budget {default} exceeds half the cgroup limit \
+             ({limit} / 2 = {}); sysinfo total_memory is {total}",
+            limit / 2
+        );
     }
 }

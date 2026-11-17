@@ -11,6 +11,7 @@ use liquid_cache::{
 };
 use uuid::Uuid;
 
+mod audit_config;
 mod cases;
 mod lineage;
 

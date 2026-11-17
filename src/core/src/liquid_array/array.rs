@@ -411,6 +411,10 @@ fn vortex_operator(op: &DataFusionOperator) -> Option<Operator> {
 }
 
 #[cfg(test)]
+#[path = "size_audit.rs"]
+mod size_audit;
+
+#[cfg(test)]
 mod tests {
     use std::sync::Arc;
 

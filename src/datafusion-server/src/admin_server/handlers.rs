@@ -505,6 +505,10 @@ pub(crate) async fn stop_disk_usage_monitor_handler(
 }
 
 #[cfg(test)]
+#[path = "handlers_audit_tests.rs"]
+mod audit_tests;
+
+#[cfg(test)]
 mod tests {
     use std::{io::Write, path::PathBuf};
 

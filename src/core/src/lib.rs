@@ -1,6 +1,8 @@
 #![warn(missing_docs)]
 #![doc = include_str!("../README.md")]
 
+#[cfg(test)]
+mod audit_alloc;
 pub mod cache;
 pub mod liquid_array;
 mod sync;

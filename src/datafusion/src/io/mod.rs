@@ -19,6 +19,17 @@ impl ParquetCacheMetadata {
     }
 }
 
+#[cfg(test)]
+impl ParquetCacheMetadata {
+    /// Test-only: (column paths tracked, total recorded expressions, longest history).
+    pub(crate) fn test_hint_counts(&self) -> (usize, usize, usize) {
+        let hints = self.expression_hints.read().unwrap();
+        let total = hints.values().map(|t| t.history.len()).sum();
+        let longest = hints.values().map(|t| t.history.len()).max().unwrap_or(0);
+        (hints.len(), total, longest)
+    }
+}
+
 const COLUMN_EXPRESSION_HISTORY: usize = 16;
 
 #[derive(Debug, Default, Clone)]

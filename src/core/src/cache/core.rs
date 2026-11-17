@@ -1282,10 +1282,15 @@ impl LiquidCache {
 }
 
 #[cfg(test)]
+#[path = "audit_spill.rs"]
+mod audit_spill;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::cache::{
-        AlwaysHydrate, CacheEntry, CachePolicy, LiquidCacheBuilder, LiquidPolicy, TranscodeEvict,
+        AlwaysHydrate, CacheEntry, CachePolicy, Evict, LiquidCacheBuilder, LiquidPolicy,
+        TranscodeEvict,
         utils::{arrow_to_bytes, create_cache_store, create_test_array, create_test_arrow_array},
     };
     use crate::sync::thread;
@@ -1760,6 +1765,91 @@ mod tests {
             .index()
             .for_each(|_, slot| held += slot.entry.memory_usage_bytes());
         assert_eq!(cache.budget.memory_usage_bytes(), held);
+    }
+
+    // ---- REPRO: try_insert sizes its budget delta from a stale index read ----
+    //
+    // `try_insert` reads the slot's memory size with `index.get`, moves the
+    // budget by (new - that size), and only then calls `index.insert`. The
+    // slot the insert really displaced is never consulted for memory. Two
+    // tasks on one key interleaved between the read and the insert leave the
+    // budget permanently off from what the index holds.
+    //
+    // These run on real threads, not shuttle: a `LiquidCache` cannot be built
+    // inside a shuttle execution. With the `shuttle` feature on, t4's
+    // `IoWorker::new` spawns its worker as a shuttle thread and then blocks on
+    // a crossbeam channel for it, which parks the one OS thread shuttle runs
+    // everything on. So they are gated off under the feature.
+
+    /// How many fresh keys each race is tried on.
+    #[cfg(not(feature = "shuttle"))]
+    const RACE_ROUNDS: usize = 5_000;
+
+    /// How many times the evicted key is re-inserted during one eviction.
+    #[cfg(not(feature = "shuttle"))]
+    const REINSERTS: usize = 32;
+
+    /// A cache whose memory budget no round can fill, so nothing is evicted
+    /// but what a test evicts itself.
+    #[cfg(not(feature = "shuttle"))]
+    fn roomy_cache() -> Arc<LiquidCache> {
+        block_on(create_cache_store(1 << 34, Box::new(LiquidPolicy::new())))
+    }
+
+    /// Run `first` and `second` at once, released together.
+    #[cfg(not(feature = "shuttle"))]
+    fn race(first: impl FnOnce() + Send, second: impl FnOnce() + Send) {
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                barrier.wait();
+                first();
+            });
+            scope.spawn(|| {
+                barrier.wait();
+                second();
+            });
+        });
+    }
+
+    /// (a) Two tasks insert the same absent key. Both read `None`, both
+    /// reserve the full size, one entry survives: the budget over-counts.
+    #[cfg(not(feature = "shuttle"))]
+    #[test]
+    fn two_inserts_of_one_absent_key_keep_memory_budget() {
+        let cache = roomy_cache();
+        for round in 0..RACE_ROUNDS {
+            let key = EntryID::from(round);
+            let insert = || block_on(cache.insert_inner(key, 0, create_test_array(100))).unwrap();
+            race(insert, insert);
+            assert_memory_budget_matches_index(&cache);
+        }
+    }
+
+    /// (b) A key holds a memory entry. One task evicts it (TranscodeEvict
+    /// shrinks it to Liquid, still in memory) while another re-inserts it as
+    /// Arrow. Both size their delta from the original entry; when the
+    /// re-insert lands last the budget under-counts what the index holds.
+    #[cfg(not(feature = "shuttle"))]
+    #[test]
+    fn evict_racing_reinsert_keeps_memory_budget() {
+        let cache = roomy_cache();
+        for round in 0..RACE_ROUNDS {
+            let key = EntryID::from(round);
+            block_on(cache.insert_inner(key, 0, create_test_array(100))).unwrap();
+            race(
+                || block_on(cache.evict_victims(vec![key])).unwrap(),
+                // Re-inserted repeatedly so that one of the inserts straddles
+                // the eviction's install; each is a no-op for the budget
+                // unless it does.
+                || {
+                    for _ in 0..REINSERTS {
+                        block_on(cache.insert_inner(key, 0, create_test_array(100))).unwrap();
+                    }
+                },
+            );
+            assert_memory_budget_matches_index(&cache);
+        }
     }
 
     /// A disk victim is picked from the policy's disk queue, and a read can
@@ -2576,5 +2666,1670 @@ mod tests {
 
         assert!(!cache.contains(&entry, 0));
         assert_disk_matches_index(&cache, &store).await;
+    }
+
+    // ---- audit reproductions under production defaults ----
+    // TranscodeEvict + LiquidPolicy + AlwaysHydrate, sequential and
+    // concurrent (`with_evict_victims_concurrently(true)`) eviction.
+
+    type AuditKnown = Arc<std::sync::Mutex<std::collections::HashMap<EntryID, CachedBatchType>>>;
+
+    /// TEST-ONLY: `LiquidPolicy`, plus a mirror of the ids it still holds, so
+    /// a test can list them without draining the queues.
+    #[derive(Debug)]
+    struct AuditTrackingPolicy {
+        inner: LiquidPolicy,
+        known: AuditKnown,
+    }
+
+    impl CachePolicy for AuditTrackingPolicy {
+        fn find_memory_victim(&self, cnt: usize) -> Vec<EntryID> {
+            let victims = self.inner.find_memory_victim(cnt);
+            let mut known = self.known.lock().unwrap();
+            for victim in &victims {
+                known.remove(victim);
+            }
+            victims
+        }
+
+        fn find_disk_victim(&self, cnt: usize) -> Vec<EntryID> {
+            let victims = self.inner.find_disk_victim(cnt);
+            let mut known = self.known.lock().unwrap();
+            for victim in &victims {
+                known.remove(victim);
+            }
+            victims
+        }
+
+        fn notify_insert(&self, entry_id: &EntryID, batch_type: CachedBatchType) {
+            self.inner.notify_insert(entry_id, batch_type);
+            self.known.lock().unwrap().insert(*entry_id, batch_type);
+        }
+
+        fn notify_access(&self, entry_id: &EntryID, batch_type: CachedBatchType) {
+            self.inner.notify_access(entry_id, batch_type);
+        }
+
+        fn notify_remove(&self, entry_id: &EntryID) {
+            self.inner.notify_remove(entry_id);
+            self.known.lock().unwrap().remove(entry_id);
+        }
+    }
+
+    fn audit_memory_keys(cache: &LiquidCache) -> Vec<EntryID> {
+        let mut keys = Vec::new();
+        cache.index().for_each(|entry_id, slot| {
+            if LiquidCache::charged_bytes(&slot.entry).is_none() {
+                keys.push(*entry_id);
+            }
+        });
+        keys.sort();
+        keys
+    }
+
+    /// (memory entries in index, of those filed by the policy in a memory
+    /// queue, of those filed in its disk queue, of those unknown to it).
+    fn audit_reachability(cache: &LiquidCache, known: &AuditKnown) -> (usize, usize, usize, usize) {
+        let keys = audit_memory_keys(cache);
+        let known = known.lock().unwrap();
+        let (mut evictable, mut misfiled, mut stranded) = (0, 0, 0);
+        for key in &keys {
+            match known.get(key) {
+                Some(CachedBatchType::MemoryArrow | CachedBatchType::MemoryLiquid) => {
+                    evictable += 1
+                }
+                Some(_) => misfiled += 1,
+                None => stranded += 1,
+            }
+        }
+        (keys.len(), evictable, misfiled, stranded)
+    }
+
+    async fn audit_prod_cache(
+        max_memory_bytes: usize,
+        max_disk_bytes: usize,
+        concurrent: bool,
+    ) -> (Arc<LiquidCache>, AuditKnown) {
+        let known = AuditKnown::default();
+        let cache = LiquidCacheBuilder::new()
+            .with_max_memory_bytes(max_memory_bytes)
+            .with_max_disk_bytes(max_disk_bytes)
+            .with_eviction_policy(Box::new(TranscodeEvict))
+            .with_hydration_policy(Box::new(AlwaysHydrate::new()))
+            .with_cache_policy(Box::new(AuditTrackingPolicy {
+                inner: LiquidPolicy::new(),
+                known: known.clone(),
+            }))
+            .with_evict_victims_concurrently(concurrent)
+            .build()
+            .await;
+        (cache, known)
+    }
+
+    /// Claim 1 under production defaults. Returns the worst stranded count.
+    async fn audit_prod_failed_inserts(max_disk_bytes: usize, concurrent: bool) -> usize {
+        let array = create_test_arrow_array(256);
+        let one = CacheEntry::memory_arrow(array.clone()).memory_usage_bytes();
+        let max = 24 * one;
+        let (cache, known) = audit_prod_cache(max, max_disk_bytes, concurrent).await;
+        println!(
+            "A1 disk_budget={max_disk_bytes} concurrent={concurrent} one_arrow={one} max_memory={max}"
+        );
+        let (mut failures, mut worst, mut next) = (0usize, 0usize, 0usize);
+        let mut after_empty = Vec::new();
+        while failures < 40 && next < 3000 {
+            let id = EntryID::from(next);
+            next += 1;
+            let policy_was_empty = audit_reachability(&cache, &known).1 == 0;
+            let result = cache.insert(id, 0, array.clone()).await;
+            let (mem, evictable, misfiled, stranded) = audit_reachability(&cache, &known);
+            worst = worst.max(stranded);
+            if policy_was_empty && after_empty.len() < 5 {
+                let tier = cache
+                    .index()
+                    .get(&id)
+                    .map(|slot| CachedBatchType::from(&slot.entry));
+                after_empty.push((next - 1, result, tier));
+            }
+            if result.is_err() {
+                failures += 1;
+                println!(
+                    "A1   failure #{failures} at insert {} : index_memory={mem} policy_evictable={evictable} misfiled_disk_queue={misfiled} stranded={stranded} mem_usage={} disk_usage={}",
+                    next - 1,
+                    cache.budget().memory_usage_bytes(),
+                    cache.budget().disk_usage_bytes(),
+                );
+            }
+        }
+        let (mem, evictable, misfiled, stranded) = audit_reachability(&cache, &known);
+        println!(
+            "A1 end: inserts={next} failures={failures} index_memory={mem} policy_evictable={evictable} misfiled={misfiled} stranded={stranded} worst_stranded={worst} mem_usage={}/{max} disk_usage={}",
+            cache.budget().memory_usage_bytes(),
+            cache.budget().disk_usage_bytes(),
+        );
+        println!("A1 inserts made while the policy had no memory victim: {after_empty:?}");
+        assert_memory_budget_matches_index(&cache);
+        worst
+    }
+
+    #[tokio::test]
+    async fn audit_prod_failed_insert_strands_victims_no_disk_sequential() {
+        let worst = audit_prod_failed_inserts(0, false).await;
+        assert_eq!(worst, 0, "memory entries not reachable through the policy");
+    }
+
+    #[tokio::test]
+    async fn audit_prod_failed_insert_strands_victims_no_disk_concurrent() {
+        let worst = audit_prod_failed_inserts(0, true).await;
+        assert_eq!(worst, 0, "memory entries not reachable through the policy");
+    }
+
+    #[tokio::test]
+    async fn audit_prod_failed_insert_strands_victims_small_disk_sequential() {
+        let worst = audit_prod_failed_inserts(2048, false).await;
+        assert_eq!(worst, 0, "memory entries not reachable through the policy");
+    }
+
+    #[tokio::test]
+    async fn audit_prod_failed_insert_strands_victims_small_disk_concurrent() {
+        let worst = audit_prod_failed_inserts(2048, true).await;
+        assert_eq!(worst, 0, "memory entries not reachable through the policy");
+    }
+
+    /// Claim 1b + workload: inserts that must evict, polled once and dropped.
+    async fn audit_prod_cancel_workload(concurrent: bool) -> usize {
+        let array = create_test_arrow_array(256);
+        let one = CacheEntry::memory_arrow(array.clone()).memory_usage_bytes();
+        let max = 24 * one;
+        let (cache, known) = audit_prod_cache(max, 64 << 20, concurrent).await;
+        // Fill memory with ordinary inserts first.
+        let mut next = 0usize;
+        while cache.budget().memory_usage_bytes() + one <= max {
+            cache
+                .insert(EntryID::from(next), 0, array.clone())
+                .await
+                .unwrap();
+            next += 1;
+        }
+        println!(
+            "B concurrent={concurrent} one_arrow={one} max_memory={max} prefill_inserts={next} reach(mem,evictable,misfiled,stranded)={:?}",
+            audit_reachability(&cache, &known)
+        );
+        let (mut pending, mut ready_ok, mut ready_err, mut worst) =
+            (0usize, 0usize, 0usize, 0usize);
+        for iteration in 1..=6000usize {
+            let id = EntryID::from(next);
+            next += 1;
+            {
+                let mut insert = Box::pin(cache.insert_inner(
+                    id,
+                    0,
+                    CacheEntry::memory_arrow(array.clone()),
+                ));
+                match poll_once(insert.as_mut()) {
+                    std::task::Poll::Pending => pending += 1,
+                    std::task::Poll::Ready(Ok(())) => ready_ok += 1,
+                    std::task::Poll::Ready(Err(_)) => ready_err += 1,
+                }
+            }
+            // Let any detached store work settle before the next query.
+            tokio::task::yield_now().await;
+            let (mem, evictable, misfiled, stranded) = audit_reachability(&cache, &known);
+            worst = worst.max(stranded);
+            if iteration % 500 == 0 || (800..=1500).contains(&iteration) && iteration % 100 == 0 {
+                println!(
+                    "B   iter={iteration} cancelled={pending} completed_ok={ready_ok} completed_err={ready_err} index_memory={mem} policy_evictable={evictable} misfiled={misfiled} stranded={stranded} evictable_fraction={:.3} mem_usage={}/{max} disk_usage={}",
+                    if mem == 0 {
+                        1.0
+                    } else {
+                        evictable as f64 / mem as f64
+                    },
+                    cache.budget().memory_usage_bytes(),
+                    cache.budget().disk_usage_bytes(),
+                );
+            }
+        }
+        let (mut ok_memory, mut ok_disk, mut failed) = (0, 0, 0);
+        for _ in 0..50 {
+            let id = EntryID::from(next);
+            next += 1;
+            match cache.insert(id, 0, array.clone()).await {
+                Ok(()) => match cache.index().get(&id) {
+                    Some(slot) if LiquidCache::charged_bytes(&slot.entry).is_some() => {
+                        ok_disk += 1
+                    }
+                    Some(_) => ok_memory += 1,
+                    None => failed += 1,
+                },
+                Err(_) => failed += 1,
+            }
+        }
+        let (mem, evictable, misfiled, stranded) = audit_reachability(&cache, &known);
+        worst = worst.max(stranded);
+        println!(
+            "B after 50 ordinary inserts: landed_in_memory={ok_memory} landed_on_disk={ok_disk} failed={failed} index_memory={mem} policy_evictable={evictable} misfiled={misfiled} stranded={stranded} mem_usage={}/{max} disk_usage={}",
+            cache.budget().memory_usage_bytes(),
+            cache.budget().disk_usage_bytes(),
+        );
+        worst
+    }
+
+    #[tokio::test]
+    async fn audit_prod_cancelled_inserts_keep_memory_evictable_sequential() {
+        let worst = audit_prod_cancel_workload(false).await;
+        assert_eq!(worst, 0, "memory entries not reachable through the policy");
+    }
+
+    #[tokio::test]
+    async fn audit_prod_cancelled_inserts_keep_memory_evictable_concurrent() {
+        let worst = audit_prod_cancel_workload(true).await;
+        assert_eq!(worst, 0, "memory entries not reachable through the policy");
+    }
+
+    /// Claim 4 under production defaults. Returns writes made by the reads.
+    async fn audit_prod_unhydratable_read(concurrent: bool) -> u64 {
+        let known = AuditKnown::default();
+        let cache = LiquidCacheBuilder::new()
+            .with_max_memory_bytes(64)
+            .with_max_disk_bytes(1 << 20)
+            .with_eviction_policy(Box::new(TranscodeEvict))
+            .with_cache_policy(Box::new(AuditTrackingPolicy {
+                inner: LiquidPolicy::new(),
+                known: known.clone(),
+            }))
+            .with_hydration_policy(Box::new(AlwaysHydrate::new()))
+            .with_evict_victims_concurrently(concurrent)
+            .build()
+            .await;
+        let entry = EntryID::from(1030usize);
+        // Values Liquid cannot pack below the 64-byte memory budget.
+        let array = audit_incompressible_array();
+        cache.insert(entry, 0, array.clone()).await.unwrap();
+        let tier =CachedBatchType::from(&cache.index().get(&entry).unwrap().entry);
+        let inserting = cache.observer().runtime_snapshot().write_io_count;
+        println!(
+            "A4 concurrent={concurrent} tier_after_insert={tier:?} writes_by_insert={inserting}"
+        );
+        assert!(LiquidCache::charged_bytes(&cache.index().get(&entry).unwrap().entry).is_some());
+        let mut total = 0u64;
+        for read in 1..=5 {
+            let got = cache.get(&entry, 0).await.expect("present");
+            assert_eq!(got.as_ref(), array.as_ref());
+            let writes = cache.observer().runtime_snapshot().write_io_count;
+            total += writes as u64;
+            println!(
+                "A4   read #{read}: writes_by_this_read={writes} tier={:?}",
+                CachedBatchType::from(&cache.index().get(&entry).unwrap().entry)
+            );
+        }
+        total
+    }
+
+    fn audit_incompressible_array() -> ArrayRef {
+        Arc::new(Int32Array::from_iter_values(
+            (0u32..1024).map(|i| i.wrapping_mul(2654435761) as i32),
+        ))
+    }
+
+    /// TEST-ONLY: `AuditTrackingPolicy` that, the first time it is told a key
+    /// went to disk, runs `hook` before filing it. This is the window between
+    /// `index.insert` and `cache_policy.notify_insert` in `try_insert`.
+    struct AuditHookBeforeDiskFiling {
+        inner: AuditTrackingPolicy,
+        hook: std::sync::Mutex<Option<Box<dyn FnOnce(EntryID) + Send>>>,
+    }
+
+    impl std::fmt::Debug for AuditHookBeforeDiskFiling {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("AuditHookBeforeDiskFiling").finish()
+        }
+    }
+
+    impl CachePolicy for AuditHookBeforeDiskFiling {
+        fn find_memory_victim(&self, cnt: usize) -> Vec<EntryID> {
+            self.inner.find_memory_victim(cnt)
+        }
+        fn find_disk_victim(&self, cnt: usize) -> Vec<EntryID> {
+            self.inner.find_disk_victim(cnt)
+        }
+        fn notify_insert(&self, entry_id: &EntryID, batch_type: CachedBatchType) {
+            if matches!(
+                batch_type,
+                CachedBatchType::DiskLiquid | CachedBatchType::DiskArrow
+            ) {
+                let hook = self.hook.lock().unwrap().take();
+                if let Some(hook) = hook {
+                    hook(*entry_id);
+                }
+            }
+            self.inner.notify_insert(entry_id, batch_type);
+        }
+        fn notify_access(&self, entry_id: &EntryID, batch_type: CachedBatchType) {
+            self.inner.notify_access(entry_id, batch_type);
+        }
+        fn notify_remove(&self, entry_id: &EntryID) {
+            self.inner.notify_remove(entry_id);
+        }
+    }
+
+    /// Claim C: a read that hydrates a key between an eviction's
+    /// `index.insert` and its `notify_insert` must not leave the memory entry
+    /// filed in the policy's disk queue.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn audit_prod_hydrate_racing_eviction_keeps_tier_and_queue_in_step() {
+        let array = audit_incompressible_array();
+        let one = CacheEntry::memory_arrow(array.clone()).memory_usage_bytes();
+        let known = AuditKnown::default();
+        let slot: Arc<std::sync::Mutex<Option<Arc<LiquidCache>>>> = Arc::default();
+        let hook_slot = slot.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let hook: Box<dyn FnOnce(EntryID) + Send> = Box::new(move |entry_id| {
+            let cache = hook_slot.lock().unwrap().clone().expect("cache set");
+            // The racing read, run to completion on its own thread.
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        let read = runtime.block_on(async { cache.get(&entry_id, 0).await });
+                        println!(
+                            "C   racing read of {entry_id:?}: hit={} tier_after_read={:?}",
+                            read.is_some(),
+                            cache
+                                .index()
+                                .get(&entry_id)
+                                .map(|slot| CachedBatchType::from(&slot.entry))
+                        );
+                    })
+                    .join()
+                    .unwrap();
+            });
+        });
+        let cache = LiquidCacheBuilder::new()
+            .with_max_memory_bytes(one + one / 2)
+            .with_max_disk_bytes(64 << 20)
+            .with_eviction_policy(Box::new(TranscodeEvict))
+            .with_hydration_policy(Box::new(AlwaysHydrate::new()))
+            .with_cache_policy(Box::new(AuditHookBeforeDiskFiling {
+                inner: AuditTrackingPolicy {
+                    inner: LiquidPolicy::new(),
+                    known: known.clone(),
+                },
+                hook: std::sync::Mutex::new(Some(hook)),
+            }))
+            .build()
+            .await;
+        *slot.lock().unwrap() = Some(cache.clone());
+
+        let first = EntryID::from(1usize);
+        let second = EntryID::from(2usize);
+        cache.insert(first, 0, array.clone()).await.unwrap();
+        println!(
+            "C one_arrow={one} max_memory={} after first insert: reach(mem,evictable,misfiled,stranded)={:?} mem_usage={}",
+            one + one / 2,
+            audit_reachability(&cache, &known),
+            cache.budget().memory_usage_bytes()
+        );
+        let result = cache.insert(second, 0, array.clone()).await;
+        let filed = |id: &EntryID| known.lock().unwrap().get(id).copied();
+        let tier = |id: &EntryID| {
+            cache
+                .index()
+                .get(id)
+                .map(|slot| CachedBatchType::from(&slot.entry))
+        };
+        println!(
+            "C second insert={result:?} tier(first)={:?} policy_files_first_as={:?} tier(second)={:?} policy_files_second_as={:?}",
+            tier(&first),
+            filed(&first),
+            tier(&second),
+            filed(&second),
+        );
+        let third = EntryID::from(3usize);
+        let result = cache.insert(third, 0, array.clone()).await;
+        let (mem, evictable, misfiled, stranded) = audit_reachability(&cache, &known);
+        println!(
+            "C third insert={result:?} tier(third)={:?} tier(first)={:?} policy_files_first_as={:?} index_memory={mem} policy_evictable={evictable} misfiled={misfiled} stranded={stranded} mem_usage={} disk_usage={}",
+            tier(&third),
+            tier(&first),
+            filed(&first),
+            cache.budget().memory_usage_bytes(),
+            cache.budget().disk_usage_bytes(),
+        );
+        *slot.lock().unwrap() = None;
+        assert_eq!(
+            (misfiled, stranded),
+            (0, 0),
+            "a memory entry is filed in the disk queue, or in none"
+        );
+    }
+
+    #[tokio::test]
+    async fn audit_prod_unhydratable_read_writes_nothing_sequential() {
+        assert_eq!(
+            audit_prod_unhydratable_read(false).await,
+            0,
+            "reads rewrote the object"
+        );
+    }
+
+    #[tokio::test]
+    async fn audit_prod_unhydratable_read_writes_nothing_concurrent() {
+        assert_eq!(
+            audit_prod_unhydratable_read(true).await,
+            0,
+            "reads rewrote the object"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Audit reproductions. Each asserts the correct behaviour, and so fails
+    // while the finding it names stands.
+    // ---------------------------------------------------------------------
+
+    /// What the index's memory entries hold.
+    fn audit_memory_held(cache: &LiquidCache) -> usize {
+        let mut held = 0;
+        cache
+            .index()
+            .for_each(|_, slot| held += slot.entry.memory_usage_bytes());
+        held
+    }
+
+    /// What the index's disk records are charged.
+    fn audit_disk_charged(cache: &LiquidCache) -> usize {
+        let mut charged = 0;
+        cache.index().for_each(|_, slot| {
+            charged += LiquidCache::charged_bytes(&slot.entry).unwrap_or(0);
+        });
+        charged
+    }
+
+    fn audit_panic_message(panic: Box<dyn std::any::Any + Send>) -> String {
+        panic
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| panic.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "<non-string panic>".to_string())
+    }
+
+    /// A cache over a counted store with the given policies.
+    fn audit_cache(
+        max_memory_bytes: usize,
+        max_disk_bytes: usize,
+        eviction: Box<dyn EvictionPolicy>,
+        policy: Box<dyn CachePolicy>,
+        hydration: Box<dyn HydrationPolicy>,
+        evict_concurrently: bool,
+    ) -> (Arc<LiquidCache>, t4::Store, tempfile::TempDir) {
+        let directory = tempfile::tempdir().unwrap();
+        let store = block_on(t4::mount(directory.path().join("cache.t4"))).unwrap();
+        let cache = block_on(
+            LiquidCacheBuilder::new()
+                .with_max_memory_bytes(max_memory_bytes)
+                .with_max_disk_bytes(max_disk_bytes)
+                .with_eviction_policy(eviction)
+                .with_cache_policy(policy)
+                .with_hydration_policy(hydration)
+                .with_evict_victims_concurrently(evict_concurrently)
+                .with_store(store.clone())
+                .build(),
+        );
+        (cache, store, directory)
+    }
+
+    /// Finding 2, spill dropped. A spill has reserved its disk and put its
+    /// object when the cache is reset. The reset zeroes the counter, so the
+    /// reservation the spill still holds is released from zero when the spill
+    /// is dropped. The counter must stay within the limit and match the
+    /// (empty) index, and the disk tier must still take a small spill.
+    #[test]
+    fn audit_reset_under_a_dropped_spill_keeps_the_disk_counter_in_bounds() {
+        let (cache, store, _directory) = block_on(cache_over_counted_store(1 << 20, 1 << 20));
+        let max_disk = cache.config.max_disk_bytes();
+        let entry = EntryID::from(9600usize);
+        let next = EntryID::from(9601usize);
+        let array: ArrayRef = Arc::new(Int32Array::from_iter_values(0..256));
+        let small: ArrayRef = Arc::new(Int32Array::from_iter_values(0..4));
+        block_on(async { cache.insert(entry, 0, array.clone()).await }).unwrap();
+
+        let (record, bytes) = arrow_spill(&array);
+        let write = block_on(cache.write_batch_to_disk(entry, 0, &record, bytes)).unwrap();
+        let reserved = cache.budget.disk_usage_bytes();
+        cache.reset();
+        let after_reset = cache.budget.disk_usage_bytes();
+        drop(write);
+        let after_drop = cache.budget.disk_usage_bytes();
+        let charged = audit_disk_charged(&cache);
+
+        let follow_up = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            block_on(async {
+                cache.insert(next, 0, small.clone()).await.unwrap();
+                let (record, bytes) = arrow_spill(&small);
+                let write = cache.write_batch_to_disk(next, 0, &record, bytes).await?;
+                let Ok(Orphan(None)) = cache.try_insert(next, 0, record, Some(write)) else {
+                    panic!("a written disk record installs, and leaves no orphan");
+                };
+                Ok::<(), CacheFull>(())
+            })
+        }));
+        let follow_up = match follow_up {
+            Ok(result) => format!("returned {result:?}"),
+            Err(panic) => format!("panicked: {}", audit_panic_message(panic)),
+        };
+        println!(
+            "audit[2 dropped]: reserved={reserved} after_reset={after_reset} \
+             after_drop={after_drop} (usize::MAX={}) max_disk={max_disk} \
+             index_charged={charged}; follow-up spill of {} bytes {follow_up}",
+            usize::MAX,
+            arrow_copy(&small),
+        );
+
+        assert!(
+            after_drop <= max_disk,
+            "a spill dropped after reset() left disk usage at {after_drop}, over the limit \
+             of {max_disk} (reserved {reserved}, index charges {charged}); the follow-up \
+             spill {follow_up}"
+        );
+        assert_eq!(after_drop, charged);
+        assert_eq!(follow_up, "returned Ok(())");
+        drop(store);
+    }
+
+    /// Finding 2, spill finished. The same reset, but the spill then installs
+    /// its record. The record must hold the charge its write reserved, so
+    /// that removing it later releases what is charged.
+    #[test]
+    fn audit_reset_under_a_finishing_spill_leaves_its_record_charged() {
+        let (cache, _store, _directory) = block_on(cache_over_counted_store(1 << 20, 1 << 20));
+        let max_disk = cache.config.max_disk_bytes();
+        let entry = EntryID::from(9610usize);
+        let array: ArrayRef = Arc::new(Int32Array::from_iter_values(0..256));
+        block_on(async { cache.insert(entry, 0, array.clone()).await }).unwrap();
+
+        let (record, bytes) = arrow_spill(&array);
+        let write = block_on(cache.write_batch_to_disk(entry, 0, &record, bytes)).unwrap();
+        let reserved = cache.budget.disk_usage_bytes();
+        cache.reset();
+        let Ok(Orphan(None)) = cache.try_insert(entry, 0, record, Some(write)) else {
+            panic!("a written disk record installs, and leaves no orphan");
+        };
+        let after_install = cache.budget.disk_usage_bytes();
+        let charged = audit_disk_charged(&cache);
+        block_on(cache.remove_disk_entry(entry));
+        let after_removal = cache.budget.disk_usage_bytes();
+        println!(
+            "audit[2 finished]: reserved={reserved} after_install={after_install} \
+             index_charged={charged} after_removal={after_removal} (usize::MAX={}) \
+             max_disk={max_disk}",
+            usize::MAX
+        );
+
+        assert_eq!(
+            after_install, charged,
+            "a spill that installed its record after reset() left disk usage at \
+             {after_install} while the index charges {charged}; removing the record then \
+             left usage at {after_removal} (limit {max_disk})"
+        );
+        assert!(after_removal <= max_disk);
+    }
+
+    /// Finding 3, policy ghosts. A reset empties the index, so the policy
+    /// has nothing left to offer as a victim.
+    #[tokio::test]
+    async fn audit_reset_leaves_the_policy_no_victims() {
+        let (cache, _store, _directory) = cache_over_counted_store(1 << 20, 1 << 20).await;
+        let array: ArrayRef = Arc::new(Int32Array::from_iter_values(0..16));
+        for id in 9620usize..9626 {
+            cache
+                .insert(EntryID::from(id), 0, array.clone())
+                .await
+                .unwrap();
+        }
+        cache.flush_all_to_disk().await.unwrap();
+        for id in 9626usize..9630 {
+            cache
+                .insert(EntryID::from(id), 0, array.clone())
+                .await
+                .unwrap();
+        }
+
+        cache.reset();
+        let entries = cache.index().entry_count();
+        let memory_victims = cache.cache_policy.find_memory_victim(8);
+        let disk_victims = cache.cache_policy.find_disk_victim(8);
+        println!(
+            "audit[3 ghosts]: after reset() index entries={entries}, policy offers \
+             {} memory victims {memory_victims:?} and {} disk victims {disk_victims:?}",
+            memory_victims.len(),
+            disk_victims.len(),
+        );
+
+        assert_eq!(entries, 0);
+        assert!(
+            memory_victims.is_empty() && disk_victims.is_empty(),
+            "after reset() the index is empty but the policy still offers {} memory \
+             victims {memory_victims:?} and {} disk victims {disk_victims:?}",
+            memory_victims.len(),
+            disk_victims.len(),
+        );
+    }
+
+    /// Finding 3, reset racing inserts. Whatever a reset and concurrent
+    /// inserts leave in the index, the memory budget charges exactly that.
+    #[test]
+    fn audit_reset_racing_inserts_leaves_the_memory_budget_matching_the_index() {
+        let (cache, _store, _directory) = audit_cache(
+            1 << 30,
+            1 << 30,
+            Box::new(Evict),
+            Box::new(LiquidPolicy::new()),
+            Box::new(AlwaysHydrate::new()),
+            false,
+        );
+        let array: ArrayRef = Arc::new(Int32Array::from_iter_values(0..16));
+        let size = CacheEntry::memory_arrow(array.clone()).memory_usage_bytes();
+        let rounds = 3000usize;
+        let per_round = 16usize;
+        let mut mismatch = None;
+        for round in 0..rounds {
+            let barrier = std::sync::Barrier::new(2);
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    block_on(async {
+                        barrier.wait();
+                        for i in 0..per_round {
+                            let id = EntryID::from(1_000_000 + round * per_round + i);
+                            cache.insert(id, 0, array.clone()).await.unwrap();
+                        }
+                    })
+                });
+                scope.spawn(|| {
+                    barrier.wait();
+                    for _ in 0..(round % 64) * 8 {
+                        std::hint::spin_loop();
+                    }
+                    cache.reset();
+                });
+            });
+            let budget = cache.budget.memory_usage_bytes();
+            let held = audit_memory_held(&cache);
+            if budget != held {
+                mismatch = Some((round, budget, held, cache.index().keys().len()));
+                break;
+            }
+        }
+        println!(
+            "audit[3 race]: entry size={size}, rounds={rounds}, first mismatch \
+             (round, budget, index_held, index_entries)={mismatch:?}"
+        );
+        assert_eq!(
+            mismatch, None,
+            "reset() racing inserts left (round, memory budget, bytes held by the index, \
+             index entries) = {mismatch:?}; entry size {size}"
+        );
+    }
+
+    /// Holds each hydration of an entry until a second one of the same entry
+    /// arrives, so two reads of one disk entry reach their inserts together;
+    /// then hydrates like [`AlwaysHydrate`]. `alone` is hydrated unpaired.
+    #[derive(Debug)]
+    struct HydrateInPairs {
+        alone: EntryID,
+        arrived: std::sync::Mutex<std::collections::HashMap<EntryID, usize>>,
+    }
+
+    impl HydrationPolicy for HydrateInPairs {
+        fn hydrate(&self, request: &HydrationRequest<'_>) -> Option<CacheEntry> {
+            if request.entry_id != self.alone {
+                *self
+                    .arrived
+                    .lock()
+                    .unwrap()
+                    .entry(request.entry_id)
+                    .or_default() += 1;
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while self.arrived.lock().unwrap()[&request.entry_id] < 2 {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the second hydration of {:?} never arrived",
+                        request.entry_id
+                    );
+                    std::hint::spin_loop();
+                }
+            }
+            AlwaysHydrate::new().hydrate(request)
+        }
+    }
+
+    /// What [`audit_race_hydrating_reads`] saw.
+    #[derive(Debug)]
+    struct HydrationRace {
+        /// Memory one hydrated entry holds.
+        hydrated_size: usize,
+        /// (budget, held by the index) after one read hydrated one entry alone.
+        alone: (usize, usize),
+        rounds: usize,
+        /// Rounds after which the budget had moved away from the index.
+        drifted_rounds: usize,
+        /// The first of them, as (round, budget, held by the index).
+        first_drift: Option<(usize, usize, usize)>,
+        /// (budget, held by the index) after every round.
+        end: (usize, usize),
+    }
+
+    /// One read hydrates a disk entry alone, as a control; then two threads
+    /// read each of `rounds` further disk entries at once.
+    fn audit_race_hydrating_reads(
+        hydration: impl FnOnce(EntryID) -> Box<dyn HydrationPolicy>,
+        rounds: usize,
+    ) -> HydrationRace {
+        let control = EntryID::from(2_000_000 + rounds);
+        let (cache, _store, _directory) = audit_cache(
+            1 << 30,
+            1 << 30,
+            Box::new(Evict),
+            Box::new(LiquidPolicy::new()),
+            hydration(control),
+            false,
+        );
+        let array: ArrayRef = Arc::new(Int32Array::from_iter_values(0..16));
+        block_on(async {
+            for id in 0..=rounds {
+                cache
+                    .insert(EntryID::from(2_000_000 + id), 0, array.clone())
+                    .await
+                    .unwrap();
+            }
+            cache.flush_all_to_disk().await.unwrap();
+        });
+        assert_eq!(cache.budget.memory_usage_bytes(), 0);
+        assert_eq!(audit_memory_held(&cache), 0);
+
+        // Two reads of the control entry, one after the other: the first
+        // hydrates it, the second finds it in memory.
+        for _ in 0..2 {
+            let read = block_on(async { cache.get(&control, 0).await }).expect("present");
+            assert_eq!(read.as_ref(), array.as_ref());
+        }
+        let alone = (cache.budget.memory_usage_bytes(), audit_memory_held(&cache));
+        let hydrated_size = alone.1;
+
+        let mut drift = alone.0 as i128 - alone.1 as i128;
+        let mut drifted_rounds = 0;
+        let mut first_drift = None;
+        for round in 0..rounds {
+            let key = EntryID::from(2_000_000 + round);
+            let barrier = std::sync::Barrier::new(2);
+            std::thread::scope(|scope| {
+                for _ in 0..2 {
+                    scope.spawn(|| {
+                        block_on(async {
+                            barrier.wait();
+                            let read = cache.get(&key, 0).await.expect("present");
+                            assert_eq!(read.as_ref(), array.as_ref());
+                        })
+                    });
+                }
+            });
+            let budget = cache.budget.memory_usage_bytes();
+            let held = audit_memory_held(&cache);
+            if budget as i128 - held as i128 != drift {
+                drift = budget as i128 - held as i128;
+                drifted_rounds += 1;
+                first_drift.get_or_insert((round, budget, held));
+            }
+        }
+        HydrationRace {
+            hydrated_size,
+            alone,
+            rounds,
+            drifted_rounds,
+            first_drift,
+            end: (cache.budget.memory_usage_bytes(), audit_memory_held(&cache)),
+        }
+    }
+
+    fn audit_assert_hydration_charged_once(label: &str, race: HydrationRace) {
+        println!("audit[4 {label}]: {race:?}");
+        assert_eq!(
+            race.alone.0, race.alone.1,
+            "one read hydrating a disk entry alone already left the budget off the index"
+        );
+        assert_eq!(
+            race.end.0,
+            race.end.1,
+            "two reads hydrating one disk entry at once left the memory budget at {} while \
+             the index holds {} ({} bytes over; one hydrated entry is {} bytes); {} of {} \
+             rounds drifted, the first as (round, budget, held) = {:?}",
+            race.end.0,
+            race.end.1,
+            race.end.0 as i128 - race.end.1 as i128,
+            race.hydrated_size,
+            race.drifted_rounds,
+            race.rounds,
+            race.first_drift,
+        );
+    }
+
+    /// Finding 4. Two reads hydrate the same disk entry at the same time;
+    /// one memory entry survives, so the budget charges one.
+    #[test]
+    fn audit_two_reads_hydrating_one_disk_entry_charge_it_once() {
+        let race = audit_race_hydrating_reads(|_| Box::new(AlwaysHydrate::new()), 1000);
+        audit_assert_hydration_charged_once("free-running", race);
+    }
+
+    /// Finding 4 again, with the two hydrations released together by the
+    /// hydration policy rather than left to the scheduler.
+    #[test]
+    fn audit_two_reads_hydrating_one_disk_entry_together_charge_it_once() {
+        let race = audit_race_hydrating_reads(
+            |alone| {
+                Box::new(HydrateInPairs {
+                    alone,
+                    arrived: Default::default(),
+                })
+            },
+            1000,
+        );
+        audit_assert_hydration_charged_once("paired", race);
+    }
+
+    /// One thread spills a memory entry to disk through `spill_entry` while
+    /// another re-inserts it as memory until the spill is done. Returns the
+    /// first round after which the memory budget and the index disagree, as
+    /// (round, budget, held by the index), and the size of one entry.
+    fn audit_race_spill_and_reinsert(
+        rounds: usize,
+        spill_entry: impl Fn(&LiquidCache, EntryID) + Sync,
+    ) -> (Option<(usize, usize, usize)>, usize) {
+        let (cache, _store, _directory) = audit_cache(
+            1 << 30,
+            1 << 30,
+            Box::new(Evict),
+            Box::new(LiquidPolicy::new()),
+            Box::new(crate::cache::NoHydration::new()),
+            false,
+        );
+        let array: ArrayRef = Arc::new(Int32Array::from_iter_values(0..16));
+        let size = CacheEntry::memory_arrow(array.clone()).memory_usage_bytes();
+        for round in 0..rounds {
+            let key = EntryID::from(3_000_000 + round);
+            block_on(async { cache.insert(key, 0, array.clone()).await }).unwrap();
+            assert!(is_memory(&cache, &key));
+            let barrier = std::sync::Barrier::new(2);
+            let spilled = std::sync::atomic::AtomicBool::new(false);
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    barrier.wait();
+                    spill_entry(&cache, key);
+                    spilled.store(true, Ordering::SeqCst);
+                });
+                scope.spawn(|| {
+                    block_on(async {
+                        barrier.wait();
+                        loop {
+                            let done = spilled.load(Ordering::SeqCst);
+                            cache.insert(key, 0, array.clone()).await.unwrap();
+                            if done {
+                                break;
+                            }
+                        }
+                    })
+                });
+            });
+            let budget = cache.budget.memory_usage_bytes();
+            let held = audit_memory_held(&cache);
+            if budget != held {
+                return (Some((round, budget, held)), size);
+            }
+        }
+        (None, size)
+    }
+
+    /// Finding 5, eviction. An eviction spills a memory entry to disk while
+    /// an insert puts the same key back in memory. Whichever record ends up
+    /// in the index, the memory budget charges exactly it.
+    #[test]
+    fn audit_an_eviction_spill_racing_a_reinsert_leaves_the_budget_matching_the_index() {
+        let rounds = 3000;
+        let (mismatch, size) = audit_race_spill_and_reinsert(rounds, |cache, key| {
+            block_on(cache.evict_victims(vec![key])).unwrap();
+        });
+        println!(
+            "audit[5 evict]: entry size={size}, rounds={rounds}, first mismatch \
+             (round, budget, index_held)={mismatch:?} (usize::MAX={})",
+            usize::MAX
+        );
+        assert_eq!(
+            mismatch, None,
+            "an eviction spilling an entry while it was re-inserted left (round, memory \
+             budget, bytes held by the index) = {mismatch:?}; one entry is {size} bytes"
+        );
+    }
+
+    /// Finding 5, flush. The same race with `flush_all_to_disk` as the spill.
+    #[test]
+    fn audit_a_flush_racing_a_reinsert_leaves_the_budget_matching_the_index() {
+        let rounds = 3000;
+        let (mismatch, size) = audit_race_spill_and_reinsert(rounds, |cache, _key| {
+            block_on(cache.flush_all_to_disk()).unwrap();
+        });
+        println!(
+            "audit[5 flush]: entry size={size}, rounds={rounds}, first mismatch \
+             (round, budget, index_held)={mismatch:?} (usize::MAX={})",
+            usize::MAX
+        );
+        assert_eq!(
+            mismatch, None,
+            "flush_all_to_disk spilling an entry while it was re-inserted left (round, \
+             memory budget, bytes held by the index) = {mismatch:?}; one entry is {size} bytes"
+        );
+    }
+
+    /// Finding 6. Memory is exactly full with 20 equal entries. Inserting one
+    /// more of the same size needs one of them gone, not eight.
+    #[test]
+    fn audit_one_insert_into_full_memory_evicts_only_what_it_needs() {
+        let array: ArrayRef = Arc::new(Int32Array::from_iter_values(0..64));
+        let size = CacheEntry::memory_arrow(array.clone()).memory_usage_bytes();
+        let (cache, _store, _directory) = audit_cache(
+            20 * size,
+            1 << 20,
+            Box::new(Evict),
+            Box::new(LiquidPolicy::new()),
+            Box::new(crate::cache::NoHydration::new()),
+            false,
+        );
+        let ids: Vec<EntryID> = (9700usize..9720).map(EntryID::from).collect();
+        block_on(async {
+            for id in &ids {
+                cache.insert(*id, 0, array.clone()).await.unwrap();
+            }
+        });
+        assert!(ids.iter().all(|id| is_memory(&cache, id)));
+        assert_eq!(cache.budget.memory_usage_bytes(), 20 * size);
+
+        block_on(async {
+            cache
+                .insert(EntryID::from(9720usize), 0, array.clone())
+                .await
+        })
+        .unwrap();
+
+        let left_memory = ids.iter().filter(|id| !is_memory(&cache, id)).count();
+        let usage = cache.budget.memory_usage_bytes();
+        println!(
+            "audit[6]: entry size={size}, max_memory={} (20 entries); inserting 1 more \
+             moved {left_memory} of the 20 out of memory; memory usage now {usage} \
+             ({} entries)",
+            20 * size,
+            usage / size,
+        );
+        assert!(
+            left_memory <= 2,
+            "inserting one {size}-byte entry into a memory tier full of 20 such entries \
+             evicted {left_memory} of them; 1 was needed"
+        );
+    }
+
+    /// Finding 7. Disk is exactly full with 20 equal records. Spilling one
+    /// more of the same size needs one of them gone, not eight.
+    #[tokio::test]
+    async fn audit_one_spill_into_full_disk_removes_only_what_it_needs() {
+        let array: ArrayRef = Arc::new(Int32Array::from_iter_values(0..64));
+        let copy = arrow_copy(&array);
+        let (cache, store, _directory) = cache_over_counted_store(1 << 20, 20 * copy).await;
+        let ids: Vec<EntryID> = (9730usize..9750).map(EntryID::from).collect();
+        for id in &ids {
+            cache.insert(*id, 0, array.clone()).await.unwrap();
+        }
+        cache.flush_all_to_disk().await.unwrap();
+        assert!(ids.iter().all(|id| cache.contains(id, 0)));
+        assert_eq!(cache.budget.disk_usage_bytes(), 20 * copy);
+
+        let extra = EntryID::from(9750usize);
+        cache.insert(extra, 0, array.clone()).await.unwrap();
+        spill(&cache, extra, &array).await;
+
+        let removed = ids.iter().filter(|id| !cache.contains(id, 0)).count();
+        let usage = cache.budget.disk_usage_bytes();
+        println!(
+            "audit[7]: record size={copy}, max_disk={} (20 records); spilling 1 more \
+             removed {removed} of the 20; disk usage now {usage} ({} records), store \
+             holds {} objects",
+            20 * copy,
+            usage / copy,
+            store.len().await.unwrap(),
+        );
+        assert!(
+            removed <= 1,
+            "spilling one {copy}-byte record into a disk tier full of 20 such records \
+             removed {removed} of them; 1 was needed"
+        );
+    }
+
+    /// Fill memory with 20 equal entries over a disk tier that fits three,
+    /// then insert one more. Returns the insert's result, memory usage after
+    /// it, the limit and the entry size.
+    fn audit_insert_over_small_disk(
+        evict_concurrently: bool,
+    ) -> (Result<(), CacheFull>, usize, usize, usize) {
+        let array: ArrayRef = Arc::new(Int32Array::from_iter_values(0..64));
+        let size = CacheEntry::memory_arrow(array.clone()).memory_usage_bytes();
+        let (cache, _store, _directory) = audit_cache(
+            20 * size,
+            3 * arrow_copy(&array),
+            Box::new(Evict),
+            Box::new(LiquidPolicy::new()),
+            Box::new(crate::cache::NoHydration::new()),
+            evict_concurrently,
+        );
+        block_on(async {
+            for id in 9760usize..9780 {
+                cache
+                    .insert(EntryID::from(id), 0, array.clone())
+                    .await
+                    .unwrap();
+            }
+        });
+        assert_eq!(cache.budget.memory_usage_bytes(), 20 * size);
+        let result = block_on(async {
+            cache
+                .insert(EntryID::from(9780usize), 0, array.clone())
+                .await
+        });
+        (
+            result,
+            cache.budget.memory_usage_bytes(),
+            cache.config.max_memory_bytes(),
+            size,
+        )
+    }
+
+    /// Finding 8. With victims evicted concurrently, as production does, an
+    /// insert is not refused while the entry fits in memory.
+    #[test]
+    fn audit_an_insert_that_fits_in_memory_is_not_refused_as_cache_full() {
+        let (sequential, sequential_usage, _, _) = audit_insert_over_small_disk(false);
+        let (result, usage, max, size) = audit_insert_over_small_disk(true);
+        println!(
+            "audit[8]: entry size={size}, max_memory={max}, disk fits 3 records. \
+             concurrent eviction: insert returned {result:?}, memory usage after={usage} \
+             ({} entries), usage+new={} vs max={max}. sequential eviction: insert returned \
+             {sequential:?}, memory usage after={sequential_usage}",
+            usage / size,
+            usage + size,
+        );
+        assert!(
+            result.is_ok() || usage + size > max,
+            "insert returned {result:?} with memory usage {usage} + new entry {size} = {} \
+             <= max {max}; with sequential eviction the same insert returned {sequential:?}",
+            usage + size,
+        );
+    }
+
+    /// Finding 9, hydrate then flush. Disk fits exactly one object. An entry
+    /// on disk is hydrated and flushed again; that needs no more disk than
+    /// the entry already had.
+    #[tokio::test]
+    async fn audit_respilling_a_hydrated_entry_fits_a_disk_tier_of_one_object() {
+        let array: ArrayRef = Arc::new(Int32Array::from_iter_values(0..256));
+        let copy = arrow_copy(&array);
+        let (cache, store, _directory) = cache_over_counted_store(1 << 20, copy).await;
+        let entry = EntryID::from(9790usize);
+        cache.insert(entry, 0, array.clone()).await.unwrap();
+        cache.flush_all_to_disk().await.unwrap();
+        assert_eq!(cache.budget.disk_usage_bytes(), copy);
+
+        let read = cache.get(&entry, 0).await.expect("present");
+        assert_eq!(read.as_ref(), array.as_ref());
+        assert!(is_memory(&cache, &entry));
+        let after_hydrate = cache.budget.disk_usage_bytes();
+        let failures_before = cache.stats().runtime.disk_reservation_failures;
+        let flush = cache.flush_all_to_disk().await;
+        let failures = cache.stats().runtime.disk_reservation_failures - failures_before;
+        let on_disk = cache
+            .index()
+            .get(&entry)
+            .is_some_and(|slot| LiquidCache::charged_bytes(&slot.entry).is_some());
+        println!(
+            "audit[9 hydrate+flush]: copy={copy}=max_disk, disk usage after hydrate=\
+             {after_hydrate}, re-flush returned {flush:?} with {failures} failed disk \
+             reservations, entry on disk={on_disk}, disk usage={}",
+            cache.budget.disk_usage_bytes()
+        );
+        assert_eq!(flush, Ok(()));
+        assert!(on_disk, "the re-spilled entry is not on disk");
+        assert_eq!(failures, 0, "the re-spill had to evict to fit");
+        assert_disk_matches_index(&cache, &store).await;
+    }
+
+    /// Finding 9, a record rewritten in place. Disk fits exactly two objects
+    /// and holds two records. Re-inserting one of the keys rewrites its
+    /// object at the same size, which needs no more disk, so the other
+    /// record is left alone.
+    #[test]
+    fn audit_rewriting_a_disk_record_in_place_evicts_no_other_record() {
+        let array: ArrayRef = Arc::new(Int32Array::from_iter_values(0..256));
+        let copy = arrow_copy(&array);
+        // No memory at all: every insert goes straight to disk.
+        let (cache, store, _directory) = audit_cache(
+            0,
+            2 * copy,
+            Box::new(Evict),
+            Box::new(LiquidPolicy::new()),
+            Box::new(crate::cache::NoHydration::new()),
+            false,
+        );
+        let other = EntryID::from(9800usize);
+        let rewritten = EntryID::from(9801usize);
+        block_on(async {
+            cache.insert(other, 0, array.clone()).await.unwrap();
+            cache.insert(rewritten, 0, array.clone()).await.unwrap();
+        });
+        assert!(cache.contains(&other, 0) && cache.contains(&rewritten, 0));
+        assert_eq!(cache.budget.disk_usage_bytes(), 2 * copy);
+
+        let failures_before = cache.stats().runtime.disk_reservation_failures;
+        let result = block_on(async { cache.insert(rewritten, 0, array.clone()).await });
+        let failures = cache.stats().runtime.disk_reservation_failures - failures_before;
+        let other_kept = cache.contains(&other, 0);
+        let rewritten_kept = cache.contains(&rewritten, 0);
+        println!(
+            "audit[9 rewrite]: copy={copy}, max_disk={} (2 records), both on disk; \
+             re-inserting one key returned {result:?} after {failures} failed disk \
+             reservations; other record kept={other_kept}, rewritten record \
+             kept={rewritten_kept}, disk usage={}, store objects={}",
+            2 * copy,
+            cache.budget.disk_usage_bytes(),
+            block_on(store.len()).unwrap(),
+        );
+        assert_eq!(result, Ok(()));
+        assert!(
+            other_kept,
+            "rewriting a {copy}-byte disk record in place evicted the other record \
+             ({failures} failed disk reservations): the rewrite reserved a second {copy} \
+             bytes while the record it replaces was still charged"
+        );
+    }
+
+    type MemoryVictimHook = Box<dyn FnOnce(&[EntryID]) + Send>;
+
+    /// A [`LiquidPolicy`] that runs a hook once, after it hands out memory
+    /// victims and before the cache acts on them.
+    struct HookAfterMemoryVictims {
+        inner: LiquidPolicy,
+        hook: Arc<std::sync::Mutex<Option<MemoryVictimHook>>>,
+    }
+
+    impl std::fmt::Debug for HookAfterMemoryVictims {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("HookAfterMemoryVictims").finish()
+        }
+    }
+
+    impl CachePolicy for HookAfterMemoryVictims {
+        fn find_memory_victim(&self, cnt: usize) -> Vec<EntryID> {
+            let victims = self.inner.find_memory_victim(cnt);
+            let hook = self.hook.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook(&victims);
+            }
+            victims
+        }
+
+        fn find_disk_victim(&self, cnt: usize) -> Vec<EntryID> {
+            self.inner.find_disk_victim(cnt)
+        }
+
+        fn notify_insert(&self, entry_id: &EntryID, batch_type: CachedBatchType) {
+            self.inner.notify_insert(entry_id, batch_type);
+        }
+
+        fn notify_access(&self, entry_id: &EntryID, batch_type: CachedBatchType) {
+            self.inner.notify_access(entry_id, batch_type);
+        }
+
+        fn notify_remove(&self, entry_id: &EntryID) {
+            self.inner.notify_remove(entry_id);
+        }
+    }
+
+    /// Finding 10. An insert picks memory victims; before it evicts them, a
+    /// flush spills them to disk, which already frees the memory. The victims
+    /// were picked to free memory, so the eviction has nothing left to do
+    /// with them: their disk records, written a moment ago, stay readable.
+    #[test]
+    fn audit_a_memory_victim_flushed_before_its_eviction_keeps_its_disk_record() {
+        let array: ArrayRef = Arc::new(Int32Array::from_iter_values(0..256));
+        let size = CacheEntry::memory_arrow(array.clone()).memory_usage_bytes();
+        let hook = Arc::new(std::sync::Mutex::new(None::<MemoryVictimHook>));
+        let (cache, store, _directory) = audit_cache(
+            2 * size,
+            1 << 20,
+            Box::new(Evict),
+            Box::new(HookAfterMemoryVictims {
+                inner: LiquidPolicy::new(),
+                hook: hook.clone(),
+            }),
+            Box::new(crate::cache::NoHydration::new()),
+            false,
+        );
+        let first = EntryID::from(9810usize);
+        let second = EntryID::from(9811usize);
+        let third = EntryID::from(9812usize);
+        block_on(async {
+            cache.insert(first, 0, array.clone()).await.unwrap();
+            cache.insert(second, 0, array.clone()).await.unwrap();
+        });
+        assert!(is_memory(&cache, &first) && is_memory(&cache, &second));
+
+        let flusher = cache.clone();
+        let victims_seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = victims_seen.clone();
+        *hook.lock().unwrap() = Some(Box::new(move |victims: &[EntryID]| {
+            seen.lock().unwrap().extend_from_slice(victims);
+            std::thread::spawn(move || {
+                block_on(flusher.flush_all_to_disk()).unwrap();
+                assert!(matches!(
+                    flusher.index().get(&first).unwrap().entry,
+                    CacheEntry::DiskArrow { .. }
+                ));
+            })
+            .join()
+            .unwrap();
+        }));
+
+        block_on(async { cache.insert(third, 0, array.clone()).await }).unwrap();
+        assert!(hook.lock().unwrap().is_none(), "the hook never ran");
+
+        let victims = victims_seen.lock().unwrap().clone();
+        let first_read = block_on(async { cache.get(&first, 0).await });
+        let second_read = block_on(async { cache.get(&second, 0).await });
+        println!(
+            "audit[10]: memory victims picked={victims:?}, flushed to disk before their \
+             eviction; afterwards first readable={}, second readable={}, index entries={}, \
+             store objects={}, disk usage={}, memory usage={} of {}",
+            first_read.is_some(),
+            second_read.is_some(),
+            cache.index().entry_count(),
+            block_on(store.len()).unwrap(),
+            cache.budget.disk_usage_bytes(),
+            cache.budget.memory_usage_bytes(),
+            2 * size,
+        );
+        assert!(
+            first_read.is_some() && second_read.is_some(),
+            "memory victims {victims:?} were flushed to disk before their eviction ran, \
+             and the eviction then deleted their disk records: first readable={}, second \
+             readable={}",
+            first_read.is_some(),
+            second_read.is_some(),
+        );
+    }
+
+    // ---- audit reproductions ----
+
+    /// Every key the policy still offers as a memory victim, sorted.
+    fn audit_drain_memory_victims(cache: &LiquidCache) -> Vec<EntryID> {
+        let mut offered = Vec::new();
+        loop {
+            let victims = cache.cache_policy.find_memory_victim(8);
+            if victims.is_empty() {
+                break;
+            }
+            offered.extend(victims);
+        }
+        offered.sort();
+        offered.dedup();
+        offered
+    }
+
+    /// A cache whose memory fits exactly three of `array`, evicting Arrow
+    /// straight to disk, already holding three entries (ids 1000..1003).
+    async fn audit_three_in_memory(
+        array: &ArrayRef,
+        max_disk_bytes: usize,
+    ) -> (Arc<LiquidCache>, Vec<EntryID>) {
+        let one = CacheEntry::memory_arrow(array.clone()).memory_usage_bytes();
+        let cache = LiquidCacheBuilder::new()
+            .with_max_memory_bytes(3 * one)
+            .with_max_disk_bytes(max_disk_bytes)
+            .with_eviction_policy(Box::new(crate::cache::Evict))
+            .with_cache_policy(Box::new(LiquidPolicy::new()))
+            .build()
+            .await;
+        let ids: Vec<EntryID> = (1000usize..1003).map(EntryID::from).collect();
+        for id in &ids {
+            cache.insert(*id, 0, array.clone()).await.unwrap();
+        }
+        assert_eq!(audit_memory_keys(&cache), ids, "three entries fit in memory");
+        (cache, ids)
+    }
+
+    /// Claim 1: an insert that fails with `CacheFull` after the policy handed
+    /// out its victims must leave those victims evictable.
+    #[tokio::test]
+    async fn audit_victims_of_a_failed_eviction_stay_evictable() {
+        let array = create_test_arrow_array(256);
+        let (cache, ids) = audit_three_in_memory(&array, 0).await;
+
+        let result = cache.insert(EntryID::from(1003usize), 0, array.clone()).await;
+        assert_eq!(result, Err(CacheFull));
+
+        let held = audit_memory_keys(&cache);
+        assert_eq!(held, ids, "the failed insert removed nothing");
+        assert_memory_budget_matches_index(&cache);
+        assert_eq!(
+            audit_drain_memory_victims(&cache),
+            held,
+            "memory entries the index holds are no longer offered as victims"
+        );
+    }
+
+    /// Claim 1b: the same, when the insert is dropped mid-eviction instead of
+    /// failing.
+    #[tokio::test]
+    async fn audit_victims_of_a_cancelled_eviction_stay_evictable() {
+        let array = create_test_arrow_array(256);
+        let (cache, ids) = audit_three_in_memory(&array, 1 << 20).await;
+
+        // Park the eviction of the first victim on its disk key.
+        let key = cache.disk_key_locks.lock(&ids[0]).await;
+        let mut insert = Box::pin(cache.insert_inner(
+            EntryID::from(1003usize),
+            0,
+            CacheEntry::memory_arrow(array.clone()),
+        ));
+        assert!(
+            poll_once(insert.as_mut()).is_pending(),
+            "the insert did not park in its eviction"
+        );
+        drop(insert);
+        drop(key);
+
+        let held = audit_memory_keys(&cache);
+        assert_eq!(held, ids, "the cancelled insert removed nothing");
+        assert_memory_budget_matches_index(&cache);
+        assert_eq!(
+            audit_drain_memory_victims(&cache),
+            held,
+            "memory entries the index holds are no longer offered as victims"
+        );
+    }
+
+    /// Claim 2: `reset` leaves nothing behind in the store.
+    #[tokio::test]
+    async fn audit_reset_deletes_disk_objects() {
+        let entry = EntryID::from(1010usize);
+        let array: ArrayRef = Arc::new(Int32Array::from_iter_values(0..256));
+        let (cache, store, _directory) = flushed(entry, &array).await;
+        assert_eq!(store.len().await.unwrap(), 1);
+
+        cache.reset();
+
+        assert!(!cache.contains(&entry, 0));
+        assert_eq!(cache.budget.disk_usage_bytes(), 0);
+        assert_disk_matches_index(&cache, &store).await;
+    }
+
+    /// Insert `array`, spill it as Arrow, read it back so it is hydrated, and
+    /// return the memory charged before the spill and after the hydration.
+    async fn audit_disk_round_trip_charge(array: ArrayRef) -> (usize, usize) {
+        let cache = LiquidCacheBuilder::new()
+            .with_max_memory_bytes(1 << 24)
+            .with_max_disk_bytes(1 << 24)
+            .with_eviction_policy(Box::new(crate::cache::Evict))
+            .with_cache_policy(Box::new(LiquidPolicy::new()))
+            .with_hydration_policy(Box::new(AlwaysHydrate::new()))
+            .build()
+            .await;
+        let entry = EntryID::from(1020usize);
+        cache.insert(entry, 0, array.clone()).await.unwrap();
+        let before = cache.budget().memory_usage_bytes();
+        assert!(before > 0);
+
+        cache.flush_all_to_disk().await.unwrap();
+        assert!(matches!(
+            cache.index().get(&entry).unwrap().entry,
+            CacheEntry::DiskArrow { .. }
+        ));
+        assert_eq!(cache.budget().memory_usage_bytes(), 0);
+
+        let read = cache.get(&entry, 0).await.expect("present");
+        assert_eq!(read.as_ref(), array.as_ref());
+        assert!(matches!(
+            cache.index().get(&entry).unwrap().entry,
+            CacheEntry::MemoryArrow(_)
+        ));
+        assert_memory_budget_matches_index(&cache);
+        (before, cache.budget().memory_usage_bytes())
+    }
+
+    /// Claim 3: an entry hydrated from disk is charged what it was charged
+    /// before it was spilled.
+    #[tokio::test]
+    async fn audit_disk_round_trip_keeps_the_charge_of_a_nullable_int32() {
+        let array: ArrayRef = Arc::new(Int32Array::from_iter(
+            (0..8192).map(|i| (i % 7 != 0).then_some(i)),
+        ));
+        let (before, after) = audit_disk_round_trip_charge(array).await;
+        assert!(
+            after <= before + before / 10,
+            "hydrated entry charged {after} bytes, {before} before the spill"
+        );
+    }
+
+    #[tokio::test]
+    async fn audit_disk_round_trip_keeps_the_charge_of_a_nullable_string() {
+        let array: ArrayRef = Arc::new(arrow::array::StringArray::from_iter(
+            (0..8192).map(|i| (i % 7 != 0).then(|| format!("value-{i}"))),
+        ));
+        let (before, after) = audit_disk_round_trip_charge(array).await;
+        assert!(
+            after <= before + before / 10,
+            "hydrated entry charged {after} bytes, {before} before the spill"
+        );
+    }
+
+    /// Claim 4: reading a disk entry that cannot be hydrated, because it does
+    /// not fit in memory, writes nothing.
+    #[tokio::test]
+    async fn audit_a_read_that_cannot_hydrate_writes_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = t4::mount(directory.path().join("cache.t4")).await.unwrap();
+        let cache = LiquidCacheBuilder::new()
+            .with_max_memory_bytes(64)
+            .with_max_disk_bytes(1 << 20)
+            .with_eviction_policy(Box::new(crate::cache::Evict))
+            .with_cache_policy(Box::new(LiquidPolicy::new()))
+            .with_hydration_policy(Box::new(AlwaysHydrate::new()))
+            .with_store(store.clone())
+            .build()
+            .await;
+        let entry = EntryID::from(1030usize);
+        let array: ArrayRef = Arc::new(Int32Array::from_iter_values(0..1024));
+        cache.insert(entry, 0, array.clone()).await.unwrap();
+        assert!(matches!(
+            cache.index().get(&entry).unwrap().entry,
+            CacheEntry::DiskArrow { .. }
+        ));
+        let inserting = cache.observer().runtime_snapshot().write_io_count;
+        assert_eq!(inserting, 1, "the insert spilled the entry once");
+
+        for _ in 0..2 {
+            let read = cache.get(&entry, 0).await.expect("present");
+            assert_eq!(read.as_ref(), array.as_ref());
+        }
+
+        assert!(matches!(
+            cache.index().get(&entry).unwrap().entry,
+            CacheEntry::DiskArrow { .. }
+        ));
+        assert_disk_matches_index(&cache, &store).await;
+        assert_eq!(
+            cache.observer().runtime_snapshot().write_io_count,
+            0,
+            "reads rewrote the object they had just read"
+        );
+    }
+
+    /// Values no encoding shrinks: a full-range xorshift stream.
+    #[cfg(target_os = "linux")]
+    fn incompressible_array(seed: u64, len: usize) -> ArrayRef {
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let values: Vec<i64> = (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as i64
+            })
+            .collect();
+        Arc::new(arrow::array::Int64Array::from(values))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+        if let Some(message) = payload.downcast_ref::<String>() {
+            message.clone()
+        } else if let Some(message) = payload.downcast_ref::<&str>() {
+            (*message).to_string()
+        } else {
+            "<non-string panic payload>".to_string()
+        }
+    }
+
+    /// The disk budget is a number the caller picks; the volume is what it
+    /// is. Once the volume fills below the budget, an insert has to report
+    /// that as [`CacheFull`] like any other full cache.
+    ///
+    /// Needs a small dedicated volume, named by `AUDIT_SMALL_DIR`.
+    /// `AUDIT_DIRECT_IO=0` mounts the store without `O_DIRECT`, for
+    /// filesystems that refuse it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn audit_full_volume_returns_cache_full_not_panic() {
+        const ARRAY_VALUES: usize = 8192; // 64 KiB of i64 per entry
+        const BYTES_TO_OFFER: usize = 96 << 20;
+        const DISK_BUDGET: usize = 1 << 30;
+
+        let Ok(directory) = std::env::var("AUDIT_SMALL_DIR") else {
+            println!("audit: AUDIT_SMALL_DIR unset; skipping");
+            return;
+        };
+        let direct_io = std::env::var("AUDIT_DIRECT_IO").as_deref() != Ok("0");
+        let path = std::path::Path::new(&directory).join("cache.t4");
+        let _ = std::fs::remove_file(&path);
+        let file_len = || std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+
+        println!("audit: mounting {} direct_io={direct_io}", path.display());
+        let store = match t4::mount_with_options(
+            &path,
+            t4::MountOptions {
+                direct_io,
+                ..Default::default()
+            },
+        )
+        .await
+        {
+            Ok(store) => store,
+            Err(error) => panic!("audit: t4 mount failed (direct_io={direct_io}): {error}"),
+        };
+        println!("audit: mounted; file length {}", file_len());
+
+        let cache = LiquidCacheBuilder::new()
+            .with_max_memory_bytes(256 << 10)
+            .with_max_disk_bytes(DISK_BUDGET)
+            .with_eviction_policy(Box::new(TranscodeEvict))
+            .with_cache_policy(Box::new(LiquidPolicy::new()))
+            .with_store(store.clone())
+            .build()
+            .await;
+
+        let inserts = BYTES_TO_OFFER / (ARRAY_VALUES * 8);
+        let (mut ok, mut full) = (0usize, 0usize);
+        let mut failure = None;
+        for i in 0..inserts {
+            let array = incompressible_array(i as u64 + 1, ARRAY_VALUES);
+            let task = {
+                let cache = cache.clone();
+                tokio::spawn(async move { cache.insert(EntryID::from(i), 0, array).await })
+            };
+            match tokio::time::timeout(std::time::Duration::from_secs(60), task).await {
+                Ok(Ok(Ok(()))) => ok += 1,
+                Ok(Ok(Err(CacheFull))) => full += 1,
+                Ok(Err(join_error)) if join_error.is_panic() => {
+                    failure = Some(format!(
+                        "insert #{i} PANICKED: {}",
+                        panic_message(join_error.into_panic().as_ref())
+                    ));
+                    break;
+                }
+                Ok(Err(join_error)) => {
+                    failure = Some(format!("insert #{i} was cancelled: {join_error}"));
+                    break;
+                }
+                Err(_) => {
+                    failure = Some(format!("insert #{i} HUNG for 60s"));
+                    break;
+                }
+            }
+        }
+
+        let length = file_len();
+        let charged = cache.budget().disk_usage_bytes();
+        println!(
+            "audit: inserts attempted      = {}",
+            ok + full + failure.is_some() as usize
+        );
+        println!("audit: inserts Ok             = {ok}");
+        println!("audit: inserts Err(CacheFull) = {full}");
+        println!(
+            "audit: bytes offered          = {}",
+            (ok + full) * ARRAY_VALUES * 8
+        );
+        println!("audit: disk budget            = {DISK_BUDGET}");
+        println!("audit: disk_usage_bytes       = {charged}");
+        println!(
+            "audit: memory_usage_bytes     = {}",
+            cache.budget().memory_usage_bytes()
+        );
+        println!("audit: t4 file length         = {length}");
+        println!("audit: t4 objects             = {:?}", store.len().await);
+        if charged > 0 {
+            println!(
+                "audit: file length / charge   = {:.3}",
+                length as f64 / charged as f64
+            );
+        }
+
+        if failure.is_some() {
+            // Whether the cache is still usable after the failure.
+            for i in inserts..inserts + 3 {
+                let array = incompressible_array(i as u64 + 1, ARRAY_VALUES);
+                let cache = cache.clone();
+                let task =
+                    tokio::spawn(async move { cache.insert(EntryID::from(i), 0, array).await });
+                let outcome =
+                    match tokio::time::timeout(std::time::Duration::from_secs(20), task).await {
+                        Ok(Ok(result)) => format!("{result:?}"),
+                        Ok(Err(join_error)) if join_error.is_panic() => format!(
+                            "PANICKED: {}",
+                            panic_message(join_error.into_panic().as_ref())
+                        ),
+                        Ok(Err(join_error)) => format!("cancelled: {join_error}"),
+                        Err(_) => "HUNG for 20s".to_string(),
+                    };
+                println!("audit: insert after the failure -> {outcome}");
+            }
+        }
+
+        if let Some(failure) = failure {
+            panic!(
+                "audit: {failure} (after {ok} Ok and {full} CacheFull; file length {length}, \
+                 disk charge {charged}, disk budget {DISK_BUDGET})"
+            );
+        }
     }
 }

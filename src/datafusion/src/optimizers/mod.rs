@@ -1505,6 +1505,287 @@ mod tests {
         let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(rows, 1);
     }
+
+    // ---- audit: DataFusion memory pool and the admission gate ----
+
+    fn audit_scan_parts(plan: &Arc<dyn ExecutionPlan>) -> (FileScanConfig, ParquetSource) {
+        let mut parts = None;
+        plan.apply(|node| {
+            if let Some((cfg, src)) = parquet_scan_parts(node) {
+                parts = Some((cfg.clone(), src.clone()));
+                return Ok(TreeNodeRecursion::Stop);
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })
+        .unwrap();
+        parts.expect("no parquet scan in plan")
+    }
+
+    fn audit_scrambled(len: usize, seed: u64) -> arrow::array::Int64Array {
+        let mut state = seed | 1;
+        arrow::array::Int64Array::from_iter_values((0..len).map(move |_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as i64
+        }))
+    }
+
+    /// Finding 1: nothing in the scan or the cache reserves from the session's
+    /// `MemoryPool`, so DataFusion cannot see (or refuse) the memory they hold.
+    #[tokio::test]
+    async fn audit_liquid_scan_reserves_from_datafusion_memory_pool() {
+        use crate::cache::snapshot_test_registry::live_totals;
+        use datafusion::execution::{
+            SessionStateBuilder,
+            memory_pool::{GreedyMemoryPool, MemoryPool},
+            runtime_env::RuntimeEnvBuilder,
+        };
+        use futures::StreamExt;
+        const POOL_LIMIT: usize = 64 * 1024;
+        const ROWS_PER_GROUP: usize = 65_536;
+        const ROW_GROUPS: usize = 4;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pool.parquet");
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        let mut writer =
+            ArrowWriter::try_new(File::create(&path).unwrap(), schema.clone(), None).unwrap();
+        for group in 0..ROW_GROUPS {
+            let values = audit_scrambled(ROWS_PER_GROUP, 0x9E37_79B9 + group as u64);
+            writer
+                .write(&RecordBatch::try_new(schema.clone(), vec![Arc::new(values)]).unwrap())
+                .unwrap();
+            writer.flush().unwrap();
+        }
+        writer.close().unwrap();
+
+        let pool = Arc::new(GreedyMemoryPool::new(POOL_LIMIT));
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_pool(pool.clone())
+            .build_arc()
+            .unwrap();
+        let cache = make_cache_with_mem_disk(dir.path(), 64 << 20, usize::MAX).await;
+        let state = SessionStateBuilder::new()
+            .with_config(SessionConfig::new().with_target_partitions(1))
+            .with_runtime_env(runtime)
+            .with_default_features()
+            .with_physical_optimizer_rule(Arc::new(LocalModeOptimizer::new(cache.clone())))
+            .build();
+        let ctx = SessionContext::new_with_state(state);
+        ctx.register_parquet("t", path.to_str().unwrap(), Default::default())
+            .await
+            .unwrap();
+        let plan = ctx
+            .sql("SELECT a FROM t")
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        assert!(has_liquid_source(&plan), "scan was not routed to the cache");
+        let plan_text = DisplayableExecutionPlan::new(plan.as_ref())
+            .one_line()
+            .to_string();
+
+        let mut stream = datafusion::physical_plan::execute_stream(plan, ctx.task_ctx()).unwrap();
+        let (mut rows, mut peak_reserved, mut peak_cache, mut peak_snapshots) = (0, 0, 0, 0);
+        let mut error = None;
+        while let Some(batch) = stream.next().await {
+            match batch {
+                Ok(batch) => rows += batch.num_rows(),
+                Err(e) => {
+                    error = Some(e.to_string());
+                    break;
+                }
+            }
+            peak_reserved = peak_reserved.max(pool.reserved());
+            peak_cache = peak_cache.max(cache.memory_usage_bytes());
+            peak_snapshots = peak_snapshots.max(live_totals().2);
+        }
+        println!(
+            "[audit memory pool] plan={plan_text:?} rows={rows} error={error:?} \
+             pool_limit={POOL_LIMIT} peak pool.reserved()={peak_reserved} \
+             peak cache.memory_usage_bytes()={peak_cache} peak snapshot_bytes={peak_snapshots} \
+             held/pool_limit={:.1}",
+            (peak_cache + peak_snapshots) as f64 / POOL_LIMIT as f64
+        );
+        assert!(
+            peak_cache + peak_snapshots > POOL_LIMIT,
+            "scan held too little to exercise the pool"
+        );
+        assert!(
+            peak_reserved > 0 || error.is_some(),
+            "the scan held {peak_cache} cache bytes + {peak_snapshots} snapshot bytes \
+             ({:.1}x the {POOL_LIMIT}-byte DataFusion memory pool) and returned {rows} rows, yet \
+             pool.reserved() peaked at {peak_reserved} and no ResourcesExhausted was raised",
+            (peak_cache + peak_snapshots) as f64 / POOL_LIMIT as f64
+        );
+    }
+
+    /// Finding 9a: the gate compares the scan's footprint with the cache's
+    /// configured capacity, never with what the cache already holds.
+    #[tokio::test]
+    async fn audit_admission_gate_declines_a_scan_when_cache_is_already_full() {
+        use crate::cache::{BatchID, ParquetFileIdentity};
+        use datafusion::execution::object_store::ObjectStoreUrl;
+
+        let plan = nano_hits_plan().await;
+        let config = ConfigOptions::default();
+        let (cfg, src) = audit_scan_parts(&plan);
+        let estimate = estimate_required_bytes(&cfg, &src);
+        // A cache exactly as large as the scan's footprint, with no disk tier.
+        let capacity = estimate.raw_bytes as usize;
+        let dir = tempfile::tempdir().unwrap();
+        let cache = make_cache_with_mem_disk(dir.path(), capacity, 0).await;
+        let gated = |cache: &LiquidCacheParquetRef| {
+            LocalModeOptimizer::new(cache.clone()).with_admission_gate(1.0, 1.0, 1.0, false)
+        };
+        let admitted_empty =
+            has_liquid_source(&gated(&cache).optimize(plan.clone(), &config).unwrap());
+
+        // Fill the cache with another file's data.
+        let other_schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
+        let other = cache.register_or_get_file(
+            ParquetFileIdentity::new(
+                ObjectStoreUrl::local_filesystem(),
+                "other.parquet".to_string(),
+            ),
+            other_schema,
+        );
+        let column = other.create_row_group(0, vec![]).get_column(0).unwrap();
+        let mut inserted = 0;
+        for batch in 0..u16::MAX {
+            if cache.memory_usage_bytes() * 10 >= capacity * 9 {
+                break;
+            }
+            let array = Arc::new(audit_scrambled(8192, 0xA5A5_0000 + batch as u64));
+            if column
+                .insert(BatchID::from_raw(batch), array)
+                .await
+                .is_err()
+            {
+                break;
+            }
+            inserted += 1;
+        }
+        let used = cache.memory_usage_bytes();
+        let admitted_full = has_liquid_source(&gated(&cache).optimize(plan, &config).unwrap());
+        println!(
+            "[audit admission/stateless] scan raw_bytes={} (required_cols={} fallback_files={}) \
+             cache max_memory_bytes={capacity} max_disk_bytes=0 gate(expansion=1,safety=1,\
+             tolerance=1): admitted with empty cache={admitted_empty}; after {inserted} batches \
+             of another file memory_usage_bytes={used} ({:.1}% full, headroom {}): \
+             admitted={admitted_full}",
+            estimate.raw_bytes,
+            estimate.required_cols,
+            estimate.fallback_files,
+            100.0 * used as f64 / capacity as f64,
+            capacity.saturating_sub(used)
+        );
+        assert!(admitted_empty, "precondition: the scan fits an empty cache");
+        assert!(
+            used * 10 >= capacity * 9,
+            "precondition: could not fill the cache ({used}/{capacity})"
+        );
+        assert!(
+            !admitted_full,
+            "a scan with a {}-byte footprint was admitted into a {capacity}-byte cache that \
+             already holds {used} bytes ({:.1}% full, headroom {} bytes, no disk tier)",
+            estimate.raw_bytes,
+            100.0 * used as f64 / capacity as f64,
+            capacity.saturating_sub(used)
+        );
+    }
+
+    /// Finding 9b: without per-column statistics the estimate is the compressed
+    /// object size, which is smaller than the with-statistics estimate of the
+    /// very same file — the "conservative" fallback is the optimistic one.
+    #[tokio::test]
+    async fn audit_admission_estimate_without_statistics_is_not_smaller() {
+        use datafusion_datasource::file_groups::FileGroup;
+        const COLUMNS: usize = 16;
+        const ROWS: usize = 200_000;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wide.parquet");
+        let schema = Arc::new(Schema::new(
+            (0..COLUMNS)
+                .map(|c| Field::new(format!("c{c}"), DataType::Int64, false))
+                .collect::<Vec<_>>(),
+        ));
+        let columns = (0..COLUMNS)
+            .map(|c| {
+                Arc::new(arrow::array::Int64Array::from(vec![c as i64; ROWS]))
+                    as arrow::array::ArrayRef
+            })
+            .collect::<Vec<_>>();
+        let mut writer =
+            ArrowWriter::try_new(File::create(&path).unwrap(), schema.clone(), None).unwrap();
+        writer
+            .write(&RecordBatch::try_new(schema, columns).unwrap())
+            .unwrap();
+        writer.close().unwrap();
+        let file_size = std::fs::metadata(&path).unwrap().len();
+
+        let ctx = SessionContext::new_with_config(
+            SessionConfig::new()
+                .with_target_partitions(1)
+                .with_collect_statistics(true),
+        );
+        ctx.register_parquet("t", path.to_str().unwrap(), Default::default())
+            .await
+            .unwrap();
+        let plan = ctx
+            .sql("SELECT * FROM t")
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let (cfg, src) = audit_scan_parts(&plan);
+        let with_stats = estimate_required_bytes(&cfg, &src);
+
+        let mut stripped = cfg.clone();
+        stripped.file_groups = cfg
+            .file_groups
+            .iter()
+            .map(|group| {
+                FileGroup::new(
+                    group
+                        .files()
+                        .iter()
+                        .cloned()
+                        .map(|mut file| {
+                            file.statistics = None;
+                            file
+                        })
+                        .collect(),
+                )
+            })
+            .collect();
+        let without_stats = estimate_required_bytes(&stripped, &src);
+        println!(
+            "[audit admission/no-stats] columns={COLUMNS} rows={ROWS} decoded_bytes={} \
+             file_size(object_meta.size)={file_size} with_stats={with_stats:?} \
+             without_stats={without_stats:?} without/with={:.5}",
+            COLUMNS * ROWS * 8,
+            without_stats.raw_bytes as f64 / with_stats.raw_bytes as f64
+        );
+        assert_eq!(
+            (with_stats.fallback_files, without_stats.fallback_files),
+            (0, 1),
+            "precondition: stats path with stats, whole-file fallback without"
+        );
+        assert!(
+            without_stats.raw_bytes >= with_stats.raw_bytes,
+            "the no-statistics fallback estimates {} bytes (the compressed file size) for a scan \
+             the statistics path estimates at {} bytes: {:.5}x, so the fallback under-counts",
+            without_stats.raw_bytes,
+            with_stats.raw_bytes,
+            without_stats.raw_bytes as f64 / with_stats.raw_bytes as f64
+        );
+    }
 }
 
 /// Pure unit tests for the footprint byte-math (no cache / no t4 mount, so they

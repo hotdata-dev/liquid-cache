@@ -217,4 +217,70 @@ mod tests {
         assert!(budget.try_reserve_disk(250).is_ok());
         assert_eq!(budget.disk_usage_bytes(), 1000);
     }
+
+    /// What the next reservation of one byte does: `Ok`/`Err` from the
+    /// budget, or the panic message if the addition overflowed.
+    fn describe_next_reservation(reserve: impl FnOnce() -> Result<(), ()>) -> String {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(reserve)) {
+            Ok(result) => format!("returned {result:?}"),
+            Err(panic) => format!(
+                "panicked: {}",
+                panic
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "<non-string panic>".to_string())
+            ),
+        }
+    }
+
+    /// Releasing more disk than is charged must not wrap the counter: usage
+    /// can never read above the limit it is compared against.
+    #[test]
+    fn audit_release_disk_beyond_usage_does_not_wrap() {
+        let max_disk = 1000;
+        let budget = test_budget(usize::MAX, max_disk);
+
+        budget.release_disk(1);
+        let usage = budget.disk_usage_bytes();
+        let next = describe_next_reservation(|| budget.try_reserve_disk(1));
+        println!(
+            "audit: fresh disk budget, release_disk(1): usage={usage} (usize::MAX={}), \
+             max={max_disk}; next try_reserve_disk(1) {next}",
+            usize::MAX
+        );
+
+        assert!(
+            usage <= max_disk,
+            "release_disk(1) on an empty budget left disk usage at {usage}, over the \
+             limit of {max_disk}; the next try_reserve_disk(1) {next}"
+        );
+        assert_eq!(usage, 0);
+    }
+
+    /// The same for memory, through the shrink path of
+    /// `try_update_memory_usage`.
+    #[test]
+    fn audit_memory_shrink_beyond_usage_does_not_wrap() {
+        let max_memory = 1000;
+        let budget = test_budget(max_memory, usize::MAX);
+
+        budget
+            .try_update_memory_usage(1, 0)
+            .expect("a release cannot fail");
+        let usage = budget.memory_usage_bytes();
+        let next = describe_next_reservation(|| budget.try_reserve_memory(1));
+        println!(
+            "audit: fresh memory budget, try_update_memory_usage(1, 0): usage={usage} \
+             (usize::MAX={}), max={max_memory}; next try_reserve_memory(1) {next}",
+            usize::MAX
+        );
+
+        assert!(
+            usage <= max_memory,
+            "try_update_memory_usage(1, 0) on an empty budget left memory usage at \
+             {usage}, over the limit of {max_memory}; the next try_reserve_memory(1) {next}"
+        );
+        assert_eq!(usage, 0);
+    }
 }

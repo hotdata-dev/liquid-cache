@@ -2,6 +2,8 @@
 #![doc = include_str!("../README.md")]
 
 #[cfg(test)]
+mod audit_tests;
+#[cfg(test)]
 mod tests;
 
 use std::path::PathBuf;
