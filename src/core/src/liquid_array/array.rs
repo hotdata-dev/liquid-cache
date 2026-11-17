@@ -274,6 +274,11 @@ impl LiquidArray {
                 | DataFusionOperator::GtEq => {
                     let op = vortex_operator(binary.op())?;
                     let constant = self.constant(literal.value(), array.len())?;
+                    let array = if matches!(op, Operator::Eq | Operator::NotEq) {
+                        with_private_fsst_symbol_tables(array).ok()?
+                    } else {
+                        array.clone()
+                    };
                     array.binary(constant, op).ok()
                 }
                 DataFusionOperator::LikeMatch | DataFusionOperator::NotLikeMatch => self.try_like(
@@ -485,6 +490,41 @@ fn heap_size(array: &vortex_array::ArrayRef, block: &ByteBuffer) -> usize {
         size += block.len();
     }
     size
+}
+
+/// `array` with every FSST node given a symbol table of its own.
+///
+/// FSST evaluates `=` and `!=` by compressing the literal, and memoizes the
+/// compressor it builds for that (about 160 KiB) in the node's symbol table.
+/// Slices and filters share that table with the cached entry, so the first
+/// such predicate would grow the entry for the rest of its life, and nothing
+/// recharges it. With a private table, the compressor is freed with the
+/// predicate's array. Only the table is copied (2.3 KiB); the codes are not.
+fn with_private_fsst_symbol_tables(
+    array: &vortex_array::ArrayRef,
+) -> VortexResult<vortex_array::ArrayRef> {
+    if !array.depth_first_traversal().any(|node| node.is::<FSST>()) {
+        return Ok(array.clone());
+    }
+    let slots = array
+        .slots()
+        .iter()
+        .map(|slot| {
+            slot.as_ref()
+                .map(with_private_fsst_symbol_tables)
+                .transpose()
+        })
+        .collect::<VortexResult<vortex_array::ArraySlots>>()?;
+    // SAFETY: every slot is replaced by the same values with, at most, a new
+    // FSST symbol table holding the same symbols.
+    let array = unsafe { array.clone().with_slots(slots)? };
+    if !array.is::<FSST>() {
+        return Ok(array);
+    }
+    // Rebuilding an FSST node from its own buffers builds a new symbol table.
+    // SAFETY: the buffers are the node's own.
+    let buffers = array.buffer_handles();
+    unsafe { array.with_buffers(buffers) }
 }
 
 fn read_u32(bytes: &[u8], at: usize) -> u32 {

@@ -10,12 +10,19 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::sync::Arc;
 
+use arrow::array::{Array, AsArray};
 use arrow::array::{
     ArrayRef, BinaryArray, Date32Array, Decimal128Array, DictionaryArray, Float64Array, Int32Array,
     Int64Array, StringArray, StringViewArray, TimestampMicrosecondArray,
 };
+use arrow::buffer::BooleanBuffer;
 use arrow::datatypes::UInt16Type;
-use liquid_cache::liquid_array::LiquidArray;
+use datafusion_common::ScalarValue;
+use datafusion_expr_common::operator::Operator;
+use datafusion_physical_expr::PhysicalExpr;
+use datafusion_physical_expr::expressions::{BinaryExpr, Column, Literal};
+use liquid_cache::cache::LiquidExpr;
+use liquid_cache::liquid_array::{LiquidArray, eval_predicate_on_array};
 
 struct Counting;
 
@@ -341,6 +348,119 @@ fn charge_matches_the_heap_an_entry_holds() {
     assert!(
         failures.is_empty(),
         "charges more than 10% + 256 bytes off the heap held:\n  {}",
+        failures.join("\n  ")
+    );
+}
+
+/// A column, and how to make a literal of its type.
+type StringColumn = (&'static str, ArrayRef, fn(String) -> ScalarValue);
+
+fn fsst_columns() -> Vec<StringColumn> {
+    let strings = |words: usize| -> Vec<String> {
+        let mut rng = Rng(77);
+        (0..ROWS)
+            .map(|_| (0..words).map(|_| format!("{:016x}", rng.next())).collect())
+            .collect()
+    };
+    vec![
+        (
+            "Utf8 hex16",
+            Arc::new(StringArray::from_iter_values(strings(1))),
+            |value| ScalarValue::Utf8(Some(value)),
+        ),
+        (
+            "Utf8 hex128",
+            Arc::new(StringArray::from_iter_values(strings(8))),
+            |value| ScalarValue::Utf8(Some(value)),
+        ),
+        (
+            "Utf8View hex128",
+            Arc::new(StringViewArray::from_iter_values(strings(8))),
+            |value| ScalarValue::Utf8View(Some(value)),
+        ),
+        (
+            "Dictionary<UInt16, Utf8> hex16 over 4096 values",
+            {
+                let values = strings(1);
+                let dictionary: DictionaryArray<UInt16Type> =
+                    (0..ROWS).map(|row| values[row % 4096].as_str()).collect();
+                Arc::new(dictionary)
+            },
+            |value| ScalarValue::Utf8(Some(value)),
+        ),
+    ]
+}
+
+/// The heap a cached entry gains from evaluating `op` against one of its own
+/// values, once the result is dropped, and how much its charge grew.
+fn growth_from_predicate(
+    source: &ArrayRef,
+    literal: ScalarValue,
+    op: Operator,
+) -> (isize, isize, LiquidArray) {
+    let liquid = LiquidArray::from_arrow_array(source).unwrap();
+    let expr: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+        Arc::new(Column::new("c", 0)),
+        op,
+        Arc::new(Literal::new(literal)),
+    ));
+    let expr = LiquidExpr::try_new(expr, source.data_type()).unwrap();
+    let selection = BooleanBuffer::new_set(ROWS);
+    let base = live();
+    let charged = liquid.get_array_memory_size() as isize;
+    let matches = liquid.try_eval_predicate(&expr, &selection);
+    assert!(
+        matches.true_count() > 0,
+        "the literal is a value of the column"
+    );
+    assert_eq!(matches, eval_predicate_on_array(source.clone(), &expr));
+    drop(matches);
+    let grown = live() - base;
+    let charge_grown = liquid.get_array_memory_size() as isize - charged;
+    (grown, charge_grown, liquid)
+}
+
+/// A predicate is a read. Evaluating one must not leave the cached entry
+/// holding more than it is charged for: FSST `=` and `!=` used to build a
+/// 160 KiB compressor for the literal and keep it in the entry.
+#[test]
+fn predicates_do_not_grow_an_entry_past_its_charge() {
+    let mut failures = Vec::new();
+    for (name, source, scalar) in fsst_columns() {
+        let needle = source
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .map(|strings| strings.value(100).to_string())
+            .or_else(|| {
+                source
+                    .as_any()
+                    .downcast_ref::<StringViewArray>()
+                    .map(|strings| strings.value(100).to_string())
+            })
+            .unwrap_or_else(|| {
+                let dictionary = source.as_dictionary::<UInt16Type>();
+                let values = dictionary.values().as_string::<i32>();
+                values
+                    .value(dictionary.keys().value(100) as usize)
+                    .to_string()
+            });
+        for op in [Operator::Eq, Operator::NotEq, Operator::Lt] {
+            // Build lazily initialized statics on a throwaway entry first.
+            drop(growth_from_predicate(&source, scalar(needle.clone()), op));
+            let (grown, charge_grown, liquid) =
+                growth_from_predicate(&source, scalar(needle.clone()), op);
+            println!("{name:<48} {op:<3} heap +{grown:>7} charge +{charge_grown:>7}");
+            if grown > charge_grown + 4096 {
+                failures.push(format!(
+                    "{name} {op}: entry grew {grown} bytes, charge grew {charge_grown}"
+                ));
+            }
+            drop(liquid);
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "predicates grew entries past their charge:\n  {}",
         failures.join("\n  ")
     );
 }
