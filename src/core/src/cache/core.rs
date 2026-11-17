@@ -597,7 +597,7 @@ impl LiquidCache {
                 kind: CachedBatchType::from(&not_inserted),
             });
 
-            let victims = self.cache_policy.find_memory_victim(8);
+            let victims = self.find_memory_victims_for(not_inserted.memory_usage_bytes());
             if victims.is_empty() {
                 // no advice, because the cache is already empty
                 // this can happen if the entry to be inserted is too large, in that case,
@@ -615,6 +615,49 @@ impl LiquidCache {
             crate::utils::yield_now_if_shuttle();
         }
     }
+
+    /// Memory victims holding enough to make room for `bytes`, at most
+    /// [`Self::MAX_MEMORY_VICTIMS`] of them, and at least one if the policy
+    /// offers any.
+    ///
+    /// Victims are taken one at a time until what they hold covers what the
+    /// budget lacks. A victim that transcodes in memory frees less than it
+    /// holds, so the insert can come back for more; taking a fixed batch
+    /// instead would evict several entries to make room for one.
+    fn find_memory_victims_for(&self, bytes: usize) -> Vec<EntryID> {
+        let free = self
+            .config
+            .max_memory_bytes()
+            .saturating_sub(self.budget.memory_usage_bytes());
+        let mut lacking = bytes.saturating_sub(free).max(1);
+        let mut victims = Vec::new();
+        while lacking > 0 && victims.len() < Self::MAX_MEMORY_VICTIMS {
+            let mut offered_new = false;
+            // A policy may hand out more than asked; every victim it hands
+            // out is off its queues, so all of them are kept.
+            for victim in self.cache_policy.find_memory_victim(1) {
+                if victims.contains(&victim) {
+                    continue;
+                }
+                let held = self
+                    .index
+                    .get(&victim)
+                    .map_or(0, |slot| slot.entry.memory_usage_bytes());
+                lacking = lacking.saturating_sub(held);
+                victims.push(victim);
+                offered_new = true;
+            }
+            // Nothing left to offer, or a policy that offers the same victim
+            // whatever was taken.
+            if !offered_new {
+                break;
+            }
+        }
+        victims
+    }
+
+    /// The most memory victims one round of an insert's eviction takes.
+    const MAX_MEMORY_VICTIMS: usize = 8;
 
     /// Create a new instance of CacheStorage.
     #[allow(clippy::too_many_arguments)]
@@ -2865,6 +2908,45 @@ mod tests {
                 cache.index().get(&arrow_id).unwrap().entry,
                 CacheEntry::MemoryLiquid(_)
             ));
+            assert_memory_budget_matches_index(&cache);
+            assert_eq!(drain_memory_victims(&cache), memory_keys(&cache));
+        }
+    }
+
+    /// One insert into a memory tier full of Arrow entries needs the room of
+    /// one entry, and transcoding one victim frees nearly all of it. It must
+    /// not transcode more: each costs an encode, and Liquid is slower to
+    /// read than the Arrow it replaces.
+    #[tokio::test]
+    async fn one_insert_into_full_memory_evicts_only_what_it_needs() {
+        for concurrently in [false, true] {
+            let array = create_test_arrow_array(4096);
+            let one = CacheEntry::memory_arrow(array.clone()).memory_usage_bytes();
+            let transcoded = liquid_entry(&array).memory_usage_bytes();
+            let cache = memory_only_cache_evicting(20 * one + transcoded, concurrently).await;
+            for id in 0usize..20 {
+                cache
+                    .insert(EntryID::from(id), 0, array.clone())
+                    .await
+                    .unwrap();
+            }
+
+            cache
+                .insert(EntryID::from(20usize), 0, array.clone())
+                .await
+                .unwrap();
+
+            let mut transcoded_entries = 0;
+            cache.index().for_each(|_, slot| {
+                if matches!(slot.entry, CacheEntry::MemoryLiquid(_)) {
+                    transcoded_entries += 1;
+                }
+            });
+            assert_eq!(
+                transcoded_entries, 1,
+                "one insert transcoded {transcoded_entries} entries, where one made room \
+                 (concurrently={concurrently})"
+            );
             assert_memory_budget_matches_index(&cache);
             assert_eq!(drain_memory_victims(&cache), memory_keys(&cache));
         }
