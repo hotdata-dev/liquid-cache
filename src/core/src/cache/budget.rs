@@ -78,11 +78,9 @@ impl BudgetAccounting {
         if released > assumed {
             release(&self.used_memory_bytes, released - assumed);
         } else if assumed > released {
-            let _ =
-                self.used_memory_bytes
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
-                        Some(used.saturating_add(assumed - released))
-                    });
+            let _ = update(&self.used_memory_bytes, |used| {
+                Some(used.saturating_add(assumed - released))
+            });
         }
     }
 
@@ -109,12 +107,29 @@ impl BudgetAccounting {
 
 /// Add `request_bytes` to `used` if the sum stays within `max_bytes`.
 fn reserve(used: &AtomicUsize, request_bytes: usize, max_bytes: usize) -> Result<(), ()> {
-    used.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+    update(used, |used| {
         used.checked_add(request_bytes)
             .filter(|&reserved| reserved <= max_bytes)
     })
     .map(|_| ())
     .map_err(|_| ())
+}
+
+/// Replace `atomic`'s value with `f` of it, retrying if another thread
+/// changes it meanwhile, unless `f` returns `None`. Returns the value `f`
+/// was last given.
+///
+/// What `fetch_update` does; spelled out because newer toolchains deprecate
+/// that name for `try_update`, which older ones and shuttle's atomics lack.
+fn update(atomic: &AtomicUsize, f: impl Fn(usize) -> Option<usize>) -> Result<usize, usize> {
+    let mut current = atomic.load(Ordering::Relaxed);
+    loop {
+        let new = f(current).ok_or(current)?;
+        match atomic.compare_exchange_weak(current, new, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(previous) => return Ok(previous),
+            Err(actual) => current = actual,
+        }
+    }
 }
 
 /// Take `bytes` off `used`, stopping at zero.
@@ -124,9 +139,7 @@ fn reserve(used: &AtomicUsize, request_bytes: usize, max_bytes: usize) -> Result
 /// would refuse every reservation from then on; stopping at zero keeps the
 /// error to the size of the mismatch.
 fn release(used: &AtomicUsize, bytes: usize) {
-    let _ = used.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
-        Some(used.saturating_sub(bytes))
-    });
+    let _ = update(used, |used| Some(used.saturating_sub(bytes)));
 }
 
 #[cfg(test)]
