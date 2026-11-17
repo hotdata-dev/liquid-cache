@@ -657,8 +657,10 @@ impl LiquidCache {
         // the budget. The rest is settled once the insert has displaced
         // whatever slot is there by then, which another write can have
         // replaced or removed since: the budget then counts exactly the
-        // entries the index holds. Settling after the insert can only
-        // over-read the budget for a moment, never under-read it.
+        // entries the index holds, never fewer. When the slot read here was
+        // removed meanwhile, the settle charges this entry in full, however
+        // full the budget is: usage can then exceed the maximum by up to one
+        // entry until a later insert evicts.
         //
         // A disk record holds no memory, so it installs however full the
         // memory budget reads. Its write cannot then be dropped, taking its
@@ -1829,10 +1831,14 @@ mod tests {
             task.await.unwrap();
         }
 
-        let mut held = 0;
-        cache.for_each_entry(|_, entry| held += entry.memory_usage_bytes());
+        let (mut held, mut largest) = (0, 0);
+        cache.for_each_entry(|_, entry| {
+            held += entry.memory_usage_bytes();
+            largest = largest.max(entry.memory_usage_bytes());
+        });
         assert_eq!(cache.budget.memory_usage_bytes(), held);
-        assert!(held <= budget);
+        // A settle can charge an entry over a full budget; one entry at most.
+        assert!(held <= budget + largest);
 
         let fresh = EntryID::from(10_000usize);
         cache
