@@ -352,6 +352,44 @@ fn charge_matches_the_heap_an_entry_holds() {
     );
 }
 
+/// Small string batches, where an FSST node's fixed overhead is a large part
+/// of the entry. The charge must still cover the heap held. It may overshoot:
+/// a full symbol table (255 symbols, as high-entropy strings produce) holds
+/// about 2.6 KB outside the block rather than the 4.8 KB charged for one, and
+/// over-charging only costs cache space, where under-charging overruns memory.
+#[test]
+fn charge_matches_the_heap_of_small_string_batches() {
+    let mut failures = Vec::new();
+    for rows in [128, 512, 2048] {
+        let mut rng = Rng(91);
+        let hex16: ArrayRef = Arc::new(StringArray::from_iter_values(
+            (0..rows).map(|_| format!("{:016x}", rng.next())),
+        ));
+        let urls: ArrayRef =
+            Arc::new(StringArray::from_iter_values((0..rows).map(|row| {
+                format!("https://example.com/page/{}?q={}", row % 97, row)
+            })));
+        for (name, source) in [("Utf8 hex16", hex16), ("Utf8 urls", urls)] {
+            let (real, charged) = measure(&source);
+            println!(
+                "{name} x{rows:<5} charged {charged:>8} real {real:>8} ({:.2}x)",
+                real as f64 / charged as f64
+            );
+            if !at_most_about(real, charged) {
+                failures.push(format!(
+                    "{name} x{rows}: holds {real} bytes, charged {charged} ({:.2}x)",
+                    real as f64 / charged as f64
+                ));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "entries hold more than 10% + 256 bytes over their charge:\n  {}",
+        failures.join("\n  ")
+    );
+}
+
 /// A column, and how to make a literal of its type.
 type StringColumn = (&'static str, ArrayRef, fn(String) -> ScalarValue);
 
@@ -427,6 +465,10 @@ fn growth_from_predicate(
 fn predicates_do_not_grow_an_entry_past_its_charge() {
     let mut failures = Vec::new();
     for (name, source, scalar) in fsst_columns() {
+        assert!(
+            LiquidArray::from_arrow_array(&source).unwrap().uses_fsst(),
+            "{name} is not FSST-compressed, so this test no longer exercises FSST"
+        );
         let needle = source
             .as_any()
             .downcast_ref::<StringArray>()

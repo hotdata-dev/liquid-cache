@@ -363,6 +363,14 @@ impl LiquidArray {
 }
 
 impl LiquidArray {
+    /// Whether any node of the encoded array is FSST-compressed strings.
+    #[doc(hidden)]
+    pub fn uses_fsst(&self) -> bool {
+        self.array
+            .depth_first_traversal()
+            .any(|node| node.is::<FSST>())
+    }
+
     /// Get the memory size of the Liquid array.
     pub fn get_array_memory_size(&self) -> usize {
         self.memory_size
@@ -448,6 +456,13 @@ fn header_bytes(alignment: Alignment) -> [u8; HEADER_SIZE] {
 /// Heap each node of a decoded Vortex tree holds besides its buffers: the
 /// shared array allocation, its statistics set, slots and dtype. Measured
 /// with a counting allocator (`tests/liquid_array_memory.rs`).
+///
+/// Both constants depend on Vortex's internals and can drift when it is
+/// upgraded; `charge_matches_the_heap_an_entry_holds` then fails. To
+/// re-derive them, run `cargo test -p liquid-cache --test liquid_array_memory
+/// -- --nocapture`, which prints each fixture's charge and real heap, and
+/// adjust until the ratios sit around 1.0: `NODE_HEAP` from the fixtures with
+/// the most nodes per byte, then `FSST_SYMBOL_TABLE_HEAP` from the FSST ones.
 const NODE_HEAP: usize = 640;
 /// Heap an FSST node holds besides that: the decoder re-pads its symbol
 /// table to the full 256 entries of 8-byte symbols and 1-byte lengths, each
