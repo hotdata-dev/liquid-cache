@@ -21,9 +21,9 @@ plan:
 stats:
 entries.total: 8
 entries.after_first_run: 8
-entries.memory.arrow: 5
-entries.memory.liquid: 1
-entries.disk.liquid: 2
+entries.memory.arrow: 2
+entries.memory.liquid: 6
+entries.disk.liquid: 0
 entries.disk.arrow: 0
 usage.memory_bytes: [bytes]
 usage.disk_bytes: [bytes]
@@ -32,7 +32,7 @@ RuntimeStatsSnapshot:
   get_with_selection: 4
   eval_predicate: 2
   try_read_liquid_calls: 0
-  read_io_count: 0
+  read_io_count: 1
   write_io_count: 0
   disk_evictions: 0
   disk_reservation_failures: 0
@@ -170,15 +170,15 @@ plan:
 stats:
 entries.total: 8
 entries.after_first_run: 8
-entries.memory.arrow: 5
-entries.memory.liquid: 1
-entries.disk.liquid: 2
+entries.memory.arrow: 2
+entries.memory.liquid: 6
+entries.disk.liquid: 0
 entries.disk.arrow: 0
 usage.memory_bytes: [bytes]
 usage.disk_bytes: [bytes]
 RuntimeStatsSnapshot:
-  get: 5
-  get_with_selection: 5
+  get: 3
+  get_with_selection: 3
   eval_predicate: 0
   try_read_liquid_calls: 3
   read_io_count: 0
@@ -209,8 +209,8 @@ plan:
 stats:
 entries.total: 8
 entries.after_first_run: 8
-entries.memory.arrow: 5
-entries.memory.liquid: 3
+entries.memory.arrow: 2
+entries.memory.liquid: 6
 entries.disk.liquid: 0
 entries.disk.arrow: 0
 usage.memory_bytes: [bytes]

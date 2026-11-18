@@ -37,7 +37,7 @@ impl BudgetAccounting {
     /// Returns ok if the memory was reserved, err if the memory budget is full.
     pub(super) fn try_reserve_memory(&self, request_bytes: usize) -> Result<(), ()> {
         let used = self.used_memory_bytes.load(Ordering::Relaxed);
-        if used + request_bytes > self.max_memory_bytes {
+        if used.saturating_add(request_bytes) > self.max_memory_bytes {
             return Err(());
         }
 
@@ -50,6 +50,12 @@ impl BudgetAccounting {
             Ok(_) => Ok(()),
             Err(_) => self.try_reserve_memory(request_bytes),
         }
+    }
+
+    /// Charge `bytes` of memory whatever the budget reads: for memory an
+    /// entry already holds, which the budget missed.
+    pub(super) fn charge_memory(&self, bytes: usize) {
+        self.used_memory_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 
     /// Adjust memory usage after transcoding.

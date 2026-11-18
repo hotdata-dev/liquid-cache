@@ -7,10 +7,10 @@ use arrow::array::{Array, ArrayRef, BooleanArray, RecordBatch};
 use arrow::buffer::BooleanBuffer;
 use arrow::compute::prep_null_mask_filter;
 use arrow::record_batch::RecordBatchOptions;
-use arrow_schema::{ArrowError, SchemaRef};
+use arrow_schema::{ArrowError, Schema, SchemaRef};
 use futures::{Stream, StreamExt, future::BoxFuture, stream::BoxStream};
 use parquet::arrow::arrow_reader::{
-    ArrowReaderMetadata, ArrowReaderOptions, RowSelection, RowSelector,
+    ArrowPredicate, ArrowReaderMetadata, ArrowReaderOptions, RowSelection, RowSelector,
 };
 use parquet::arrow::{ParquetRecordBatchStreamBuilder, ProjectionMask};
 use parquet::errors::ParquetError;
@@ -331,18 +331,66 @@ impl LiquidCacheReaderInner {
             return Ok(selection);
         }
 
-        self.read_parquet_batch_and_fill_cache(self.current_batch_id)
+        let record_batch = self
+            .read_parquet_batch_and_fill_cache(self.current_batch_id)
             .await?;
-        apply_predicates(
+        if let Some(selection) = apply_predicates(
             &self.cached_row_group,
             self.current_batch_id,
-            input_selection,
+            input_selection.clone(),
             filter,
         )
         .await?
-        .ok_or_else(|| {
-            ArrowError::ComputeError("predicate unavailable after materialization".to_string())
-        })
+        {
+            return Ok(selection);
+        }
+        // A full cache can evict this batch's own columns while it caches the
+        // rest of them, so the predicates fall back to the batch just read.
+        self.apply_predicates_to_batch(&record_batch, input_selection, filter)
+    }
+
+    /// Evaluate `filter` over the rows of `record_batch` that `selection`
+    /// keeps, as [`apply_predicates`] does over the cache.
+    fn apply_predicates_to_batch(
+        &self,
+        record_batch: &RecordBatch,
+        mut selection: BooleanBuffer,
+        filter: &mut LiquidRowFilter,
+    ) -> Result<BooleanBuffer, ArrowError> {
+        for predicate in filter.predicates_mut() {
+            let selected_rows = selection.count_set_bits();
+            if selected_rows == 0 {
+                break;
+            }
+            let mut fields = Vec::new();
+            let mut arrays = Vec::new();
+            for column_id in predicate.predicate_column_ids() {
+                let column = self
+                    .cached_row_group
+                    .get_column(column_id as u64)
+                    .ok_or_else(|| {
+                        ArrowError::ComputeError(format!(
+                            "column {column_id} not present in liquid cache"
+                        ))
+                    })?;
+                fields.push(column.field());
+                arrays.push(filter_array(
+                    self.parquet_array(record_batch, column_id)?,
+                    &selection,
+                )?);
+            }
+            let options = RecordBatchOptions::new().with_row_count(Some(selected_rows));
+            let batch =
+                RecordBatch::try_new_with_options(Arc::new(Schema::new(fields)), arrays, &options)?;
+            let boolean_array = predicate.evaluate(batch)?;
+            let boolean_mask = if boolean_array.null_count() == 0 {
+                boolean_array.into_parts().0
+            } else {
+                prep_null_mask_filter(&boolean_array).into_parts().0
+            };
+            selection = boolean_buffer_and_then(&selection, &boolean_mask);
+        }
+        Ok(selection)
     }
 
     #[fastrace::trace]
