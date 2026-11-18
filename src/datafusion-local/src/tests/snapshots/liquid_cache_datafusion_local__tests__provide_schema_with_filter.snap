@@ -59,4 +59,5 @@ RuntimeStatsSnapshot:
   write_io_count: 0
   disk_evictions: 0
   disk_reservation_failures: 0
+  budget_underflows: 0
   eval_predicate_on_liquid_failed: 0

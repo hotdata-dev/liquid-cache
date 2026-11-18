@@ -4,7 +4,7 @@ use super::observer::Observer;
 use super::utils::EntryID;
 use crate::sync::{
     Arc, Mutex, Weak,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use ahash::AHashMap;
 
@@ -25,6 +25,8 @@ pub struct BudgetAccounting {
     used_memory_bytes: AtomicUsize,
     used_disk_bytes: AtomicUsize,
     held: HeldReleases,
+    /// Whether a release past zero has been logged; later ones are only counted.
+    underflow_logged: AtomicBool,
     observer: Arc<Observer>,
 }
 
@@ -40,6 +42,7 @@ impl BudgetAccounting {
             used_memory_bytes: AtomicUsize::new(0),
             used_disk_bytes: AtomicUsize::new(0),
             held: HeldReleases::default(),
+            underflow_logged: AtomicBool::new(false),
             observer,
         }
     }
@@ -50,6 +53,12 @@ impl BudgetAccounting {
         self.held.held_len.store(0, Ordering::Relaxed);
         self.used_memory_bytes.store(0, Ordering::Relaxed);
         self.used_disk_bytes.store(0, Ordering::Relaxed);
+    }
+
+    /// Set the memory usage outright, as accounting drift could leave it.
+    #[cfg(test)]
+    pub(super) fn set_memory_usage(&self, bytes: usize) {
+        self.used_memory_bytes.store(bytes, Ordering::Relaxed);
     }
 
     /// Record a snapshot of `entry_id` handed to a reader.
@@ -116,7 +125,7 @@ impl BudgetAccounting {
         self.held.held_len.store(held.len(), Ordering::Relaxed);
         drop(held);
         if freed > 0 {
-            self.used_memory_bytes.fetch_sub(freed, Ordering::Relaxed);
+            self.release_memory(freed);
         }
     }
 
@@ -135,37 +144,34 @@ impl BudgetAccounting {
     /// Try to reserve memory in the cache.
     /// Returns ok if the memory was reserved, err if the memory budget is full.
     pub(super) fn try_reserve_memory(&self, request_bytes: usize) -> Result<(), ()> {
-        let used = self.used_memory_bytes.load(Ordering::Relaxed);
-        if used.saturating_add(request_bytes) > self.max_memory_bytes {
-            if self.held.held_len.load(Ordering::Relaxed) > 0 {
-                self.sweep_held();
-                if self
-                    .used_memory_bytes
-                    .load(Ordering::Relaxed)
-                    .saturating_add(request_bytes)
-                    <= self.max_memory_bytes
-                {
-                    return self.try_reserve_memory(request_bytes);
-                }
-            }
+        if reserve(
+            &self.used_memory_bytes,
+            request_bytes,
+            self.max_memory_bytes,
+        )
+        .is_ok()
+        {
+            return Ok(());
+        }
+        // Held entries whose snapshots were dropped since the last sweep may
+        // still be charged; release them and try once more.
+        if self.held.held_len.load(Ordering::Relaxed) == 0 {
             return Err(());
         }
-
-        match self.used_memory_bytes.compare_exchange(
-            used,
-            used + request_bytes,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => Ok(()),
-            Err(_) => self.try_reserve_memory(request_bytes),
-        }
+        self.sweep_held();
+        reserve(
+            &self.used_memory_bytes,
+            request_bytes,
+            self.max_memory_bytes,
+        )
     }
 
     /// Charge `bytes` of memory whatever the budget reads: for memory an
     /// entry already holds, which the budget missed.
     pub(super) fn charge_memory(&self, bytes: usize) {
-        self.used_memory_bytes.fetch_add(bytes, Ordering::Relaxed);
+        let _ = update(&self.used_memory_bytes, |used| {
+            Some(used.saturating_add(bytes))
+        });
     }
 
     /// Adjust memory usage after transcoding.
@@ -180,8 +186,7 @@ impl BudgetAccounting {
             self.try_reserve_memory(diff)?;
             Ok(())
         } else {
-            self.used_memory_bytes
-                .fetch_sub(old_size - new_size, Ordering::Relaxed);
+            self.release_memory(old_size - new_size);
             Ok(())
         }
     }
@@ -197,25 +202,77 @@ impl BudgetAccounting {
     }
 
     pub(super) fn try_reserve_disk(&self, request_bytes: usize) -> Result<(), ()> {
-        let used = self.used_disk_bytes.load(Ordering::Relaxed);
-        if used + request_bytes > self.max_disk_bytes {
+        let reserved = reserve(&self.used_disk_bytes, request_bytes, self.max_disk_bytes);
+        if reserved.is_err() {
             self.observer.on_disk_reservation_failure();
-            return Err(());
         }
-
-        match self.used_disk_bytes.compare_exchange(
-            used,
-            used + request_bytes,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => Ok(()),
-            Err(_) => self.try_reserve_disk(request_bytes),
-        }
+        reserved
     }
 
     pub(super) fn release_disk(&self, bytes: usize) {
-        self.used_disk_bytes.fetch_sub(bytes, Ordering::Relaxed);
+        if let Some(charged) = release(&self.used_disk_bytes, bytes) {
+            self.report_underflow("disk", bytes, charged);
+        }
+    }
+
+    fn release_memory(&self, bytes: usize) {
+        if let Some(charged) = release(&self.used_memory_bytes, bytes) {
+            self.report_underflow("memory", bytes, charged);
+        }
+    }
+
+    /// A release past zero is an accounting error elsewhere: a charge given
+    /// back twice, or never taken. It is counted every time and logged once,
+    /// so a recurring error cannot flood the log. A reset that zeroes usage
+    /// while operations are in flight also leads here, when they release.
+    fn report_underflow(&self, tier: &str, released: usize, charged: usize) {
+        self.observer.on_budget_underflow();
+        if !self.underflow_logged.swap(true, Ordering::Relaxed) {
+            log::warn!(
+                "{tier} budget released {released} bytes with {charged} charged; usage clamped \
+                 at zero. Later occurrences are counted in budget_underflows."
+            );
+        }
+    }
+}
+
+/// Add `request_bytes` to `used` if the sum stays within `max_bytes`.
+fn reserve(used: &AtomicUsize, request_bytes: usize, max_bytes: usize) -> Result<(), ()> {
+    update(used, |used| {
+        used.checked_add(request_bytes)
+            .filter(|&reserved| reserved <= max_bytes)
+    })
+    .map(|_| ())
+    .map_err(|_| ())
+}
+
+/// Replace `atomic`'s value with `f` of it, retrying if another thread
+/// changes it meanwhile, unless `f` returns `None`. Returns the value `f`
+/// was last given.
+///
+/// What `fetch_update` does; spelled out because newer toolchains deprecate
+/// that name for `try_update`, which older ones and shuttle's atomics lack.
+fn update(atomic: &AtomicUsize, f: impl Fn(usize) -> Option<usize>) -> Result<usize, usize> {
+    let mut current = atomic.load(Ordering::Relaxed);
+    loop {
+        let new = f(current).ok_or(current)?;
+        match atomic.compare_exchange_weak(current, new, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(previous) => return Ok(previous),
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+/// Take `bytes` off `used`, stopping at zero. Returns the usage it found if
+/// that was less than `bytes`.
+///
+/// A release larger than the usage means a charge was given back twice or
+/// never taken. Wrapping would leave the usage near `usize::MAX`, and the tier
+/// would refuse every reservation from then on; stopping at zero keeps the
+/// error to the size of the mismatch.
+fn release(used: &AtomicUsize, bytes: usize) -> Option<usize> {
+    match update(used, |used| Some(used.saturating_sub(bytes))) {
+        Ok(previous) | Err(previous) => (previous < bytes).then_some(previous),
     }
 }
 
@@ -334,5 +391,101 @@ mod tests {
         assert_eq!(budget.disk_usage_bytes(), 750);
         assert!(budget.try_reserve_disk(250).is_ok());
         assert_eq!(budget.disk_usage_bytes(), 1000);
+    }
+
+    /// A release larger than the charge is an accounting error elsewhere, but
+    /// it must not wrap the counter to near `usize::MAX`: the tier would then
+    /// refuse every reservation for good.
+    #[test]
+    fn releasing_more_memory_than_charged_leaves_usage_at_zero() {
+        let budget = test_budget(1000, usize::MAX);
+        budget.try_reserve_memory(100).unwrap();
+
+        budget
+            .try_update_memory_usage(50, 0)
+            .expect("a release cannot fail");
+        assert_eq!(budget.observer.runtime_snapshot().budget_underflows, 0);
+
+        budget
+            .try_update_memory_usage(300, 0)
+            .expect("a release cannot fail");
+
+        assert_eq!(budget.memory_usage_bytes(), 0);
+        assert_eq!(budget.observer.runtime_snapshot().budget_underflows, 1);
+        assert!(budget.try_reserve_memory(1000).is_ok());
+        assert_eq!(budget.memory_usage_bytes(), 1000);
+    }
+
+    #[test]
+    fn releasing_more_disk_than_charged_leaves_usage_at_zero() {
+        let budget = test_budget(usize::MAX, 1000);
+        budget.try_reserve_disk(100).unwrap();
+
+        budget.release_disk(300);
+
+        assert_eq!(budget.disk_usage_bytes(), 0);
+        assert_eq!(budget.observer.runtime_snapshot().budget_underflows, 1);
+        assert!(budget.try_reserve_disk(1000).is_ok());
+        assert_eq!(budget.disk_usage_bytes(), 1000);
+    }
+
+    /// A snapshot that keeps a removed entry charged frees that charge once
+    /// dropped, and the next reservation the charge would refuse succeeds:
+    /// the refusal sweeps held entries and tries again, so nothing has to be
+    /// evicted for room that is already free.
+    #[test]
+    fn a_refused_reservation_sweeps_dropped_snapshots_and_retries() {
+        let array: arrow::array::ArrayRef =
+            std::sync::Arc::new(arrow::array::Int64Array::from(vec![7; 1024]));
+        let entry = CacheEntry::memory_arrow(array);
+        let size = entry.memory_usage_bytes();
+        let budget = test_budget(2 * size, usize::MAX);
+        let entry_id = EntryID::from(0usize);
+
+        // The entry is charged, then a snapshot of it is taken.
+        budget.try_reserve_memory(size).unwrap();
+        let snapshot = Arc::new(entry.clone());
+        budget.register_snapshot(entry_id, &snapshot);
+
+        // It leaves the index while the snapshot is alive: its charge stays.
+        assert_eq!(budget.hold_if_snapshotted(&entry_id, &entry), size);
+        // Another entry fills the budget.
+        budget.try_reserve_memory(size).unwrap();
+
+        drop(snapshot);
+        // Fits only once the held charge is released.
+        assert!(budget.try_reserve_memory(size).is_ok());
+        assert_eq!(budget.memory_usage_bytes(), 2 * size);
+    }
+
+    /// Memory an installed entry already holds is charged even past the
+    /// limit, and the charge saturates rather than wrapping.
+    #[test]
+    fn charging_memory_ignores_the_limit_and_does_not_wrap() {
+        let budget = test_budget(1000, usize::MAX);
+        budget.try_reserve_memory(900).unwrap();
+
+        budget.charge_memory(300);
+        assert_eq!(budget.memory_usage_bytes(), 1200);
+        assert!(budget.try_reserve_memory(1).is_err());
+
+        budget.charge_memory(usize::MAX);
+        assert_eq!(budget.memory_usage_bytes(), usize::MAX);
+    }
+
+    /// A reservation whose sum with the usage does not fit a `usize` is
+    /// refused, not wrapped into a small usage (or a panic in debug builds).
+    #[test]
+    fn a_reservation_past_usize_max_is_refused() {
+        let budget = test_budget(usize::MAX, usize::MAX);
+        budget.try_reserve_memory(usize::MAX - 1).unwrap();
+        budget.try_reserve_disk(usize::MAX - 1).unwrap();
+
+        assert!(budget.try_reserve_memory(2).is_err());
+        assert!(budget.try_reserve_disk(2).is_err());
+        assert!(budget.try_update_memory_usage(0, 2).is_err());
+
+        assert_eq!(budget.memory_usage_bytes(), usize::MAX - 1);
+        assert_eq!(budget.disk_usage_bytes(), usize::MAX - 1);
     }
 }

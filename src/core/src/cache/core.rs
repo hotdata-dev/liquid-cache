@@ -209,6 +209,49 @@ impl Drop for UnfinishedObject<'_> {
 #[must_use = "the displaced object stays on disk until reclaimed"]
 struct Orphan<'a>(Option<(DiskCharge<'a>, UnfinishedObject<'a>)>);
 
+/// Memory victims the policy handed out that an eviction has not finished.
+///
+/// Handing a victim out takes it off the policy's queues, and only an
+/// eviction that installs the victim's new form files it again. A victim
+/// whose eviction never finished because the caller dropped it, which can
+/// happen while the eviction waits on a disk write, would stay in the index,
+/// charged, with no queue offering it. Dropping the lease files each
+/// unfinished victim the index still holds in memory back with the policy.
+struct VictimLease<'a> {
+    cache: &'a LiquidCache,
+    pending: Vec<EntryID>,
+}
+
+impl VictimLease<'_> {
+    /// `victim`'s eviction finished; whatever it installed told the policy.
+    fn evicted(&mut self, victim: EntryID) {
+        if let Some(position) = self.pending.iter().position(|v| *v == victim) {
+            self.pending.swap_remove(position);
+        }
+    }
+}
+
+impl Drop for VictimLease<'_> {
+    fn drop(&mut self) {
+        // A policy that panicked mid-eviction is not called again while the
+        // panic unwinds: a second panic would abort.
+        if std::thread::panicking() {
+            return;
+        }
+        for victim in self.pending.drain(..) {
+            let Some(slot) = self.cache.index.get(&victim) else {
+                continue;
+            };
+            // A disk record is filed by the write that installed it.
+            if LiquidCache::charged_bytes(&slot.entry).is_none() {
+                self.cache
+                    .cache_policy
+                    .notify_insert(&victim, CachedBatchType::from(&slot.entry));
+            }
+        }
+    }
+}
+
 /// Outcome of [`LiquidCache::prefetch`].
 pub enum PrefetchResult {
     /// A memory-form snapshot of the entry (Arrow or Liquid), ready to hand to a reader.
@@ -600,10 +643,17 @@ impl LiquidCache {
             // No eviction makes room for an entry larger than the whole memory
             // tier; evicting for it would only empty the cache before refusing
             // it. It goes the way of an insert into an empty cache instead.
-            let victims = if not_inserted.memory_usage_bytes() > self.config.max_memory_bytes() {
+            let new_memory_size = not_inserted.memory_usage_bytes();
+            let victims = if new_memory_size > self.config.max_memory_bytes() {
                 Vec::new()
             } else {
-                self.cache_policy.find_memory_victim(8)
+                // A replacement needs room only for its growth over the slot
+                // it replaces, which is what `try_insert` reserves.
+                let replaced = self
+                    .index
+                    .get(&entry_id)
+                    .map_or(0, |slot| slot.entry.memory_usage_bytes());
+                self.find_memory_victims_for(new_memory_size.saturating_sub(replaced))
             };
             if victims.is_empty() {
                 // no advice, because the cache is already empty
@@ -616,12 +666,55 @@ impl LiquidCache {
                 write = written;
                 continue;
             }
-            self.evict_victims(victims).await?;
+            self.evict_victims(victims).await;
 
             batch_to_cache = not_inserted;
             crate::utils::yield_now_if_shuttle();
         }
     }
+
+    /// Memory victims holding enough to make room for `bytes`, at most
+    /// [`Self::MAX_MEMORY_VICTIMS`] of them, and at least one if the policy
+    /// offers any.
+    ///
+    /// Victims are taken one at a time until what they hold covers what the
+    /// budget lacks. A victim that transcodes in memory frees less than it
+    /// holds, so the insert can come back for more; taking a fixed batch
+    /// instead would evict several entries to make room for one.
+    fn find_memory_victims_for(&self, bytes: usize) -> Vec<EntryID> {
+        let free = self
+            .config
+            .max_memory_bytes()
+            .saturating_sub(self.budget.memory_usage_bytes());
+        let mut lacking = bytes.saturating_sub(free).max(1);
+        let mut victims = Vec::new();
+        while lacking > 0 && victims.len() < Self::MAX_MEMORY_VICTIMS {
+            let mut offered_new = false;
+            // A policy may hand out more than asked; every victim it hands
+            // out is off its queues, so all of them are kept.
+            for victim in self.cache_policy.find_memory_victim(1) {
+                if victims.contains(&victim) {
+                    continue;
+                }
+                let held = self
+                    .index
+                    .get(&victim)
+                    .map_or(0, |slot| slot.entry.memory_usage_bytes());
+                lacking = lacking.saturating_sub(held);
+                victims.push(victim);
+                offered_new = true;
+            }
+            // Nothing left to offer, or a policy that offers the same victim
+            // whatever was taken.
+            if !offered_new {
+                break;
+            }
+        }
+        victims
+    }
+
+    /// The most memory victims one round of an insert's eviction takes.
+    const MAX_MEMORY_VICTIMS: usize = 8;
 
     /// Create a new instance of CacheStorage.
     #[allow(clippy::too_many_arguments)]
@@ -681,15 +774,19 @@ impl LiquidCache {
             "a disk record is installed only by the write that charged it"
         );
         let new_memory_size = to_insert.memory_usage_bytes();
-        // Only growth over the slot read here is reserved up front, against
-        // the budget. The rest is settled once the insert has displaced
-        // whatever slot is there by then, which another write can have
-        // replaced or removed since: the budget then counts exactly the
-        // entries the index holds, never fewer. When the slot read here was
-        // removed meanwhile, the settle charges this entry in full, however
-        // full the budget is: usage can then exceed the maximum, by up to one
-        // entry for each insert that raced the removal of its key, until a
-        // later insert that grows the budget evicts.
+        // Only growth over the slot read here is reserved against the budget.
+        // The rest of the entry is charged before it enters the index, so a
+        // removal of it, which can follow at once, never finds it uncharged.
+        // Whatever slot the insert displaced, which another write can have
+        // replaced or removed since the read, is released after: the budget
+        // then counts exactly the entries the index holds. Until then it
+        // counts the displaced slot as well, which can refuse a concurrent
+        // reservation that would have fit, and size that insert's eviction to
+        // take a victim more than it needs. When the slot read here was removed
+        // meanwhile, this entry stays charged in full however full the budget
+        // is: usage can then exceed the maximum, by up to one entry for each
+        // insert that raced the removal of its key, until a later insert that
+        // grows the budget evicts.
         //
         // A disk record holds no memory, so it installs however full the
         // memory budget reads. Its write cannot then be dropped, taking its
@@ -702,24 +799,20 @@ impl LiquidCache {
         if reserved > 0 && self.budget.try_reserve_memory(reserved).is_err() {
             return Err(to_insert);
         }
+        let unreserved = new_memory_size - reserved;
+        if unreserved > 0 {
+            self.budget.charge_memory(unreserved);
+        }
         let cached_batch_type = CachedBatchType::from(&to_insert);
         let displaced = self.index.insert(&entry_id, identity, to_insert);
-        let actual_old_size = displaced
-            .as_ref()
-            .map_or(0, |slot| slot.entry.memory_usage_bytes());
-        let held_old_size = displaced.as_ref().map_or(0, |slot| {
-            self.budget.hold_if_snapshotted(&entry_id, &slot.entry)
+        // A displaced entry a snapshot still holds stays charged.
+        let released = displaced.as_ref().map_or(0, |slot| {
+            slot.entry.memory_usage_bytes()
+                - self.budget.hold_if_snapshotted(&entry_id, &slot.entry)
         });
-        // The insert's net change is `new - actual_old`, of which `reserved`
-        // is charged already. A displaced entry a snapshot still holds stays
-        // charged.
-        let remaining = new_memory_size as i128 - actual_old_size as i128 + held_old_size as i128
-            - reserved as i128;
-        if remaining > 0 {
-            self.budget.charge_memory(remaining as usize);
-        } else if remaining < 0 {
+        if released > 0 {
             self.budget
-                .try_update_memory_usage((-remaining) as usize, 0)
+                .try_update_memory_usage(released, 0)
                 .expect("memory release cannot fail");
         }
         let displaced = displaced.and_then(|displaced| self.charge_of(&displaced.entry));
@@ -924,29 +1017,40 @@ impl LiquidCache {
         &self.index
     }
 
+    /// Evict `victims`. Victims of an eviction the caller dropped before it
+    /// finished are offered to the policy again (see [`VictimLease`]).
     #[fastrace::trace]
-    async fn evict_victims(&self, victims: Vec<EntryID>) -> Result<(), CacheFull> {
+    async fn evict_victims(&self, victims: Vec<EntryID>) {
         self.trace(InternalEvent::EvictionBegin {
             victims: victims.clone(),
         });
+        let mut lease = VictimLease {
+            cache: self,
+            pending: victims.clone(),
+        };
         if self.evict_victims_concurrently {
-            let results = futures::stream::iter(victims)
-                .map(|victim| self.evict_victim_inner(victim))
-                .buffer_unordered(usize::MAX)
-                .collect::<Vec<_>>()
-                .await;
-            results.into_iter().collect::<Result<Vec<_>, _>>()?;
+            let mut evictions = futures::stream::iter(victims)
+                .map(|victim| async move {
+                    self.evict_victim_inner(victim).await;
+                    victim
+                })
+                .buffer_unordered(usize::MAX);
+            while let Some(victim) = evictions.next().await {
+                lease.evicted(victim);
+            }
         } else {
             for victim in victims {
-                self.evict_victim_inner(victim).await?;
+                self.evict_victim_inner(victim).await;
+                lease.evicted(victim);
             }
         }
-        Ok(())
     }
 
-    async fn evict_victim_inner(&self, victim: EntryID) -> Result<(), CacheFull> {
+    /// Evict `victim` to its next form, or drop it from memory when it has
+    /// none the disk can take.
+    async fn evict_victim_inner(&self, victim: EntryID) {
         let Some(slot) = self.index.get(&victim) else {
-            return Ok(());
+            return;
         };
         // The rewrite is made for the identity the victim was read under. If
         // another identity takes the key over meanwhile, the rewrite still
@@ -1013,7 +1117,6 @@ impl LiquidCache {
                 }
             }
         }
-        Ok(())
     }
 
     async fn maybe_hydrate(
@@ -2575,9 +2678,7 @@ mod tests {
         let array: ArrayRef = Arc::new(Int32Array::from_iter_values(0..256));
         cache
             .budget
-            .try_update_memory_usage(1, 0)
-            .expect("a release cannot fail");
-        assert!(cache.budget.memory_usage_bytes() > cache.config.max_memory_bytes());
+            .set_memory_usage(cache.config.max_memory_bytes() + 1);
 
         let (record, bytes) = arrow_spill(&array);
         let write = cache
@@ -2681,7 +2782,7 @@ mod tests {
         cache.insert(entry, 0, array.clone()).await.unwrap();
         cache.flush_all_to_disk().await.unwrap();
 
-        cache.evict_victims(vec![entry]).await.unwrap();
+        cache.evict_victims(vec![entry]).await;
         assert_disk_matches_index(&cache, &store).await;
         assert_eq!(cache.budget.disk_usage_bytes(), arrow_copy(&array));
 
@@ -2716,7 +2817,7 @@ mod tests {
             .join()
             .unwrap();
         }));
-        block_on(cache.evict_victims(vec![entry])).unwrap();
+        block_on(cache.evict_victims(vec![entry]));
 
         assert!(hook.lock().unwrap().is_none(), "the hook never ran");
         assert!(is_memory(&cache, &entry), "the stale record was installed");
@@ -2884,8 +2985,8 @@ mod tests {
             std::thread::spawn(move || {
                 block_on(async {
                     // Arrow to Liquid in memory, then Liquid to disk.
-                    evicter.evict_victims(vec![entry]).await.unwrap();
-                    evicter.evict_victims(vec![entry]).await.unwrap();
+                    evicter.evict_victims(vec![entry]).await;
+                    evicter.evict_victims(vec![entry]).await;
                 })
             })
             .join()
@@ -2935,14 +3036,384 @@ mod tests {
         assert_disk_matches_index(&cache, &store).await;
     }
 
-    async fn memory_only_cache(budget: usize) -> Arc<LiquidCache> {
+    /// A cache with no disk tier, and the builder's production policies
+    /// otherwise.
+    async fn memory_only_cache(max_memory_bytes: usize) -> Arc<LiquidCache> {
+        memory_only_cache_evicting(max_memory_bytes, false).await
+    }
+
+    /// [`memory_only_cache`], evicting victims concurrently or not. Builds
+    /// outside tests evict concurrently.
+    async fn memory_only_cache_evicting(
+        max_memory_bytes: usize,
+        concurrently: bool,
+    ) -> Arc<LiquidCache> {
         LiquidCacheBuilder::new()
-            .with_max_memory_bytes(budget)
+            .with_max_memory_bytes(max_memory_bytes)
             .with_max_disk_bytes(0)
             .with_eviction_policy(Box::new(TranscodeEvict))
             .with_cache_policy(Box::new(LiquidPolicy::new()))
+            .with_hydration_policy(Box::new(AlwaysHydrate::new()))
+            .with_evict_victims_concurrently(concurrently)
             .build()
             .await
+    }
+
+    /// The keys the index holds in memory, sorted.
+    fn memory_keys(cache: &LiquidCache) -> Vec<EntryID> {
+        let mut keys = Vec::new();
+        cache.index().for_each(|entry_id, slot| {
+            if LiquidCache::charged_bytes(&slot.entry).is_none() {
+                keys.push(*entry_id);
+            }
+        });
+        keys.sort();
+        keys
+    }
+
+    /// Every key the policy still offers as a memory victim, sorted. Takes
+    /// them out of the policy.
+    fn drain_memory_victims(cache: &LiquidCache) -> Vec<EntryID> {
+        let mut offered = Vec::new();
+        loop {
+            let victims = cache.cache_policy.find_memory_victim(8);
+            if victims.is_empty() {
+                break;
+            }
+            offered.extend(victims);
+        }
+        offered.sort();
+        offered.dedup();
+        offered
+    }
+
+    /// With no disk tier, a Liquid entry has nowhere to be evicted to, so an
+    /// insert into a cache full of them drops a victim. The victims the policy
+    /// handed out and that are still held must be offered again, or the
+    /// memory they hold can never be reclaimed.
+    #[tokio::test]
+    async fn an_insert_into_full_liquid_memory_leaves_the_rest_evictable() {
+        for concurrently in [false, true] {
+            let liquid = || {
+                let array = create_test_arrow_array(1024);
+                CacheEntry::memory_liquid(Arc::new(
+                    crate::liquid_array::LiquidArray::from_arrow_array(&array).unwrap(),
+                ))
+            };
+            let one = liquid().memory_usage_bytes();
+            let cache = memory_only_cache_evicting(3 * one, concurrently).await;
+            let ids: Vec<EntryID> = (0usize..3).map(EntryID::from).collect();
+            for id in &ids {
+                cache.insert_inner(*id, 0, liquid()).await.unwrap();
+            }
+
+            let new = EntryID::from(3usize);
+            let inserted = cache.insert_inner(new, 0, liquid()).await;
+
+            assert_eq!(inserted, Ok(()), "concurrently={concurrently}");
+            let held = memory_keys(&cache);
+            assert!(held.contains(&new), "concurrently={concurrently}");
+            assert_eq!(held.len(), 3, "concurrently={concurrently}");
+            assert_memory_budget_matches_index(&cache);
+            assert_eq!(
+                drain_memory_victims(&cache),
+                held,
+                "entries held in memory are no longer offered as victims \
+                 (concurrently={concurrently})"
+            );
+        }
+    }
+
+    /// Scans keep caching Arrow arrays into a memory-only cache: evictions
+    /// transcode them to Liquid until nothing is left to transcode, and drop
+    /// Liquid victims from then on. The cache keeps admitting, and every
+    /// entry still held in memory stays on offer to the policy.
+    #[tokio::test]
+    async fn a_memory_only_cache_filled_by_scans_keeps_its_entries_evictable() {
+        for concurrently in [false, true] {
+            // Values that do not compress, so Liquid saves little over Arrow.
+            let array: ArrayRef = Arc::new(arrow::array::Int64Array::from_iter_values(
+                (0..4096u64).map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15) as i64),
+            ));
+            let one = CacheEntry::memory_arrow(array.clone()).memory_usage_bytes();
+            let cache = memory_only_cache_evicting(16 * one, concurrently).await;
+            let mut refused = 0;
+            for id in 0usize..200 {
+                if cache
+                    .insert(EntryID::from(id), 0, array.clone())
+                    .await
+                    .is_err()
+                {
+                    refused += 1;
+                }
+            }
+
+            assert_eq!(refused, 0, "concurrently={concurrently}");
+            assert!(
+                cache.contains(&EntryID::from(199usize), 0),
+                "the last scan was not cached (concurrently={concurrently})"
+            );
+            assert!(
+                memory_keys(&cache).len() < 200,
+                "the cache never filled (concurrently={concurrently})"
+            );
+            assert_memory_budget_matches_index(&cache);
+            assert_eq!(
+                drain_memory_victims(&cache),
+                memory_keys(&cache),
+                "entries held in memory are no longer offered as victims \
+                 (concurrently={concurrently})"
+            );
+        }
+    }
+
+    /// An insert dropped while it evicts, as a query that stops early drops
+    /// its scan, must leave the victims it had not finished on offer. Only a
+    /// disk write parks an eviction, so this needs a disk tier.
+    #[tokio::test]
+    async fn a_cancelled_insert_leaves_its_victims_evictable() {
+        let array = create_test_arrow_array(256);
+        let one = CacheEntry::memory_arrow(array.clone()).memory_usage_bytes();
+        let cache = LiquidCacheBuilder::new()
+            .with_max_memory_bytes(3 * one)
+            .with_max_disk_bytes(1 << 20)
+            .with_eviction_policy(Box::new(crate::cache::Evict))
+            .with_cache_policy(Box::new(LiquidPolicy::new()))
+            .build()
+            .await;
+        let ids: Vec<EntryID> = (0usize..3).map(EntryID::from).collect();
+        for id in &ids {
+            cache.insert(*id, 0, array.clone()).await.unwrap();
+        }
+
+        // Park the first victim's eviction on its disk key.
+        let key = cache.disk_key_locks.lock(&ids[0]).await;
+        let mut insert = Box::pin(cache.insert_inner(
+            EntryID::from(3usize),
+            0,
+            CacheEntry::memory_arrow(array.clone()),
+        ));
+        assert!(
+            poll_once(insert.as_mut()).is_pending(),
+            "the insert did not park in its eviction"
+        );
+        drop(insert);
+        drop(key);
+
+        assert_eq!(memory_keys(&cache), ids);
+        assert_memory_budget_matches_index(&cache);
+        assert_eq!(
+            drain_memory_victims(&cache),
+            ids,
+            "entries held in memory are no longer offered as victims"
+        );
+    }
+
+    /// Values that do not compress, so Liquid saves little over Arrow.
+    fn incompressible_array(rows: u64) -> ArrayRef {
+        Arc::new(arrow::array::Int64Array::from_iter_values(
+            (0..rows).map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15) as i64),
+        ))
+    }
+
+    fn liquid_entry(array: &ArrayRef) -> CacheEntry {
+        CacheEntry::memory_liquid(Arc::new(
+            crate::liquid_array::LiquidArray::from_arrow_array(array).unwrap(),
+        ))
+    }
+
+    /// With no disk tier, a full cache holds a mix: Arrow entries an eviction
+    /// transcodes, and Liquid ones it can only drop. The insert must succeed,
+    /// with the Arrow entry transcoded rather than lost.
+    #[tokio::test]
+    async fn an_insert_that_eviction_made_room_for_is_not_refused() {
+        for concurrently in [false, true] {
+            // Transcodes to a fraction of its Arrow size.
+            let compressible = create_test_arrow_array(4096);
+            let incompressible = incompressible_array(4096);
+            let arrow = CacheEntry::memory_arrow(compressible.clone()).memory_usage_bytes();
+            let transcoded = liquid_entry(&compressible).memory_usage_bytes();
+            let liquid = liquid_entry(&incompressible).memory_usage_bytes();
+            assert!(transcoded < arrow / 4, "the Arrow entry barely compresses");
+            let cache =
+                memory_only_cache_evicting(arrow + 2 * liquid + transcoded, concurrently).await;
+            let arrow_id = EntryID::from(0usize);
+            cache
+                .insert_inner(arrow_id, 0, CacheEntry::memory_arrow(compressible.clone()))
+                .await
+                .unwrap();
+            for id in 1usize..3 {
+                cache
+                    .insert_inner(EntryID::from(id), 0, liquid_entry(&incompressible))
+                    .await
+                    .unwrap();
+            }
+
+            let new = EntryID::from(3usize);
+            let inserted = cache.insert(new, 0, compressible.clone()).await;
+
+            assert_eq!(inserted, Ok(()), "concurrently={concurrently}");
+            assert!(cache.contains(&new, 0));
+            assert!(matches!(
+                cache.index().get(&arrow_id).unwrap().entry,
+                CacheEntry::MemoryLiquid(_)
+            ));
+            assert_memory_budget_matches_index(&cache);
+            assert_eq!(drain_memory_victims(&cache), memory_keys(&cache));
+        }
+    }
+
+    /// One insert into a memory tier full of Arrow entries needs the room of
+    /// one entry, and transcoding one victim frees nearly all of it. It must
+    /// not transcode more: each costs an encode, and Liquid is slower to
+    /// read than the Arrow it replaces.
+    #[tokio::test]
+    async fn one_insert_into_full_memory_evicts_only_what_it_needs() {
+        for concurrently in [false, true] {
+            let array = create_test_arrow_array(4096);
+            let one = CacheEntry::memory_arrow(array.clone()).memory_usage_bytes();
+            let transcoded = liquid_entry(&array).memory_usage_bytes();
+            let cache = memory_only_cache_evicting(20 * one + transcoded, concurrently).await;
+            for id in 0usize..20 {
+                cache
+                    .insert(EntryID::from(id), 0, array.clone())
+                    .await
+                    .unwrap();
+            }
+
+            cache
+                .insert(EntryID::from(20usize), 0, array.clone())
+                .await
+                .unwrap();
+
+            let mut transcoded_entries = 0;
+            cache.index().for_each(|_, slot| {
+                if matches!(slot.entry, CacheEntry::MemoryLiquid(_)) {
+                    transcoded_entries += 1;
+                }
+            });
+            assert_eq!(
+                transcoded_entries, 1,
+                "one insert transcoded {transcoded_entries} entries, where one made room \
+                 (concurrently={concurrently})"
+            );
+            assert_memory_budget_matches_index(&cache);
+            assert_eq!(drain_memory_victims(&cache), memory_keys(&cache));
+        }
+    }
+
+    /// Replacing a key in a full memory tier needs room only for the growth
+    /// over the entry it replaces, and transcoding one victim covers that.
+    /// Sizing the eviction by the whole new entry would take a second.
+    #[tokio::test]
+    async fn a_replacement_evicts_only_for_its_growth() {
+        for concurrently in [false, true] {
+            let array = create_test_arrow_array(4096);
+            let bigger = create_test_arrow_array(4096 + 512);
+            let one = CacheEntry::memory_arrow(array.clone()).memory_usage_bytes();
+            let transcoded = liquid_entry(&array).memory_usage_bytes();
+            let growth = CacheEntry::memory_arrow(bigger.clone()).memory_usage_bytes() - one;
+            assert!(
+                growth > 0 && growth < one - transcoded,
+                "transcoding one entry must cover the growth"
+            );
+            let cache = memory_only_cache_evicting(20 * one, concurrently).await;
+            for id in 0usize..20 {
+                cache
+                    .insert(EntryID::from(id), 0, array.clone())
+                    .await
+                    .unwrap();
+            }
+
+            let replaced = EntryID::from(19usize);
+            cache
+                .insert_inner(replaced, 0, CacheEntry::memory_arrow(bigger.clone()))
+                .await
+                .unwrap();
+
+            let mut transcoded_entries = 0;
+            cache.index().for_each(|_, slot| {
+                if matches!(slot.entry, CacheEntry::MemoryLiquid(_)) {
+                    transcoded_entries += 1;
+                }
+            });
+            assert_eq!(
+                transcoded_entries, 1,
+                "one replacement transcoded {transcoded_entries} entries, where one made \
+                 room (concurrently={concurrently})"
+            );
+            assert_eq!(
+                cache
+                    .index()
+                    .get(&replaced)
+                    .unwrap()
+                    .entry
+                    .memory_usage_bytes(),
+                one + growth
+            );
+            assert_memory_budget_matches_index(&cache);
+        }
+    }
+
+    /// Rounds a race test runs. Each round is one chance at the interleaving
+    /// it looks for, so a pass means only that no round hit it.
+    #[cfg(not(feature = "shuttle"))]
+    const RACE_ROUNDS: usize = 2_000;
+
+    /// Run `first` and `second` on two threads, released together.
+    #[cfg(not(feature = "shuttle"))]
+    fn race(first: impl FnOnce() + Send, second: impl FnOnce() + Send) {
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                barrier.wait();
+                first();
+            });
+            scope.spawn(|| {
+                barrier.wait();
+                second();
+            });
+        });
+    }
+
+    /// Two scans cache the same absent key at once, as `CachedColumn::insert`
+    /// allows: it checks `contains` and inserts as separate steps. Both
+    /// inserts can read the key absent and reserve the full size, but only
+    /// one entry survives, so the one displaced must give its memory back.
+    #[cfg(not(feature = "shuttle"))]
+    #[test]
+    fn two_inserts_of_one_absent_key_charge_it_once() {
+        let cache = block_on(memory_only_cache(1 << 34));
+        for round in 0..RACE_ROUNDS {
+            let key = EntryID::from(round);
+            let insert = || block_on(cache.insert_inner(key, 0, create_test_array(100))).unwrap();
+            race(insert, insert);
+            assert_memory_budget_matches_index(&cache);
+        }
+    }
+
+    /// An eviction transcodes a key in memory while a scan inserts the key
+    /// again. Whichever install lands last must leave the budget charging
+    /// what it installed, not what the slot held when it was read.
+    #[cfg(not(feature = "shuttle"))]
+    #[test]
+    fn an_eviction_racing_a_reinsert_keeps_the_budget_matching_the_index() {
+        let cache = block_on(memory_only_cache(1 << 34));
+        for round in 0..RACE_ROUNDS {
+            let key = EntryID::from(round);
+            block_on(cache.insert_inner(key, 0, create_test_array(100))).unwrap();
+            race(
+                || block_on(cache.evict_victims(vec![key])),
+                // Inserted several times so that one of them straddles the
+                // eviction's install.
+                || {
+                    for _ in 0..32 {
+                        block_on(cache.insert_inner(key, 0, create_test_array(100))).unwrap();
+                    }
+                },
+            );
+            assert_memory_budget_matches_index(&cache);
+        }
     }
 
     fn index_memory_bytes(cache: &LiquidCache) -> usize {
@@ -3008,7 +3479,7 @@ mod tests {
             .unwrap();
         let held = snapshot(&cache, entry_id).await;
 
-        assert_eq!(cache.evict_victim_inner(entry_id).await, Ok(()));
+        cache.evict_victim_inner(entry_id).await;
 
         let slot = cache.index().get(&entry_id).unwrap();
         assert!(matches!(slot.entry, CacheEntry::MemoryLiquid(_)));

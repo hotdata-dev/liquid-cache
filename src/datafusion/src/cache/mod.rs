@@ -775,12 +775,20 @@ mod tests {
         Arc::new(Int32Array::from(vec![0; len]))
     }
 
+    /// Cache `first` and `second` as columns 0 and 1 of a cache they fill,
+    /// then a dummy column 2 wider than either. Eviction takes only as many
+    /// victims as the dummy needs room for, so it transcodes both to Liquid.
     async fn insert_liquid_columns(
         row_group: &CachedRowGroupRef,
         batch_id: BatchID,
-        arrays: [ArrayRef; 3],
+        first: ArrayRef,
+        second: ArrayRef,
     ) {
-        for (column_id, array) in arrays.into_iter().enumerate() {
+        let widest = first
+            .get_array_memory_size()
+            .max(second.get_array_memory_size());
+        let dummy = dummy(widest / std::mem::size_of::<i32>() + 16);
+        for (column_id, array) in [first, second, dummy].into_iter().enumerate() {
             row_group
                 .get_column(column_id as u64)
                 .unwrap()
@@ -808,7 +816,7 @@ mod tests {
         let budget = a.get_array_memory_size() + b.get_array_memory_size();
         let row_group = setup_liquid_cache(batch_size, schema.clone(), budget).await;
         let batch_id = BatchID::from_row_id(0, batch_size);
-        insert_liquid_columns(&row_group, batch_id, [a.clone(), b.clone(), dummy(1)]).await;
+        insert_liquid_columns(&row_group, batch_id, a.clone(), b.clone()).await;
         let expr = Arc::new(BinaryExpr::new(
             equals("a", 0, ScalarValue::Int32(Some(3))),
             Operator::Or,
@@ -844,7 +852,7 @@ mod tests {
         let budget = city.get_array_memory_size() + name.get_array_memory_size();
         let row_group = setup_liquid_cache(batch_size, schema.clone(), budget).await;
         let batch_id = BatchID::from_row_id(0, batch_size);
-        insert_liquid_columns(&row_group, batch_id, [city.clone(), name.clone(), dummy(1)]).await;
+        insert_liquid_columns(&row_group, batch_id, city.clone(), name.clone()).await;
         let expr = Arc::new(BinaryExpr::new(
             equals("name", 1, ScalarValue::Utf8View(Some("Bob".into()))),
             Operator::Or,

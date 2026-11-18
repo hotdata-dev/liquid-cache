@@ -36,8 +36,8 @@ values:
 stats:
 entries.total: 8
 entries.after_first_run: 8
-entries.memory.arrow: 3
-entries.memory.liquid: 5
+entries.memory.arrow: 4
+entries.memory.liquid: 4
 entries.disk.liquid: 0
 entries.disk.arrow: 0
 usage.memory_bytes: [bytes]
@@ -47,8 +47,9 @@ RuntimeStatsSnapshot:
   get_with_selection: 3
   eval_predicate: 4
   try_read_liquid_calls: 0
-  read_io_count: 3
+  read_io_count: 0
   write_io_count: 0
   disk_evictions: 0
   disk_reservation_failures: 0
+  budget_underflows: 0
   eval_predicate_on_liquid_failed: 0

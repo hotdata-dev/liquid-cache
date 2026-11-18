@@ -89,6 +89,11 @@ impl Observer {
         self.runtime.incr_disk_reservation_failures();
     }
 
+    #[inline]
+    pub(crate) fn on_budget_underflow(&self) {
+        self.runtime.incr_budget_underflows();
+    }
+
     pub(crate) fn record_internal(&self, event: InternalEvent) {
         match event {
             InternalEvent::IoWrite { .. } => self.runtime.incr_write_io_count(),
