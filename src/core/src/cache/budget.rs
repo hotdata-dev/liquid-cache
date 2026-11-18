@@ -1,8 +1,22 @@
+use super::cached_batch::CacheEntry;
+use super::core::same_memory_entry;
 use super::observer::Observer;
+use super::utils::EntryID;
 use crate::sync::{
-    Arc,
+    Arc, Mutex, Weak,
     atomic::{AtomicUsize, Ordering},
 };
+use ahash::AHashMap;
+
+/// Snapshots handed out by prefetch, and memory entries removed from the
+/// index while one of their snapshots was still alive.
+#[derive(Debug, Default)]
+struct HeldReleases {
+    snapshots: Mutex<AHashMap<EntryID, Vec<Weak<CacheEntry>>>>,
+    /// The live snapshots of each removed entry, with the bytes it keeps charged.
+    held: Mutex<Vec<(Vec<Weak<CacheEntry>>, usize)>>,
+    held_len: AtomicUsize,
+}
 
 #[derive(Debug)]
 pub struct BudgetAccounting {
@@ -10,6 +24,7 @@ pub struct BudgetAccounting {
     max_disk_bytes: usize,
     used_memory_bytes: AtomicUsize,
     used_disk_bytes: AtomicUsize,
+    held: HeldReleases,
     observer: Arc<Observer>,
 }
 
@@ -24,13 +39,97 @@ impl BudgetAccounting {
             max_disk_bytes,
             used_memory_bytes: AtomicUsize::new(0),
             used_disk_bytes: AtomicUsize::new(0),
+            held: HeldReleases::default(),
             observer,
         }
     }
 
     pub(super) fn reset_usage(&self) {
+        self.held.snapshots.lock().unwrap().clear();
+        self.held.held.lock().unwrap().clear();
+        self.held.held_len.store(0, Ordering::Relaxed);
         self.used_memory_bytes.store(0, Ordering::Relaxed);
         self.used_disk_bytes.store(0, Ordering::Relaxed);
+    }
+
+    /// Record a snapshot of `entry_id` handed to a reader.
+    pub(super) fn register_snapshot(&self, entry_id: EntryID, snapshot: &Arc<CacheEntry>) {
+        let mut snapshots = self.held.snapshots.lock().unwrap();
+        let live = snapshots.entry(entry_id).or_default();
+        live.retain(|weak| weak.strong_count() > 0);
+        live.push(Arc::downgrade(snapshot));
+    }
+
+    /// Keep `removed`'s memory charged while a snapshot of it is alive.
+    ///
+    /// Called as `removed` leaves the index under `entry_id`. Returns the
+    /// bytes kept charged: all of `removed`'s memory, or 0 when no live
+    /// snapshot holds its data.
+    pub(super) fn hold_if_snapshotted(&self, entry_id: &EntryID, removed: &CacheEntry) -> usize {
+        if !matches!(
+            removed,
+            CacheEntry::MemoryArrow(_) | CacheEntry::MemoryLiquid(_)
+        ) {
+            return 0;
+        }
+        let mut snapshots = self.held.snapshots.lock().unwrap();
+        let Some(live) = snapshots.get_mut(entry_id) else {
+            return 0;
+        };
+        let mut holding = Vec::new();
+        live.retain(|weak| match weak.upgrade() {
+            Some(snapshot) if same_memory_entry(&snapshot, removed) => {
+                holding.push(weak.clone());
+                false
+            }
+            Some(_) => true,
+            None => false,
+        });
+        if live.is_empty() {
+            snapshots.remove(entry_id);
+        }
+        drop(snapshots);
+        if holding.is_empty() {
+            return 0;
+        }
+        let bytes = removed.memory_usage_bytes();
+        let mut held = self.held.held.lock().unwrap();
+        held.push((holding, bytes));
+        self.held.held_len.store(held.len(), Ordering::Relaxed);
+        bytes
+    }
+
+    /// Release the charge of every held entry whose snapshots were all dropped.
+    pub(super) fn sweep_held(&self) {
+        if self.held.held_len.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        let mut freed = 0;
+        let mut held = self.held.held.lock().unwrap();
+        held.retain(|(snapshots, bytes)| {
+            let alive = snapshots.iter().any(|weak| weak.strong_count() > 0);
+            if !alive {
+                freed += bytes;
+            }
+            alive
+        });
+        self.held.held_len.store(held.len(), Ordering::Relaxed);
+        drop(held);
+        if freed > 0 {
+            self.used_memory_bytes.fetch_sub(freed, Ordering::Relaxed);
+        }
+    }
+
+    /// Bytes charged for removed entries that snapshots still hold.
+    pub fn held_memory_bytes(&self) -> usize {
+        self.sweep_held();
+        self.held
+            .held
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, bytes)| bytes)
+            .sum()
     }
 
     /// Try to reserve memory in the cache.
@@ -38,6 +137,17 @@ impl BudgetAccounting {
     pub(super) fn try_reserve_memory(&self, request_bytes: usize) -> Result<(), ()> {
         let used = self.used_memory_bytes.load(Ordering::Relaxed);
         if used.saturating_add(request_bytes) > self.max_memory_bytes {
+            if self.held.held_len.load(Ordering::Relaxed) > 0 {
+                self.sweep_held();
+                if self
+                    .used_memory_bytes
+                    .load(Ordering::Relaxed)
+                    .saturating_add(request_bytes)
+                    <= self.max_memory_bytes
+                {
+                    return self.try_reserve_memory(request_bytes);
+                }
+            }
             return Err(());
         }
 
@@ -76,7 +186,9 @@ impl BudgetAccounting {
         }
     }
 
+    /// Charged memory, after releasing held entries whose snapshots were all dropped.
     pub fn memory_usage_bytes(&self) -> usize {
+        self.sweep_held();
         self.used_memory_bytes.load(Ordering::Relaxed)
     }
 

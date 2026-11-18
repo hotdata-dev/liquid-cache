@@ -222,7 +222,7 @@ const IDENTITY_TRAILER_LEN: usize = std::mem::size_of::<u64>();
 
 /// Whether `slot` is the memory entry `observed`: the same array, not only an
 /// equal one, so an entry written since is not mistaken for it.
-fn same_memory_entry(slot: &CacheEntry, observed: &CacheEntry) -> bool {
+pub(super) fn same_memory_entry(slot: &CacheEntry, observed: &CacheEntry) -> bool {
     match (slot, observed) {
         (CacheEntry::MemoryArrow(a), CacheEntry::MemoryArrow(b)) => std::sync::Arc::ptr_eq(a, b),
         (CacheEntry::MemoryLiquid(a), CacheEntry::MemoryLiquid(b)) => std::sync::Arc::ptr_eq(a, b),
@@ -304,7 +304,20 @@ impl LiquidCache {
     }
 
     /// Prefetch an entry into a memory-form snapshot without recording an access.
+    ///
+    /// An entry on disk is read and offered to the hydration policy; it is
+    /// snapshotted only if hydration puts it back in memory, and is otherwise
+    /// reported absent. If the entry leaves the index while the snapshot is
+    /// alive, its memory stays charged until the snapshot is dropped.
     pub async fn prefetch(&self, entry_id: &EntryID, identity: u64) -> PrefetchResult {
+        let result = self.prefetch_inner(entry_id, identity).await;
+        if let PrefetchResult::Snapshot(snapshot) = &result {
+            self.budget.register_snapshot(*entry_id, snapshot);
+        }
+        result
+    }
+
+    async fn prefetch_inner(&self, entry_id: &EntryID, identity: u64) -> PrefetchResult {
         let Some(slot) = self.index.get_for(entry_id, identity) else {
             return PrefetchResult::Absent;
         };
@@ -324,7 +337,7 @@ impl LiquidCache {
                     None,
                 )
                 .await;
-                PrefetchResult::Snapshot(Arc::new(CacheEntry::memory_arrow(array)))
+                self.memory_snapshot(entry_id, identity)
             }
             disk @ CacheEntry::DiskLiquid { .. } => {
                 let Some(array) = self.read_disk_liquid_array(entry_id, identity).await else {
@@ -338,8 +351,23 @@ impl LiquidCache {
                     None,
                 )
                 .await;
-                PrefetchResult::Snapshot(Arc::new(CacheEntry::memory_liquid(array)))
+                self.memory_snapshot(entry_id, identity)
             }
+        }
+    }
+
+    /// A snapshot of `entry_id` if the index holds it in memory for `identity`.
+    fn memory_snapshot(&self, entry_id: &EntryID, identity: u64) -> PrefetchResult {
+        match self.index.get_for(entry_id, identity) {
+            Some(slot)
+                if matches!(
+                    slot.entry,
+                    CacheEntry::MemoryArrow(_) | CacheEntry::MemoryLiquid(_)
+                ) =>
+            {
+                PrefetchResult::Snapshot(Arc::new(slot.entry.clone()))
+            }
+            _ => PrefetchResult::Absent,
         }
     }
 
@@ -679,9 +707,14 @@ impl LiquidCache {
         let actual_old_size = displaced
             .as_ref()
             .map_or(0, |slot| slot.entry.memory_usage_bytes());
+        let held_old_size = displaced.as_ref().map_or(0, |slot| {
+            self.budget.hold_if_snapshotted(&entry_id, &slot.entry)
+        });
         // The insert's net change is `new - actual_old`, of which `reserved`
-        // is charged already.
-        let remaining = new_memory_size as i128 - actual_old_size as i128 - reserved as i128;
+        // is charged already. A displaced entry a snapshot still holds stays
+        // charged.
+        let remaining = new_memory_size as i128 - actual_old_size as i128 + held_old_size as i128
+            - reserved as i128;
         if remaining > 0 {
             self.budget.charge_memory(remaining as usize);
         } else if remaining < 0 {
@@ -797,8 +830,9 @@ impl LiquidCache {
         else {
             return;
         };
+        let held = self.budget.hold_if_snapshotted(&entry_id, &removed.entry);
         self.budget
-            .try_update_memory_usage(removed.entry.memory_usage_bytes(), 0)
+            .try_update_memory_usage(removed.entry.memory_usage_bytes() - held, 0)
             .expect("memory release cannot fail");
         self.cache_policy.notify_remove(&entry_id);
         // A write can have installed the key again, and told the policy,
@@ -823,8 +857,9 @@ impl LiquidCache {
         else {
             return;
         };
+        let held = self.budget.hold_if_snapshotted(&entry_id, &removed.entry);
         self.budget
-            .try_update_memory_usage(removed.entry.memory_usage_bytes(), 0)
+            .try_update_memory_usage(removed.entry.memory_usage_bytes() - held, 0)
             .expect("memory release cannot fail");
         self.cache_policy.notify_remove(&entry_id);
     }
@@ -2898,5 +2933,149 @@ mod tests {
 
         assert!(!cache.contains(&entry, 0));
         assert_disk_matches_index(&cache, &store).await;
+    }
+
+    async fn memory_only_cache(budget: usize) -> Arc<LiquidCache> {
+        LiquidCacheBuilder::new()
+            .with_max_memory_bytes(budget)
+            .with_max_disk_bytes(0)
+            .with_eviction_policy(Box::new(TranscodeEvict))
+            .with_cache_policy(Box::new(LiquidPolicy::new()))
+            .build()
+            .await
+    }
+
+    fn index_memory_bytes(cache: &LiquidCache) -> usize {
+        let mut held = 0;
+        cache
+            .index()
+            .for_each(|_, slot| held += slot.entry.memory_usage_bytes());
+        held
+    }
+
+    async fn snapshot(cache: &LiquidCache, entry_id: EntryID) -> Arc<CacheEntry> {
+        match cache.prefetch(&entry_id, 0).await {
+            PrefetchResult::Snapshot(snapshot) => snapshot,
+            PrefetchResult::Absent => panic!("{entry_id:?} is not cached"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_keeps_its_entry_charged_after_the_entry_is_evicted() {
+        let budget = 1 << 20;
+        let cache = memory_only_cache(budget).await;
+        let first = EntryID::from(0usize);
+        cache.insert(first, 0, int64_array(4096, 0)).await.unwrap();
+        let held = snapshot(&cache, first).await;
+        let held_bytes = held.memory_usage_bytes();
+
+        let mut k = 1usize;
+        while cache.contains(&first, 0) {
+            cache
+                .insert(EntryID::from(k), 0, int64_array(4096, k as i64))
+                .await
+                .unwrap();
+            k += 1;
+        }
+        for k in k..k + 50 {
+            cache
+                .insert(EntryID::from(k), 0, int64_array(4096, k as i64))
+                .await
+                .unwrap();
+            assert!(cache.budget.memory_usage_bytes() <= budget);
+        }
+
+        assert_eq!(cache.budget.held_memory_bytes(), held_bytes);
+        assert_eq!(
+            cache.budget.memory_usage_bytes(),
+            index_memory_bytes(&cache) + held_bytes
+        );
+        drop(held);
+        assert_eq!(cache.budget.held_memory_bytes(), 0);
+        assert_eq!(
+            cache.budget.memory_usage_bytes(),
+            index_memory_bytes(&cache)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_transcoded_entry_keeps_its_snapshotted_arrow_charged() {
+        let cache = memory_only_cache(1 << 20).await;
+        let entry_id = EntryID::from(0usize);
+        cache
+            .insert(entry_id, 0, int64_array(4096, 0))
+            .await
+            .unwrap();
+        let held = snapshot(&cache, entry_id).await;
+
+        assert_eq!(cache.evict_victim_inner(entry_id).await, Ok(()));
+
+        let slot = cache.index().get(&entry_id).unwrap();
+        assert!(matches!(slot.entry, CacheEntry::MemoryLiquid(_)));
+        assert_eq!(
+            cache.budget.memory_usage_bytes(),
+            slot.entry.memory_usage_bytes() + held.memory_usage_bytes()
+        );
+        drop(held);
+        assert_eq!(
+            cache.budget.memory_usage_bytes(),
+            slot.entry.memory_usage_bytes()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_array_the_inserter_keeps_is_not_charged_once_evicted() {
+        let budget = 1 << 20;
+        let cache = memory_only_cache(budget).await;
+        let first = EntryID::from(0usize);
+        let kept = int64_array(4096, 0);
+        cache.insert(first, 0, Arc::clone(&kept)).await.unwrap();
+
+        let mut k = 1usize;
+        while cache.contains(&first, 0) {
+            cache
+                .insert(EntryID::from(k), 0, int64_array(4096, k as i64))
+                .await
+                .unwrap();
+            k += 1;
+        }
+
+        assert_eq!(cache.budget.held_memory_bytes(), 0);
+        assert_eq!(
+            cache.budget.memory_usage_bytes(),
+            index_memory_bytes(&cache)
+        );
+        drop(kept);
+    }
+
+    #[tokio::test]
+    async fn held_snapshots_count_against_admission() {
+        let budget = 1 << 20;
+        let cache = memory_only_cache(budget).await;
+        let mut snapshots = Vec::new();
+        let mut refused = None;
+        for k in 0..200usize {
+            let entry_id = EntryID::from(k);
+            match cache.insert(entry_id, 0, int64_array(4096, k as i64)).await {
+                Ok(()) => snapshots.push(snapshot(&cache, entry_id).await),
+                Err(CacheFull) => {
+                    refused = Some(k);
+                    break;
+                }
+            }
+            assert!(cache.budget.memory_usage_bytes() <= budget);
+            assert!(
+                index_memory_bytes(&cache) + cache.budget.held_memory_bytes()
+                    <= cache.budget.memory_usage_bytes()
+            );
+        }
+        let refused = refused.expect("snapshots of every entry never filled the budget");
+
+        snapshots.clear();
+        cache
+            .insert(EntryID::from(refused), 0, int64_array(4096, refused as i64))
+            .await
+            .unwrap();
+        assert_eq!(cache.budget.held_memory_bytes(), 0);
     }
 }
