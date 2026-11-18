@@ -19,6 +19,9 @@ pub trait CachePolicy: std::fmt::Debug + Send + Sync {
     }
 
     /// Notify the cache policy that an entry was inserted.
+    ///
+    /// The cache can tell the policy of the same key again, in any order
+    /// with other notices of it, so this must file the key once (an upsert).
     fn notify_insert(&self, _entry_id: &EntryID, _batch_type: CachedBatchType) {}
 
     /// Notify the cache policy that an entry was accessed.

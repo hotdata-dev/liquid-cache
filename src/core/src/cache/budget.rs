@@ -49,6 +49,14 @@ impl BudgetAccounting {
         )
     }
 
+    /// Charge `bytes` of memory whatever the budget reads: for memory an
+    /// entry already holds, which the budget missed.
+    pub(super) fn charge_memory(&self, bytes: usize) {
+        let _ = update(&self.used_memory_bytes, |used| {
+            Some(used.saturating_add(bytes))
+        });
+    }
+
     /// Adjust memory usage after transcoding.
     /// Returns ok if the usage was adjusted, err if the memory budget is full when new_size is larger than old_size.
     pub(super) fn try_update_memory_usage(
@@ -63,24 +71,6 @@ impl BudgetAccounting {
         } else {
             release(&self.used_memory_bytes, old_size - new_size);
             Ok(())
-        }
-    }
-
-    /// Correct a memory update made against the wrong replaced size.
-    ///
-    /// An insert updates the usage by its new size less the size of the slot
-    /// it read, but another insert of the key can replace that slot before
-    /// this one lands. `assumed` is the size the update released, `released`
-    /// the size of the slot actually displaced. The difference is applied
-    /// whatever the limit: the entry is installed, and the usage has to say
-    /// what it holds.
-    pub(super) fn settle_memory_release(&self, assumed: usize, released: usize) {
-        if released > assumed {
-            release(&self.used_memory_bytes, released - assumed);
-        } else if assumed > released {
-            let _ = update(&self.used_memory_bytes, |used| {
-                Some(used.saturating_add(assumed - released))
-            });
         }
     }
 
@@ -288,24 +278,19 @@ mod tests {
         assert_eq!(budget.disk_usage_bytes(), 1000);
     }
 
-    /// An insert that released less than the displaced slot held gives the
-    /// rest back; one that released more takes the difference back, even past
-    /// the limit, since the entry it charges is already installed.
+    /// Memory an installed entry already holds is charged even past the
+    /// limit, and the charge saturates rather than wrapping.
     #[test]
-    fn settling_a_release_charges_what_was_actually_displaced() {
+    fn charging_memory_ignores_the_limit_and_does_not_wrap() {
         let budget = test_budget(1000, usize::MAX);
         budget.try_reserve_memory(900).unwrap();
 
-        budget.settle_memory_release(100, 400);
-        assert_eq!(budget.memory_usage_bytes(), 600);
-
-        budget.settle_memory_release(400, 100);
-        assert_eq!(budget.memory_usage_bytes(), 900);
-
-        budget.settle_memory_release(0, 0);
-        budget.settle_memory_release(300, 0);
+        budget.charge_memory(300);
         assert_eq!(budget.memory_usage_bytes(), 1200);
         assert!(budget.try_reserve_memory(1).is_err());
+
+        budget.charge_memory(usize::MAX);
+        assert_eq!(budget.memory_usage_bytes(), usize::MAX);
     }
 
     /// A reservation whose sum with the usage does not fit a `usize` is

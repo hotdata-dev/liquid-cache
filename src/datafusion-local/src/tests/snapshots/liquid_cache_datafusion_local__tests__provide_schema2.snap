@@ -22,8 +22,8 @@ stats:
 entries.total: 8
 entries.after_first_run: 8
 entries.memory.arrow: 5
-entries.memory.liquid: 1
-entries.disk.liquid: 2
+entries.memory.liquid: 3
+entries.disk.liquid: 0
 entries.disk.arrow: 0
 usage.memory_bytes: [bytes]
 usage.disk_bytes: [bytes]
@@ -171,8 +171,8 @@ stats:
 entries.total: 8
 entries.after_first_run: 8
 entries.memory.arrow: 5
-entries.memory.liquid: 1
-entries.disk.liquid: 2
+entries.memory.liquid: 3
+entries.disk.liquid: 0
 entries.disk.arrow: 0
 usage.memory_bytes: [bytes]
 usage.disk_bytes: [bytes]
