@@ -275,6 +275,7 @@ impl LiquidCacheReaderInner {
             let mut inner = self;
             let mut row_filter = row_filter;
             inner.last_pull = None;
+            let batch_id = inner.current_batch_id;
 
             let result = match inner
                 .build_predicate_filter(&mut row_filter, selection)
@@ -293,6 +294,8 @@ impl LiquidCacheReaderInner {
                 },
                 Err(e) => ProcessResult::Emit(Err(e)),
             };
+            inner.cached_row_group.release_snapshot_batch(batch_id);
+            inner.last_pull = None;
 
             (inner, row_filter, result)
         })

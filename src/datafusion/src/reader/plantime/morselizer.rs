@@ -650,9 +650,12 @@ fn plan_row_group_morsels(planned: PlannedRowGroups) -> Result<Option<MorselPlan
         snapshots: Arc::default(),
         prefetch,
     };
-    let plan = if prefetch {
+    let plan = if prefetch && chain.has_headroom_for_front() {
         MorselPlan::new().with_pending_planner(prefetch_future(chain))
     } else {
+        if prefetch {
+            chain.planner.metrics.prefetch_skipped.add(1);
+        }
         MorselPlan::new().with_planners(vec![Box::new(chain)])
     };
     Ok(Some(plan))
@@ -670,6 +673,22 @@ impl fmt::Debug for LiquidRowGroupChain {
         f.debug_struct("LiquidRowGroupChain")
             .field("remaining_row_groups", &self.queue.len())
             .finish_non_exhaustive()
+    }
+}
+
+impl LiquidRowGroupChain {
+    /// Whether the cache's free memory covers the estimate of the next queued row group.
+    fn has_headroom_for_front(&self) -> bool {
+        let Some((row_group_idx, _)) = self.queue.front() else {
+            return false;
+        };
+        let estimate = self.planner.estimated_bytes(*row_group_idx);
+        let headroom = self
+            .planner
+            .liquid_cache
+            .max_memory_bytes()
+            .saturating_sub(self.planner.liquid_cache.memory_usage_bytes());
+        headroom >= estimate
     }
 }
 
@@ -692,14 +711,7 @@ impl MorselPlanner for LiquidRowGroupChain {
             return Ok(Some(plan.with_planners(vec![self])));
         }
 
-        let next_row_group = self.queue.front().unwrap().0;
-        let estimate = self.planner.estimated_bytes(next_row_group);
-        let headroom = self
-            .planner
-            .liquid_cache
-            .max_memory_bytes()
-            .saturating_sub(self.planner.liquid_cache.memory_usage_bytes());
-        if headroom >= estimate {
+        if self.has_headroom_for_front() {
             plan = plan.with_pending_planner(prefetch_future(*self));
         } else {
             self.planner.metrics.prefetch_skipped.add(1);
@@ -743,7 +755,11 @@ async fn prefetch_front(chain: LiquidRowGroupChain) -> LiquidRowGroupChain {
 
         if predicate_summary.any_missing {
             match materialize_prefetch_batch(&mut context, batch_id).await {
-                Ok(()) => produced_snapshots = true,
+                Ok(true) => produced_snapshots = true,
+                Ok(false) => {
+                    debug!("Stopping row group {row_group_idx} prefetch: cache full");
+                    break;
+                }
                 Err(error) => {
                     debug!("Stopping row group {row_group_idx} prefetch: {error}");
                     break;
@@ -778,7 +794,11 @@ async fn prefetch_front(chain: LiquidRowGroupChain) -> LiquidRowGroupChain {
                 produced_snapshots |= projection_summary.any_snapshotted;
                 if projection_summary.any_missing {
                     match materialize_prefetch_batch(&mut context, batch_id).await {
-                        Ok(()) => produced_snapshots = true,
+                        Ok(true) => produced_snapshots = true,
+                        Ok(false) => {
+                            debug!("Stopping row group {row_group_idx} prefetch: cache full");
+                            break;
+                        }
                         Err(error) => {
                             debug!("Stopping row group {row_group_idx} prefetch: {error}");
                             break;
@@ -829,10 +849,14 @@ async fn prefetch_columns(
     summary
 }
 
+/// Read `batch_id` from parquet, cache it, and snapshot what the cache took.
+///
+/// Returns `Ok(false)` once the cache refuses a column; that column and the
+/// rest of the batch are left for the reader.
 async fn materialize_prefetch_batch(
     context: &mut crate::reader::runtime::LiquidRowGroupPrefetchContext,
     batch_id: BatchID,
-) -> std::result::Result<(), parquet::errors::ParquetError> {
+) -> std::result::Result<bool, parquet::errors::ParquetError> {
     let record_batch = context.fallback.fetch_batch(batch_id).await?;
     for (position, column_id) in context.cache_column_ids.iter().enumerate() {
         let column = context
@@ -841,12 +865,13 @@ async fn materialize_prefetch_batch(
             .unwrap();
         let array = Arc::clone(record_batch.column(position));
         match column.insert(batch_id, Arc::clone(&array)).await {
-            Ok(()) | Err(InsertArrowArrayError::AlreadyCached) => {}
-            Err(InsertArrowArrayError::CacheFull) => {}
+            Ok(()) | Err(InsertArrowArrayError::AlreadyCached) => {
+                column.prefetch_snapshot(batch_id).await;
+            }
+            Err(InsertArrowArrayError::CacheFull) => return Ok(false),
         }
-        column.insert_snapshot(batch_id, array);
     }
-    Ok(())
+    Ok(true)
 }
 
 async fn load_bloom_filters(
@@ -1044,6 +1069,28 @@ mod tests {
         writer.close().unwrap();
     }
 
+    fn write_row_groups_file(path: &std::path::Path, schema: SchemaRef, rows: &[usize]) {
+        let file = File::create(path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, Arc::clone(&schema), None).unwrap();
+        let mut next = 0i32;
+        for rows in rows {
+            let a = (next..next + *rows as i32).collect::<Vec<_>>();
+            let b = a.iter().map(|value| value + 100_000).collect::<Vec<_>>();
+            next += *rows as i32;
+            writer
+                .write(
+                    &RecordBatch::try_new(
+                        Arc::clone(&schema),
+                        vec![Arc::new(Int32Array::from(a)), Arc::new(Int32Array::from(b))],
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            writer.flush().unwrap();
+        }
+        writer.close().unwrap();
+    }
+
     fn write_single_row_group_file(path: &std::path::Path, schema: SchemaRef, a: Vec<i32>) {
         let file = File::create(path).unwrap();
         let b = a.iter().map(|value| value + 1000).collect::<Vec<_>>();
@@ -1079,6 +1126,14 @@ mod tests {
         predicate: Option<Arc<dyn PhysicalExpr>>,
         projection_columns: Vec<usize>,
         single_row_group_values: Option<Vec<i32>>,
+        /// A file of any schema, one row group per batch (takes precedence).
+        custom_file: Option<(SchemaRef, Vec<RecordBatch>)>,
+        /// Rows per row group for a multi-row-group file.
+        row_group_rows: Option<Vec<usize>>,
+        prefetch: bool,
+        shared_cache: Option<Arc<LiquidCacheParquet>>,
+        /// Batch size of the cache and of the morselizer.
+        batch_size: usize,
     }
 
     impl Default for PlanOptions {
@@ -1089,6 +1144,11 @@ mod tests {
                 predicate: None,
                 projection_columns: vec![0, 1],
                 single_row_group_values: None,
+                custom_file: None,
+                row_group_rows: None,
+                prefetch: true,
+                shared_cache: None,
+                batch_size: 4,
             }
         }
     }
@@ -1098,10 +1158,19 @@ mod tests {
         max_memory_bytes: usize,
         max_disk_bytes: usize,
     ) -> Arc<LiquidCacheParquet> {
+        create_test_cache_with_batch_size(path, max_memory_bytes, max_disk_bytes, 4).await
+    }
+
+    async fn create_test_cache_with_batch_size(
+        path: &std::path::Path,
+        max_memory_bytes: usize,
+        max_disk_bytes: usize,
+        batch_size: usize,
+    ) -> Arc<LiquidCacheParquet> {
         let store = t4::mount(path.join("liquid_cache.t4")).await.unwrap();
         Arc::new(
             LiquidCacheParquet::new(
-                4,
+                batch_size,
                 max_memory_bytes,
                 max_disk_bytes,
                 store,
@@ -1114,12 +1183,25 @@ mod tests {
     }
 
     async fn prepare_test_file(options: PlanOptions) -> TestFilePlanner {
-        let schema = schema();
+        let schema = match &options.custom_file {
+            Some((schema, _)) => Arc::clone(schema),
+            None => schema(),
+        };
         let tmp_dir = tempfile::tempdir().unwrap();
         let file_id = NEXT_FILE_ID.fetch_add(1, Ordering::Relaxed);
         let file_name = "data.parquet".to_string();
         let parquet_path = tmp_dir.path().join(&file_name);
-        if let Some(values) = options.single_row_group_values {
+        if let Some((_, row_groups)) = &options.custom_file {
+            let file = File::create(&parquet_path).unwrap();
+            let mut writer = ArrowWriter::try_new(file, Arc::clone(&schema), None).unwrap();
+            for row_group in row_groups {
+                writer.write(row_group).unwrap();
+                writer.flush().unwrap();
+            }
+            writer.close().unwrap();
+        } else if let Some(rows) = options.row_group_rows {
+            write_row_groups_file(&parquet_path, Arc::clone(&schema), &rows);
+        } else if let Some(values) = options.single_row_group_values {
             write_single_row_group_file(&parquet_path, Arc::clone(&schema), values);
         } else {
             write_two_row_group_file(&parquet_path, Arc::clone(&schema));
@@ -1129,18 +1211,24 @@ mod tests {
             std::fs::metadata(&parquet_path).unwrap().len(),
         );
         let object_store = Arc::new(LocalFileSystem::new_with_prefix(tmp_dir.path()).unwrap());
-        let cache = create_test_cache(
-            tmp_dir.path(),
-            options.max_memory_bytes,
-            options.max_disk_bytes,
-        )
-        .await;
+        let cache = match options.shared_cache {
+            Some(cache) => cache,
+            None => {
+                create_test_cache_with_batch_size(
+                    tmp_dir.path(),
+                    options.max_memory_bytes,
+                    options.max_disk_bytes,
+                    options.batch_size,
+                )
+                .await
+            }
+        };
         let metrics = ExecutionPlanMetricsSet::new();
         let object_store_url = ObjectStoreUrl::parse(format!("test-{file_id}:///")).unwrap();
         let morselizer = LiquidMorselizer {
             partition_index: 0,
             projection: ProjectionExprs::from_indices(&options.projection_columns, schema.as_ref()),
-            batch_size: 4,
+            batch_size: options.batch_size,
             predicate: options.predicate,
             table_schema: TableSchema::from(Arc::clone(&schema)),
             metrics: metrics.clone(),
@@ -1154,7 +1242,7 @@ mod tests {
             expr_adapter_factory: Arc::new(DefaultPhysicalExprAdapterFactory),
             span: None,
             lineages: Arc::default(),
-            prefetch: true,
+            prefetch: options.prefetch,
         };
         let cached_file = cache.register_or_get_file(
             ParquetFileIdentity::new(object_store_url, file_name),
@@ -1186,6 +1274,9 @@ mod tests {
             let mut plan = planner.plan().unwrap().expect("file has row groups");
             assert!(plan.take_morsels().is_empty());
             if let Some(ready) = plan.take_ready_planners().pop() {
+                if format!("{ready:?}").contains("LiquidRowGroupChain") {
+                    return ready;
+                }
                 planner = ready;
                 continue;
             }
@@ -1604,6 +1695,283 @@ mod tests {
         );
     }
 
+    fn file_metadata(path: &std::path::Path) -> Arc<parquet::file::metadata::ParquetMetaData> {
+        parquet::arrow::arrow_reader::ArrowReaderMetadata::load(
+            &File::open(path).unwrap(),
+            Default::default(),
+        )
+        .unwrap()
+        .metadata()
+        .clone()
+    }
+
+    const STRING_ROWS: usize = 8192;
+
+    /// A file of two row groups, each one batch of a 20-value, 64-byte string
+    /// column: parquet dictionary-encodes it to a small fraction of its
+    /// decoded size.
+    async fn low_cardinality_string_file(max_memory_bytes: usize) -> TestFilePlanner {
+        let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, false)]));
+        let row_group = |offset: usize| {
+            let values = (0..STRING_ROWS)
+                .map(|row| format!("{:0>64}", (offset + row) % 20))
+                .collect::<Vec<_>>();
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(arrow::array::StringArray::from(values))],
+            )
+            .unwrap()
+        };
+        let row_groups = vec![row_group(0), row_group(1)];
+        prepare_test_file(PlanOptions {
+            max_memory_bytes,
+            max_disk_bytes: 0,
+            projection_columns: vec![0],
+            custom_file: Some((schema, row_groups)),
+            batch_size: STRING_ROWS,
+            ..Default::default()
+        })
+        .await
+    }
+
+    /// The headroom gate must size a row group by what its prefetch pins, the
+    /// decoded arrays, not by parquet's encoded page size. With the disk tier
+    /// off and headroom for a few times the encoded size but well under the
+    /// decoded one, the second row group must not be prefetched.
+    #[tokio::test]
+    async fn headroom_gate_sizes_row_groups_by_decoded_bytes() {
+        let unbounded = low_cardinality_string_file(usize::MAX).await;
+        let path = unbounded.tmp_dir.path().join("data.parquet");
+
+        let metadata = file_metadata(&path);
+        let encoded = metadata.row_group(1).column(0).uncompressed_size() as usize;
+        let decoded: usize =
+            parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+                File::open(&path).unwrap(),
+            )
+            .unwrap()
+            .with_row_groups(vec![1])
+            .with_batch_size(STRING_ROWS)
+            .build()
+            .unwrap()
+            .map(|batch| batch.unwrap().column(0).get_array_memory_size())
+            .sum();
+        assert!(
+            decoded > encoded * 20,
+            "precondition: the column must decode far larger than it encodes \
+             ({decoded} decoded, {encoded} encoded)"
+        );
+
+        let headroom = encoded * 4;
+        let file = low_cardinality_string_file(headroom).await;
+        let chain = advance_to_row_group_chain(file.planner).await;
+        // The first row group's prefetch waits for headroom too.
+        assert_eq!(file.cache.memory_usage_bytes(), 0);
+        let mut first = chain.plan().unwrap().unwrap();
+        let prefetched = first.take_pending_planner().is_some();
+        println!(
+            "row group 1: encoded={encoded} decoded={decoded} headroom={headroom} \
+             prefetched={prefetched}"
+        );
+        assert!(
+            !prefetched,
+            "row group 1 was prefetched into {headroom} bytes of headroom, though its \
+             {decoded} decoded bytes are {:.0}x that",
+            decoded as f64 / headroom as f64
+        );
+    }
+
+    /// Each fixed-width and byte-array column is sized by its decoded Arrow
+    /// width, never below parquet's encoded size.
+    #[test]
+    fn decoded_column_bytes_covers_decoded_arrays() {
+        use crate::reader::runtime::decoded_column_bytes;
+        let rows = 4096;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("i32", DataType::Int32, false),
+            Field::new("i64", DataType::Int64, true),
+            Field::new("f64", DataType::Float64, false),
+            Field::new("flag", DataType::Boolean, false),
+            Field::new("s", DataType::Utf8, false),
+            Field::new("unique", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![7; rows])),
+                Arc::new(arrow::array::Int64Array::from_iter(
+                    (0..rows as i64).map(|v| (v % 3 != 0).then_some(1)),
+                )),
+                Arc::new(arrow::array::Float64Array::from(vec![1.5; rows])),
+                Arc::new(arrow::array::BooleanArray::from(vec![true; rows])),
+                Arc::new(arrow::array::StringArray::from_iter_values(
+                    (0..rows).map(|row| format!("{:0>40}", row % 5)),
+                )),
+                Arc::new(arrow::array::StringArray::from_iter_values(
+                    (0..rows).map(|row| format!("value-{row}")),
+                )),
+            ],
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("types.parquet");
+        let mut writer =
+            ArrowWriter::try_new(File::create(&path).unwrap(), Arc::clone(&schema), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let metadata = file_metadata(&path);
+        for (index, column) in metadata.row_group(0).columns().iter().enumerate() {
+            let name = schema.field(index).name();
+            let estimate = decoded_column_bytes(column);
+            let decoded = batch
+                .column(index)
+                .to_data()
+                .get_slice_memory_size()
+                .unwrap();
+            println!(
+                "{name}: encoded={} decoded={decoded} estimate={estimate}",
+                column.uncompressed_size()
+            );
+            assert!(
+                estimate >= decoded,
+                "{name}: estimated {estimate} bytes for {decoded} decoded"
+            );
+            assert!(estimate >= column.uncompressed_size() as usize);
+            assert!(
+                estimate <= decoded * 3,
+                "{name}: estimated {estimate} bytes, over 3x the {decoded} decoded"
+            );
+        }
+    }
+
+    /// Decimals are stored as INT32, INT64 or fixed-length bytes but decode to
+    /// 16- or 32-byte Arrow decimals; the estimate must cover what the reader
+    /// actually produces, whatever the physical type.
+    #[test]
+    fn decoded_column_bytes_covers_decimals() {
+        use crate::reader::runtime::decoded_column_bytes;
+        use arrow::array::{Decimal128Array, Decimal256Array};
+        use arrow::datatypes::i256;
+        let rows = 4096;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("d5", DataType::Decimal128(5, 2), false),
+            Field::new("d15", DataType::Decimal128(15, 2), false),
+            Field::new("d30", DataType::Decimal128(30, 2), false),
+            Field::new("d50", DataType::Decimal256(50, 2), false),
+        ]));
+        let values = |precision: u8| {
+            Decimal128Array::from_iter_values((0..rows as i128).map(|v| v % 997))
+                .with_precision_and_scale(precision, 2)
+                .unwrap()
+        };
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(values(5)),
+                Arc::new(values(15)),
+                Arc::new(values(30)),
+                Arc::new(
+                    Decimal256Array::from_iter_values(
+                        (0..rows as i128).map(|v| i256::from_i128(v % 997)),
+                    )
+                    .with_precision_and_scale(50, 2)
+                    .unwrap(),
+                ),
+            ],
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("decimals.parquet");
+        let mut writer =
+            ArrowWriter::try_new(File::create(&path).unwrap(), Arc::clone(&schema), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        // What the reader decodes, not what was written.
+        let decoded = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+            File::open(&path).unwrap(),
+        )
+        .unwrap()
+        .with_batch_size(rows)
+        .build()
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+        let metadata = file_metadata(&path);
+        for (index, column) in metadata.row_group(0).columns().iter().enumerate() {
+            let name = schema.field(index).name();
+            let estimate = decoded_column_bytes(column);
+            let array = decoded.column(index);
+            let decoded_bytes = array.to_data().get_slice_memory_size().unwrap();
+            println!(
+                "{name}: physical={:?} decoded_type={:?} encoded={} decoded={decoded_bytes} \
+                 estimate={estimate}",
+                column.column_type(),
+                array.data_type(),
+                column.uncompressed_size()
+            );
+            assert!(
+                estimate >= decoded_bytes,
+                "{name} ({:?}, decoded as {:?}): estimated {estimate} bytes for \
+                 {decoded_bytes} decoded",
+                column.column_type(),
+                array.data_type()
+            );
+        }
+    }
+
+    /// Without `unencoded_byte_array_data_bytes` the string data must not be
+    /// sized from the min/max values alone: they are ordered by value, not by
+    /// length, and writers truncate them. Here both are one byte long while
+    /// every value is 100 bytes, which the plain-encoded size still shows.
+    #[test]
+    fn decoded_column_bytes_without_data_size_does_not_trust_min_max() {
+        use crate::reader::runtime::decoded_column_bytes;
+        use parquet::basic::{LogicalType, Type as PhysicalType};
+        use parquet::data_type::ByteArray;
+        use parquet::file::metadata::ColumnChunkMetaData;
+        use parquet::file::statistics::Statistics;
+        use parquet::schema::types::{ColumnDescriptor, ColumnPath, Type};
+
+        let rows: usize = 4096;
+        let value_len: usize = 100;
+        let field = Type::primitive_type_builder("s", PhysicalType::BYTE_ARRAY)
+            .with_logical_type(Some(LogicalType::String))
+            .build()
+            .unwrap();
+        let descr = Arc::new(ColumnDescriptor::new(
+            Arc::new(field),
+            0,
+            0,
+            ColumnPath::from("s"),
+        ));
+        // Plain encoding: a 4-byte length before each value.
+        let encoded = rows * (4 + value_len);
+        let column = ColumnChunkMetaData::builder(descr)
+            .set_num_values(rows as i64)
+            .set_total_uncompressed_size(encoded as i64)
+            .set_statistics(Statistics::byte_array(
+                Some(ByteArray::from("a")),
+                Some(ByteArray::from("b")),
+                None,
+                Some(0),
+                false,
+            ))
+            .build()
+            .unwrap();
+        assert!(column.unencoded_byte_array_data_bytes().is_none());
+
+        let estimate = decoded_column_bytes(&column);
+        // A `Utf8View` of 100-byte values: a 16-byte view plus the value each.
+        let decoded = rows * (16 + value_len);
+        assert!(
+            estimate >= decoded,
+            "estimated {estimate} bytes for {decoded} decoded ({encoded} encoded)"
+        );
+    }
+
     #[tokio::test]
     async fn cache_full_drops_the_oldest_batch_to_admit_the_newest() {
         let one_array_memory = Arc::new(Int32Array::from(vec![0, 1, 2, 3])).get_array_memory_size();
@@ -1749,5 +2117,188 @@ mod tests {
             .create_morselizer(object_store, &base_config, 0)
             .unwrap();
         assert!(morselizer.plan_file(file).is_ok());
+    }
+
+    // ---- snapshot memory accounting ----
+
+    fn one_array_memory() -> usize {
+        Arc::new(Int32Array::from(vec![0, 1, 2, 3])).get_array_memory_size()
+    }
+
+    /// Assert that the memory held by the cache's entries and by live
+    /// snapshots, each array counted once, is within the cache's counter, and
+    /// the counter within the budget.
+    fn assert_snapshots_counted(cache: &LiquidCacheParquet, at: &str) {
+        let (in_index, snapshot_only) =
+            crate::cache::snapshot_test_registry::live_footprint(cache.storage());
+        let held = in_index + snapshot_only;
+        let counter = cache.memory_usage_bytes();
+        let max = cache.max_memory_bytes();
+        assert!(
+            held <= counter,
+            "{at}: entries and snapshots hold {held} bytes ({snapshot_only} only in snapshots) \
+             but the counter reports {counter}"
+        );
+        assert!(
+            counter <= max,
+            "{at}: counter {counter} exceeds the budget {max}"
+        );
+    }
+
+    async fn concurrent_prefetch_case(max_disk_bytes: usize) {
+        const PARTITIONS: usize = 4;
+        const ROWS: usize = 128; // 32 batches, 2 columns per row group
+        // Decoded size of one row group: headroom for about one prefetch.
+        let max = one_array_memory() * 2 * (ROWS / 4);
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = create_test_cache(cache_dir.path(), max, max_disk_bytes).await;
+
+        let mut files = Vec::new();
+        for _ in 0..PARTITIONS {
+            files.push(
+                prepare_test_file(PlanOptions {
+                    row_group_rows: Some(vec![ROWS, ROWS]),
+                    shared_cache: Some(Arc::clone(&cache)),
+                    ..Default::default()
+                })
+                .await,
+            );
+        }
+        let mut keep = Vec::new();
+        let mut planners = Vec::new();
+        for file in files {
+            planners.push(file.planner);
+            keep.push((file.cached_file, file.tmp_dir));
+        }
+
+        let chains =
+            futures::future::join_all(planners.into_iter().map(advance_to_row_group_chain)).await;
+        assert_snapshots_counted(&cache, "after concurrent row group 0 prefetches");
+
+        let mut morsels = Vec::new();
+        let mut pending = Vec::new();
+        for chain in chains {
+            let mut plan = chain.plan().unwrap().unwrap();
+            morsels.extend(plan.take_morsels());
+            pending.extend(plan.take_pending_planner());
+        }
+        let _next = futures::future::join_all(pending).await;
+        assert_snapshots_counted(
+            &cache,
+            "after row group 1 prefetches, row group 0 morsels alive",
+        );
+        drop(morsels);
+        drop(keep);
+    }
+
+    #[tokio::test]
+    async fn concurrent_prefetch_snapshots_stay_within_the_counter() {
+        concurrent_prefetch_case(usize::MAX).await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_prefetch_snapshots_stay_within_the_counter_memory_only() {
+        concurrent_prefetch_case(0).await;
+    }
+
+    #[tokio::test]
+    async fn a_reader_on_a_full_cache_snapshots_at_most_the_batch_it_reads() {
+        use crate::cache::snapshot_test_registry::live_totals;
+        const ROWS: usize = 64; // 16 batches of 4 rows, 2 columns
+        let file = prepare_test_file(PlanOptions {
+            max_memory_bytes: 1,
+            max_disk_bytes: 0,
+            row_group_rows: Some(vec![ROWS]),
+            prefetch: false,
+            ..Default::default()
+        })
+        .await;
+        let mut morsels = drive_planner(file.planner).await;
+        assert_eq!(morsels.len(), 1);
+        let mut stream = morsels.pop().unwrap().into_stream();
+
+        let mut batches = 0;
+        while let Some(batch) = stream.next().await {
+            batch.unwrap();
+            batches += 1;
+            let (_, entries, bytes) = live_totals();
+            assert_eq!(
+                entries, 0,
+                "after batch {batches} the snapshot map still holds {entries} entries ({bytes} bytes)"
+            );
+        }
+        assert_eq!(batches, ROWS / 4);
+    }
+
+    #[tokio::test]
+    async fn evicted_snapshotted_entries_stay_charged() {
+        use crate::cache::snapshot_test_registry::live_totals;
+        const ROWS: usize = 128; // 32 batches of 4 rows, 2 columns
+        let file = prepare_test_file(PlanOptions {
+            row_group_rows: Some(vec![ROWS, ROWS]),
+            ..Default::default()
+        })
+        .await;
+        let chain = advance_to_row_group_chain(file.planner).await;
+        let (_, entries, snapshot_bytes) = live_totals();
+        assert!(entries > 0, "prefetch produced no snapshots");
+
+        file.cache.flush_data().await.unwrap();
+
+        assert_eq!(file.cache.memory_usage_bytes(), snapshot_bytes);
+        drop(chain);
+        assert_eq!(file.cache.memory_usage_bytes(), 0);
+    }
+
+    async fn drain_morsels(morsels: Vec<Box<dyn Morsel>>) -> usize {
+        let mut rows = 0;
+        for morsel in morsels {
+            let mut stream = morsel.into_stream();
+            while let Some(batch) = stream.next().await {
+                rows += batch.unwrap().num_rows();
+            }
+        }
+        rows
+    }
+
+    #[tokio::test]
+    async fn first_row_group_prefetch_waits_for_headroom() {
+        use crate::cache::snapshot_test_registry::live_totals;
+        const ROWS: usize = 128; // 32 batches of 4 rows, 2 columns
+        let row_group_bytes = one_array_memory() * 2 * (ROWS / 4);
+
+        // A cache sized for one row group, filled by another file.
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = create_test_cache(cache_dir.path(), row_group_bytes, usize::MAX).await;
+        let warm = prepare_test_file(PlanOptions {
+            row_group_rows: Some(vec![ROWS]),
+            prefetch: false,
+            shared_cache: Some(Arc::clone(&cache)),
+            ..Default::default()
+        })
+        .await;
+        assert_eq!(drain_morsels(drive_planner(warm.planner).await).await, ROWS);
+        assert_eq!(cache.memory_usage_bytes(), cache.max_memory_bytes());
+
+        let cold = prepare_test_file(PlanOptions {
+            row_group_rows: Some(vec![ROWS, ROWS]),
+            shared_cache: Some(Arc::clone(&cache)),
+            ..Default::default()
+        })
+        .await;
+        let full = advance_to_row_group_chain(cold.planner).await;
+
+        // A cache that can hold nothing.
+        let empty = prepare_test_file(PlanOptions {
+            max_memory_bytes: 1,
+            max_disk_bytes: 0,
+            row_group_rows: Some(vec![ROWS, ROWS]),
+            ..Default::default()
+        })
+        .await;
+        let nothing = advance_to_row_group_chain(empty.planner).await;
+
+        assert_eq!(live_totals(), (0, 0, 0));
+        drop((full, nothing));
     }
 }

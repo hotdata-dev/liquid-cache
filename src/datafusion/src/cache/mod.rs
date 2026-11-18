@@ -84,6 +84,112 @@ impl RowGroupSnapshots {
     pub(crate) fn insert_selection(&self, batch_id: BatchID, selection: BooleanBuffer) {
         self.selections.write().unwrap().insert(batch_id, selection);
     }
+
+    /// Drop every snapshot entry and the selection held for `batch_id`.
+    pub(crate) fn release_batch(&self, batch_id: BatchID) {
+        let batch = u64::from(*batch_id);
+        self.entries
+            .write()
+            .unwrap()
+            .retain(|entry_id, _| ParquetArrayID::from(*entry_id).batch_id_inner() != batch);
+        self.selections.write().unwrap().remove(&batch_id);
+    }
+}
+
+#[cfg(test)]
+impl RowGroupSnapshots {
+    /// Test-only: (entry count, sum of `CacheEntry::memory_usage_bytes`).
+    pub(crate) fn test_entry_count_and_bytes(&self) -> (usize, usize) {
+        let entries = self.entries.read().unwrap();
+        let bytes = entries.values().map(|e| e.memory_usage_bytes()).sum();
+        (entries.len(), bytes)
+    }
+
+    /// Test-only: every snapshot entry this map holds.
+    pub(crate) fn test_entries(&self) -> Vec<Arc<CacheEntry>> {
+        self.entries.read().unwrap().values().cloned().collect()
+    }
+}
+
+/// Test-only registry of every snapshot map handed to a row group on this
+/// thread. `#[tokio::test]` is single-threaded, so each test sees only its own.
+#[cfg(test)]
+pub(crate) mod snapshot_test_registry {
+    use super::RowGroupSnapshots;
+    use liquid_cache::cache::{CacheEntry, LiquidCache};
+    use std::cell::RefCell;
+    use std::sync::{Arc, Weak};
+
+    thread_local! {
+        static LIVE: RefCell<Vec<Weak<RowGroupSnapshots>>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(crate) fn register(snapshots: &Arc<RowGroupSnapshots>) {
+        LIVE.with(|live| {
+            let mut live = live.borrow_mut();
+            let ptr = Arc::as_ptr(snapshots);
+            if !live.iter().any(|weak| weak.as_ptr() == ptr) {
+                live.push(Arc::downgrade(snapshots));
+            }
+        });
+    }
+
+    /// (live non-empty maps, entries, bytes) over maps that are still alive.
+    pub(crate) fn live_totals() -> (usize, usize, usize) {
+        LIVE.with(|live| {
+            let mut maps = 0;
+            let mut entries = 0;
+            let mut bytes = 0;
+            for weak in live.borrow().iter() {
+                if let Some(snapshots) = weak.upgrade() {
+                    let (count, size) = snapshots.test_entry_count_and_bytes();
+                    if count > 0 {
+                        maps += 1;
+                    }
+                    entries += count;
+                    bytes += size;
+                }
+            }
+            (maps, entries, bytes)
+        })
+    }
+
+    fn data_ptr(entry: &CacheEntry) -> Option<usize> {
+        match entry {
+            CacheEntry::MemoryArrow(array) => Some(Arc::as_ptr(array) as *const () as usize),
+            CacheEntry::MemoryLiquid(array) => Some(Arc::as_ptr(array) as *const () as usize),
+            _ => None,
+        }
+    }
+
+    /// (memory bytes the index holds, bytes only live snapshots hold), each
+    /// array counted once.
+    pub(crate) fn live_footprint(cache: &LiquidCache) -> (usize, usize) {
+        let mut held = std::collections::HashSet::new();
+        let mut in_index = 0;
+        cache.for_each_entry(|_, entry| {
+            if let Some(ptr) = data_ptr(entry)
+                && held.insert(ptr)
+            {
+                in_index += entry.memory_usage_bytes();
+            }
+        });
+        LIVE.with(|live| {
+            let mut snapshot_only = 0;
+            for weak in live.borrow().iter() {
+                if let Some(snapshots) = weak.upgrade() {
+                    for entry in snapshots.test_entries() {
+                        if let Some(ptr) = data_ptr(&entry)
+                            && held.insert(ptr)
+                        {
+                            snapshot_only += entry.memory_usage_bytes();
+                        }
+                    }
+                }
+            }
+            (in_index, snapshot_only)
+        })
+    }
 }
 
 #[derive(Default, Debug)]
@@ -159,6 +265,11 @@ impl CachedRowGroup {
 
     pub(crate) fn snapshot_selection(&self, batch_id: BatchID) -> Option<BooleanBuffer> {
         self.snapshots.selection(batch_id)
+    }
+
+    /// Drop the snapshots held for `batch_id` once the reader is done with it.
+    pub(crate) fn release_snapshot_batch(&self, batch_id: BatchID) {
+        self.snapshots.release_batch(batch_id);
     }
 
     /// Evaluate a predicate on a row group.
@@ -333,6 +444,9 @@ impl CachedFile {
                 )
             })
             .collect();
+
+        #[cfg(test)]
+        snapshot_test_registry::register(&snapshots);
 
         Arc::new(CachedRowGroup::new(
             self.cache_store.clone(),
