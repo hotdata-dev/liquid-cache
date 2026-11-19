@@ -12,7 +12,7 @@ use parquet::arrow::arrow_reader::ArrowPredicate;
 
 use crate::{
     LiquidPredicate,
-    cache::{BatchID, ColumnAccessPath, ParquetArrayID, RowGroupSnapshots},
+    cache::{BatchID, ColumnAccessPath, ParquetArrayID, RowGroupSnapshots, registry::FileLease},
 };
 use std::sync::Arc;
 
@@ -27,6 +27,9 @@ pub struct CachedColumn {
     /// entry ids; the cache serves an entry only to the identity it was
     /// cached for.
     file_identity: u64,
+    /// Keeps the file registered, so its slot is not handed to another file
+    /// while this column can still insert under it.
+    _lease: FileLease,
     expression: Option<Arc<CacheExpression>>,
     snapshots: Arc<RowGroupSnapshots>,
 }
@@ -56,11 +59,13 @@ impl From<CacheFull> for InsertArrowArrayError {
 }
 
 impl CachedColumn {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         field: Arc<Field>,
         cache_store: Arc<LiquidCache>,
         column_access_path: ColumnAccessPath,
         file_identity: u64,
+        lease: FileLease,
         expression: Option<Arc<CacheExpression>>,
         is_predicate_column: bool,
         snapshots: Arc<RowGroupSnapshots>,
@@ -86,6 +91,7 @@ impl CachedColumn {
             cache_store,
             column_path: column_access_path,
             file_identity,
+            _lease: lease,
             expression,
             snapshots,
         }

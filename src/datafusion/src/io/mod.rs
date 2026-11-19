@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 use liquid_cache::cache::{CacheExpression, EntryID, EntryMetadata};
 
 use crate::cache::{ColumnAccessPath, ParquetArrayID};
@@ -16,6 +16,29 @@ pub(crate) struct ParquetCacheMetadata {
 impl ParquetCacheMetadata {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Drop the hints of every column whose file field is one of `file_ids`.
+    pub(crate) fn forget_files(&self, file_ids: &[u16]) {
+        if file_ids.is_empty() {
+            return;
+        }
+        let file_ids: AHashSet<u16> = file_ids.iter().copied().collect();
+        self.expression_hints
+            .write()
+            .unwrap()
+            .retain(|path, _| !file_ids.contains(&(path.file_id_inner() as u16)));
+    }
+
+    /// Drop every hint.
+    pub(crate) fn clear(&self) {
+        self.expression_hints.write().unwrap().clear();
+    }
+
+    /// How many columns have hints.
+    #[cfg(test)]
+    pub(crate) fn hinted_columns(&self) -> usize {
+        self.expression_hints.read().unwrap().len()
     }
 }
 

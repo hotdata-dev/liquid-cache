@@ -162,7 +162,7 @@ impl ColumnAccessPath {
     }
 
     /// Get the file id.
-    fn file_id_inner(&self) -> u64 {
+    pub(crate) fn file_id_inner(&self) -> u64 {
         self.file_id as u64
     }
 

@@ -21,16 +21,18 @@ use parquet::arrow::arrow_reader::ArrowPredicate;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 mod column;
 mod id;
+mod registry;
 mod stats;
 
 pub use column::{CachedColumn, CachedColumnRef};
 pub(crate) use column::{InsertArrowArrayError, PrefetchOutcome};
 pub(crate) use id::ColumnAccessPath;
 pub use id::{BatchID, ParquetArrayID};
+use registry::{FileKey, FileLease, FileRegistry};
 
 /// Typed lineage expressions for a single file, keyed by file-schema column name.
 ///
@@ -214,18 +216,21 @@ impl CachedRowGroup {
     fn new(
         cache_store: Arc<LiquidCache>,
         row_group_idx: u64,
-        file_idx: u64,
+        file: FileKey,
+        lease: &FileLease,
         columns: &[CachedColumnSpec],
         snapshots: Arc<RowGroupSnapshots>,
     ) -> Self {
         let mut column_maps = ColumnMaps::default();
         for (column_id, field, expression, is_predicate_column) in columns {
-            let column_access_path = ColumnAccessPath::new(file_idx, row_group_idx, *column_id);
+            let column_access_path =
+                ColumnAccessPath::new(file.slot as u64, row_group_idx, *column_id);
             let column = Arc::new(CachedColumn::new(
                 Arc::clone(field),
                 Arc::clone(&cache_store),
                 column_access_path,
-                file_idx,
+                file.identity,
+                lease.clone(),
                 expression.clone(),
                 *is_predicate_column,
                 Arc::clone(&snapshots),
@@ -393,7 +398,10 @@ pub(crate) type CachedRowGroupRef = Arc<CachedRowGroup>;
 #[derive(Debug)]
 pub struct CachedFile {
     cache_store: Arc<LiquidCache>,
-    file_id: u64,
+    key: FileKey,
+    /// Keeps the file registered while this handle, or a row group or column
+    /// created from it, is alive.
+    lease: FileLease,
     file_schema: SchemaRef,
     lineages: Arc<ColumnLineages>,
 }
@@ -401,13 +409,15 @@ pub struct CachedFile {
 impl CachedFile {
     fn new(
         cache_store: Arc<LiquidCache>,
-        file_id: u64,
+        key: FileKey,
+        lease: FileLease,
         file_schema: SchemaRef,
         lineages: Arc<ColumnLineages>,
     ) -> Self {
         Self {
             cache_store,
-            file_id,
+            key,
+            lease,
             file_schema,
             lineages,
         }
@@ -451,7 +461,8 @@ impl CachedFile {
         Arc::new(CachedRowGroup::new(
             self.cache_store.clone(),
             row_group_id,
-            self.file_id,
+            self.key,
+            &self.lease,
             &columns,
             snapshots,
         ))
@@ -474,12 +485,17 @@ pub(crate) type CachedFileRef = Arc<CachedFile>;
 /// The main cache structure.
 #[derive(Debug)]
 pub struct LiquidCacheParquet {
-    /// Map object-store-qualified file identity to file id.
-    files: Mutex<AHashMap<ParquetFileIdentity, u64>>,
+    /// The files the cache knows, and the key each one is cached under.
+    files: Mutex<FileRegistry>,
 
     cache_store: Arc<LiquidCache>,
 
-    current_file_id: AtomicU64,
+    /// The lineage hints the cache keeps per column, owned by `cache_store`.
+    /// Held here to drop a forgotten file's hints.
+    metadata: Arc<ParquetCacheMetadata>,
+
+    /// Set while a sweep for forgettable files runs, so only one does.
+    sweeping: AtomicBool,
 }
 
 /// A reference to the main cache structure.
@@ -531,16 +547,17 @@ impl LiquidCacheParquet {
             .with_eviction_policy(eviction_policy)
             .with_cache_policy(cache_policy)
             .with_hydration_policy(hydration_policy)
-            .with_metadata(metadata)
+            .with_metadata(Arc::clone(&metadata) as _)
             .with_store(store)
             .with_evict_victims_concurrently(evict_victims_concurrently)
             .build()
             .await;
 
         LiquidCacheParquet {
-            files: Mutex::new(AHashMap::new()),
+            files: Mutex::new(FileRegistry::default()),
             cache_store: cache_storage,
-            current_file_id: AtomicU64::new(0),
+            metadata,
+            sweeping: AtomicBool::new(false),
         }
     }
 
@@ -562,34 +579,76 @@ impl LiquidCacheParquet {
         lineages: Arc<ColumnLineages>,
     ) -> CachedFileRef {
         let mut files = self.files.lock().unwrap();
-        let file_id = *files
-            .entry(file_identity)
-            .or_insert_with(|| self.current_file_id.fetch_add(1, Ordering::Relaxed));
+        let (key, lease, new) = files.register(file_identity);
+        let sweep = new && files.should_sweep();
         drop(files);
-
-        Arc::new(CachedFile::new(
+        let file = Arc::new(CachedFile::new(
             self.cache_store.clone(),
-            file_id,
+            key,
+            lease,
             full_file_schema,
             lineages,
-        ))
+        ));
+        if sweep {
+            self.reclaim_idle_files();
+        }
+        file
     }
 
-    /// How many distinct files have been registered with this cache.
+    /// Forget every registered file that no handle refers to and that has
+    /// nothing cached, with the lineage hints kept for it. Returns how many
+    /// were forgotten.
     ///
-    /// File ids are never reused, so this counts every file ever registered,
-    /// not only those being read now.
+    /// Registration runs this whenever the number of registered files has
+    /// doubled since the last run, or could take every key slot, so the
+    /// registry stays proportional to the files being read or holding cached
+    /// data, and idle files usually give their slots back before a new file
+    /// has to share one. A forgotten file registers again as a new one: it
+    /// had nothing cached to lose.
+    pub fn reclaim_idle_files(&self) -> usize {
+        /// Clears the flag however the sweep ends, so a panic in one does not
+        /// stop every later sweep.
+        struct Sweeping<'a>(&'a AtomicBool);
+        impl Drop for Sweeping<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+
+        if self.sweeping.swap(true, Ordering::Acquire) {
+            return 0;
+        }
+        let _sweeping = Sweeping(&self.sweeping);
+        let idle = self.files.lock().unwrap().idle_files();
+        let mut occupied = ahash::AHashSet::new();
+        if !idle.is_empty() {
+            self.cache_store
+                .for_each_entry_identity(|identity| _ = occupied.insert(identity));
+        }
+        let mut files = self.files.lock().unwrap();
+        let (forgotten, freed) = files.forget(&idle, &occupied);
+        // Before a freed slot can be handed out again.
+        self.metadata.forget_files(&freed);
+        files.swept();
+        forgotten
+    }
+
+    /// How many files are registered with this cache: those being read, or
+    /// holding cached data, plus any not yet forgotten by
+    /// [`Self::reclaim_idle_files`].
     pub fn leased_file_ids(&self) -> usize {
         self.files.lock().unwrap().len()
     }
 
-    /// How many file ids have been handed out that do not fit the cache key's
-    /// 16-bit file field. Above zero, distinct files compute the same keys:
-    /// each is served correctly, but they cannot share the cache.
+    /// How many registrations so far found every value of the cache key's
+    /// 16-bit file field taken by a registered file, and had to share one.
+    /// Files sharing a value compute the same keys: each is served correctly,
+    /// but they cannot share the cache. The count never goes down. It rises
+    /// briefly when the registered files come within a sweep's interval of
+    /// 65,536, and steadily when more than that are being read or holding
+    /// cached data at once.
     pub fn file_ids_over_key_width(&self) -> u64 {
-        self.current_file_id
-            .load(Ordering::Relaxed)
-            .saturating_sub(1 << 16)
+        self.files.lock().unwrap().over_key_width()
     }
 
     /// How many cache lookups found a key held by another file, and missed
@@ -646,6 +705,7 @@ impl LiquidCacheParquet {
     pub unsafe fn reset(&self) {
         let mut files = self.files.lock().unwrap();
         files.clear();
+        self.metadata.clear();
         self.cache_store.reset();
     }
 
@@ -1125,11 +1185,14 @@ mod tests {
             .await
             .unwrap();
 
-        for i in 1..=u16::MAX as u32 {
-            cache.register_or_get_file(identity(format!("filler-{i}")), schema.clone());
-        }
+        // Held, so all 65,536 files are registered at once.
+        let _fillers: Vec<_> = (1..=u16::MAX as u32)
+            .map(|i| cache.register_or_get_file(identity(format!("filler-{i}")), schema.clone()))
+            .collect();
+        assert_eq!(cache.file_ids_over_key_width(), 0);
 
         let colliding = cache.register_or_get_file(identity("colliding".to_string()), schema);
+        assert_eq!(cache.file_ids_over_key_width(), 1);
         let colliding_column = colliding.create_row_group(0, vec![]).get_column(0).unwrap();
         assert_eq!(
             colliding_column.entry_id(batch_id),
@@ -1156,5 +1219,182 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(read.as_ref(), colliding_data.as_ref());
+    }
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+    use arrow::array::{Array, ArrayRef, Int32Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use liquid_cache::cache::{AlwaysHydrate, Evict};
+    use liquid_cache::cache_policies::LiquidPolicy;
+
+    const BATCH: usize = 1024;
+
+    /// A memory-only cache (no disk tier) that holds `batches` batches.
+    async fn memory_only_cache(dir: &std::path::Path, batches: usize) -> LiquidCacheParquet {
+        let store = t4::mount(dir.join("liquid_cache.t4")).await.unwrap();
+        LiquidCacheParquet::new(
+            BATCH,
+            batch_data(0).get_array_memory_size() * batches,
+            0,
+            store,
+            Box::new(LiquidPolicy::new()),
+            Box::new(Evict),
+            Box::new(AlwaysHydrate::new()),
+        )
+        .await
+    }
+
+    fn schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]))
+    }
+
+    fn identity(file: usize) -> ParquetFileIdentity {
+        ParquetFileIdentity::new(
+            ObjectStoreUrl::local_filesystem(),
+            format!("table/file-{file}.parquet"),
+        )
+    }
+
+    fn batch_data(seed: usize) -> ArrayRef {
+        Arc::new(Int32Array::from_iter_values(
+            (0..BATCH as i32).map(|v| v.wrapping_mul(seed as i32 + 7)),
+        ))
+    }
+
+    /// Read one file as a filtered scan does: register it, open a row group
+    /// with a predicate column, cache a batch, and drop every handle.
+    async fn read_file(cache: &LiquidCacheParquet, file: usize) {
+        let handle = cache.register_or_get_file(identity(file), schema());
+        let row_group = handle.create_row_group(0, vec![0]);
+        let column = row_group.get_column(0).unwrap();
+        let _ = column.insert(BatchID::from_raw(0), batch_data(file)).await;
+    }
+
+    /// A long-running process reads ever new files (a table's data files are
+    /// replaced on every compaction) through a cache far smaller than all of
+    /// them. Files whose data was evicted and that nothing reads any more
+    /// must not stay registered, nor keep their lineage hints.
+    #[tokio::test]
+    async fn registry_stays_bounded_as_files_come_and_go() {
+        const FILES: usize = 10_000;
+        const CACHED_BATCHES: usize = 8;
+        let dir = tempfile::tempdir().unwrap();
+        let cache = memory_only_cache(dir.path(), CACHED_BATCHES).await;
+        for file in 0..FILES {
+            read_file(&cache, file).await;
+        }
+        let registered = cache.leased_file_ids();
+        let hinted = cache.metadata.hinted_columns();
+        println!(
+            "after reading {FILES} files: registered={registered} hinted_columns={hinted} \
+             cached_entries={}",
+            cache.storage().stats().total_entries
+        );
+        assert!(cache.storage().stats().total_entries <= CACHED_BATCHES);
+        assert!(
+            registered <= 2 * 1024,
+            "{registered} of {FILES} files are still registered, though the cache holds at \
+             most {CACHED_BATCHES} batches and no handle is alive"
+        );
+        assert!(
+            hinted <= registered,
+            "{hinted} columns keep lineage hints for {registered} registered files"
+        );
+        assert_eq!(cache.file_ids_over_key_width(), 0);
+
+        // An explicit sweep keeps only the files that still hold data.
+        cache.reclaim_idle_files();
+        assert!(cache.leased_file_ids() <= CACHED_BATCHES);
+        assert!(cache.metadata.hinted_columns() <= CACHED_BATCHES);
+    }
+
+    /// Forgetting a file must not cost it its cached data: a file whose
+    /// batches are still cached stays registered under the same key, and is
+    /// served them when it is read again.
+    #[tokio::test]
+    async fn a_file_with_cached_data_stays_registered() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = memory_only_cache(dir.path(), 8).await;
+        read_file(&cache, 0).await;
+        assert_eq!(cache.reclaim_idle_files(), 0);
+        assert_eq!(cache.leased_file_ids(), 1);
+        assert_eq!(cache.metadata.hinted_columns(), 1);
+
+        let handle = cache.register_or_get_file(identity(0), schema());
+        let column = handle.create_row_group(0, vec![]).get_column(0).unwrap();
+        let cached = column
+            .get_arrow_array_test_only(BatchID::from_raw(0))
+            .await
+            .expect("the file's cached batch was lost");
+        assert_eq!(cached.as_ref(), batch_data(0).as_ref());
+    }
+
+    /// A row group or column handle outliving its file handle can still
+    /// insert, so it keeps the file registered: otherwise its slot could be
+    /// handed to another file while it writes under it.
+    #[tokio::test]
+    async fn a_live_column_keeps_its_file_registered() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = memory_only_cache(dir.path(), 8).await;
+        let handle = cache.register_or_get_file(identity(0), schema());
+        let column = handle.create_row_group(0, vec![]).get_column(1).unwrap();
+        drop(handle);
+
+        assert_eq!(cache.reclaim_idle_files(), 0);
+        column
+            .insert(BatchID::from_raw(0), batch_data(1))
+            .await
+            .unwrap();
+        drop(column);
+        assert_eq!(cache.reclaim_idle_files(), 0, "the file now holds data");
+
+        let other = cache.register_or_get_file(identity(1), schema());
+        let other_column = other.create_row_group(0, vec![]).get_column(1).unwrap();
+        assert!(
+            other_column
+                .get_arrow_array_test_only(BatchID::from_raw(0))
+                .await
+                .is_none(),
+            "another file was served the first file's data"
+        );
+    }
+
+    /// A forgotten file's slot goes to the next new file, so a long-running
+    /// cache keeps registered files on distinct keys instead of running out
+    /// of the key's 16 bits.
+    #[tokio::test]
+    async fn a_forgotten_file_frees_its_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = memory_only_cache(dir.path(), 8).await;
+        let first = cache.register_or_get_file(identity(0), schema()).key;
+        read_file(&cache, 1).await;
+        assert_eq!(cache.reclaim_idle_files(), 1, "only file 0 holds nothing");
+        assert_eq!(cache.leased_file_ids(), 1);
+
+        let next = cache.register_or_get_file(identity(2), schema());
+        assert_eq!(next.key.slot, first.slot);
+        assert_ne!(next.key.identity, first.identity);
+        // Read again, the forgotten file registers as a new one.
+        let again = cache.register_or_get_file(identity(0), schema());
+        assert_ne!(again.key.identity, first.identity);
+    }
+
+    #[tokio::test]
+    async fn reset_drops_lineage_hints() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = memory_only_cache(dir.path(), 8).await;
+        let handle = cache.register_or_get_file(identity(0), schema());
+        drop(handle.create_row_group(0, vec![0, 1]));
+        assert_eq!(cache.metadata.hinted_columns(), 2);
+        drop(handle);
+        unsafe { cache.reset() };
+        assert_eq!(cache.leased_file_ids(), 0);
+        assert_eq!(cache.metadata.hinted_columns(), 0);
     }
 }
