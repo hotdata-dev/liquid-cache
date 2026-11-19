@@ -453,6 +453,12 @@ impl LiquidCache {
             .for_each(|entry_id, slot| f(entry_id, &slot.entry));
     }
 
+    /// Call `f` with the identity each entry in the cache is held for.
+    /// Isolation level: read-committed
+    pub fn for_each_entry_identity(&self, mut f: impl FnMut(u64)) {
+        self.index.for_each(|_, slot| f(slot.identity));
+    }
+
     /// Reset the cache.
     pub fn reset(&self) {
         self.index.reset();

@@ -9,7 +9,7 @@
 //!
 //! A file is forgotten once nothing can read or write its entries: no handle
 //! (file, row group or column) refers to it, and the cache holds no entry
-//! under its slot. Until then its registration, and the lineage hints kept
+//! for its identity. Until then its registration, and the lineage hints kept
 //! under its slot, stay.
 
 use std::sync::Arc;
@@ -18,10 +18,12 @@ use ahash::{AHashMap, AHashSet};
 
 use super::ParquetFileIdentity;
 
-/// Registrations at which the first sweep for forgettable files runs. After a
-/// sweep the next one runs once the registry has doubled, so sweeping costs
-/// amortized O(1) per registration.
+/// Registrations at which the first sweep for forgettable files runs, and
+/// the fewest registrations between two sweeps.
 const MIN_SWEEP_AT: usize = 1024;
+
+/// How many distinct values the cache key's 16-bit file field holds.
+const SLOTS: usize = 1 << 16;
 
 /// Where a registered file's entries live.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +57,7 @@ struct RegisteredFile {
 /// A file a sweep may forget, as it was when the sweep started.
 pub(crate) struct IdleFile {
     identity: ParquetFileIdentity,
+    key_identity: u64,
     registrations: u64,
 }
 
@@ -126,12 +129,17 @@ impl FileRegistry {
         self.files.len()
     }
 
-    /// Registrations that found every slot taken and had to share one.
+    /// Registrations so far that found every slot taken and had to share one.
     pub(crate) fn over_key_width(&self) -> u64 {
         self.over_key_width
     }
 
-    /// Whether the registry has grown enough since the last sweep to sweep again.
+    /// Whether the registry has grown enough since the last sweep to sweep
+    /// again: once it has doubled, or once every slot could be taken,
+    /// whichever comes first, so idle files usually give their slots back
+    /// before a new file has to share one. Within [`MIN_SWEEP_AT`]
+    /// registrations of every slot being taken, a few may share until the
+    /// next sweep.
     pub(crate) fn should_sweep(&self) -> bool {
         self.files.len() >= self.sweep_at
     }
@@ -143,21 +151,22 @@ impl FileRegistry {
             .filter(|(_, file)| file.lease.is_idle())
             .map(|(identity, file)| IdleFile {
                 identity: identity.clone(),
+                key_identity: file.key.identity,
                 registrations: file.registrations,
             })
             .collect()
     }
 
     /// Forget each of `idle` that is still idle, was not registered again
-    /// since, and whose slot holds no entry (`occupied` is every slot the
-    /// cache held an entry under, scanned after `idle` was taken).
+    /// since, and has no entry in the cache (`occupied` is every identity the
+    /// cache held an entry for, scanned after `idle` was taken).
     ///
     /// Returns how many files were forgotten and the slots freed by it: those
     /// no registered file uses any more, which are now free to hand out.
     pub(crate) fn forget(
         &mut self,
         idle: &[IdleFile],
-        occupied: &AHashSet<u16>,
+        occupied: &AHashSet<u64>,
     ) -> (usize, Vec<u16>) {
         let mut forgotten = 0;
         let mut released = AHashSet::new();
@@ -166,8 +175,9 @@ impl FileRegistry {
                 continue;
             };
             if !file.lease.is_idle()
+                || file.key.identity != candidate.key_identity
                 || file.registrations != candidate.registrations
-                || occupied.contains(&file.key.slot)
+                || occupied.contains(&file.key.identity)
             {
                 continue;
             }
@@ -186,9 +196,11 @@ impl FileRegistry {
         (forgotten, freed)
     }
 
-    /// Schedule the next sweep for when the registry has doubled.
+    /// Schedule the next sweep for when the registry has doubled or could
+    /// take every slot, but at least [`MIN_SWEEP_AT`] registrations away.
     pub(crate) fn swept(&mut self) {
-        self.sweep_at = MIN_SWEEP_AT.max(self.files.len().saturating_mul(2));
+        let len = self.files.len();
+        self.sweep_at = (len + MIN_SWEEP_AT).max(len.saturating_mul(2).min(SLOTS));
     }
 
     /// Forget every file. Identities keep counting up, so a handle that
@@ -253,7 +265,7 @@ mod tests {
         assert_eq!(idle.len(), 2, "only the files without a handle are idle");
         // Reopened and closed again while the sweep scanned the cache.
         drop(registry.register(identity("reopened")).1);
-        let occupied = AHashSet::from([cached.slot]);
+        let occupied = AHashSet::from([cached.identity]);
         let (forgotten, freed) = registry.forget(&idle, &occupied);
         assert_eq!((forgotten, freed.len()), (0, 0));
         assert_eq!(registry.len(), 3);
@@ -280,5 +292,44 @@ mod tests {
         drop(lease_b);
         let (forgotten, freed) = registry.forget(&registry.idle_files(), &AHashSet::new());
         assert_eq!((forgotten, freed), (1, vec![a.slot]));
+    }
+
+    #[test]
+    fn a_file_sharing_a_slot_is_forgotten_while_the_other_holds_entries() {
+        let mut registry = FileRegistry {
+            next_slot: 1 << 16,
+            ..Default::default()
+        };
+        let (a, lease_a, _) = registry.register(identity("a"));
+        let (_, lease_b, _) = registry.register(identity("b"));
+        registry.files.get_mut(&identity("b")).unwrap().key.slot = a.slot;
+        drop((lease_a, lease_b));
+
+        let occupied = AHashSet::from([a.identity]);
+        let (forgotten, freed) = registry.forget(&registry.idle_files(), &occupied);
+        assert_eq!((forgotten, freed.len()), (1, 0), "b goes, a keeps the slot");
+        assert_eq!(registry.len(), 1);
+    }
+
+    /// Files that keep cached entries, then a long run of files read once.
+    /// Sweeping as `LiquidCacheParquet` does, no file ever has to share a slot.
+    #[test]
+    fn idle_files_give_their_slots_back_before_slots_run_out() {
+        let mut registry = FileRegistry::default();
+        let mut occupied = AHashSet::new();
+        for i in 0..200_000 {
+            let (key, lease, new) = registry.register(identity(&format!("f{i}")));
+            drop(lease);
+            if i < 40_000 {
+                occupied.insert(key.identity);
+            }
+            if new && registry.should_sweep() {
+                let idle = registry.idle_files();
+                registry.forget(&idle, &occupied);
+                registry.swept();
+            }
+        }
+        assert_eq!(registry.over_key_width(), 0);
+        assert!(registry.len() < SLOTS);
     }
 }

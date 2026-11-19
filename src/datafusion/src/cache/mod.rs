@@ -600,27 +600,36 @@ impl LiquidCacheParquet {
     /// were forgotten.
     ///
     /// Registration runs this whenever the number of registered files has
-    /// doubled since the last run, so the registry stays proportional to the
-    /// files being read or holding cached data. A forgotten file registers
-    /// again as a new one: it had nothing cached to lose.
+    /// doubled since the last run, or could take every key slot, so the
+    /// registry stays proportional to the files being read or holding cached
+    /// data, and idle files usually give their slots back before a new file
+    /// has to share one. A forgotten file registers again as a new one: it
+    /// had nothing cached to lose.
     pub fn reclaim_idle_files(&self) -> usize {
+        /// Clears the flag however the sweep ends, so a panic in one does not
+        /// stop every later sweep.
+        struct Sweeping<'a>(&'a AtomicBool);
+        impl Drop for Sweeping<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+
         if self.sweeping.swap(true, Ordering::Acquire) {
             return 0;
         }
+        let _sweeping = Sweeping(&self.sweeping);
         let idle = self.files.lock().unwrap().idle_files();
         let mut occupied = ahash::AHashSet::new();
         if !idle.is_empty() {
-            self.cache_store.for_each_entry(|entry_id, _| {
-                occupied.insert(ParquetArrayID::from(*entry_id).file_id_inner() as u16);
-            });
+            self.cache_store
+                .for_each_entry_identity(|identity| _ = occupied.insert(identity));
         }
         let mut files = self.files.lock().unwrap();
         let (forgotten, freed) = files.forget(&idle, &occupied);
         // Before a freed slot can be handed out again.
         self.metadata.forget_files(&freed);
         files.swept();
-        drop(files);
-        self.sweeping.store(false, Ordering::Release);
         forgotten
     }
 
@@ -631,10 +640,13 @@ impl LiquidCacheParquet {
         self.files.lock().unwrap().len()
     }
 
-    /// How many registrations found every value of the cache key's 16-bit
-    /// file field taken by a registered file, and had to share one. Above
-    /// zero, distinct files compute the same keys: each is served correctly,
-    /// but they cannot share the cache.
+    /// How many registrations so far found every value of the cache key's
+    /// 16-bit file field taken by a registered file, and had to share one.
+    /// Files sharing a value compute the same keys: each is served correctly,
+    /// but they cannot share the cache. The count never goes down. It rises
+    /// briefly when the registered files come within a sweep's interval of
+    /// 65,536, and steadily when more than that are being read or holding
+    /// cached data at once.
     pub fn file_ids_over_key_width(&self) -> u64 {
         self.files.lock().unwrap().over_key_width()
     }
