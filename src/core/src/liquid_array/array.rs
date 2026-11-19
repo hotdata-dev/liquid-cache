@@ -13,22 +13,29 @@ use vortex_array::builtins::ArrayBuiltins;
 use vortex_array::dtype::DType;
 use vortex_array::scalar_fn::fns::like::{Like, LikeOptions};
 use vortex_array::scalar_fn::fns::operators::Operator;
-use vortex_array::{IntoArray, VortexSessionExecute};
+use vortex_array::serde::{SerializeOptions, SerializedArray};
+use vortex_array::{ArrayContext, ArrayId, IntoArray, VortexSessionExecute};
 use vortex_arrow::ArrowSessionExt;
 use vortex_btrblocks::BtrBlocksCompressor;
-use vortex_buffer::BitBuffer;
+use vortex_buffer::{Alignment, BitBuffer, ByteBuffer, ByteBufferMut};
 use vortex_error::VortexResult;
+use vortex_fsst::FSST;
 use vortex_ipc::messages::{BufMessageReader, DecoderMessage, EncoderMessage, MessageEncoder};
 use vortex_mask::Mask;
 use vortex_session::VortexSession;
+use vortex_session::registry::ReadContext;
 
 use crate::cache::LiquidExpr;
 
 use super::eval_predicate_on_array;
 
 const MAGIC: u32 = 0x4C51_4441; // "LQDA" for LiQuid Data Array
-const VERSION: u16 = 1;
+const VERSION: u16 = 2;
 const HEADER_SIZE: usize = 16;
+/// Header byte holding the exponent of the alignment a block is written for.
+const ALIGNMENT_OFFSET: usize = 6;
+/// The least alignment a serialized block is written for.
+const MIN_ALIGNMENT: Alignment = Alignment::new(64);
 
 static SESSION: LazyLock<VortexSession> = LazyLock::new(session);
 static COMPRESSOR: LazyLock<BtrBlocksCompressor> = LazyLock::new(BtrBlocksCompressor::default);
@@ -54,6 +61,8 @@ fn session() -> VortexSession {
 pub struct LiquidArray {
     array: vortex_array::ArrayRef,
     arrow_type: DataType,
+    /// What [`Self::get_array_memory_size`] reports; see [`heap_size`].
+    memory_size: usize,
 }
 
 impl LiquidArray {
@@ -85,7 +94,13 @@ impl LiquidArray {
                 return Err(array);
             }
         };
-        Ok(Self { array, arrow_type })
+        // Only the compacted array is ever charged; this one is transient.
+        let memory_size = array.nbytes() as usize + size_of::<Self>();
+        Ok(Self {
+            array,
+            arrow_type,
+            memory_size,
+        })
     }
 
     /// Detach the array from its source's buffers and from the compressor's
@@ -95,29 +110,58 @@ impl LiquidArray {
     /// lengths, but the compressor's output can keep more alive: a constant
     /// string is a zero-copy slice of its whole source buffer (vortex #10599),
     /// and an FSST codes buffer keeps its growth slack (vortex #11420). Both
-    /// are freed only with the entry. Round-tripping through the IPC
-    /// serialization the disk tier uses drops those allocations. The charge
-    /// stays approximate: `nbytes()` still leaves out per-node overhead.
+    /// are freed only with the entry. Round-tripping through the
+    /// serialization the disk tier uses drops those allocations, and leaves
+    /// an array whose heap [`heap_size`] can account for.
     fn compacted(self) -> Self {
-        let bytes = self.to_bytes().into_boxed_slice();
-        Self::from_bytes(Bytes::from(bytes))
+        let (alignment, pieces) = self.encode();
+        let len = pieces.iter().map(ByteBuffer::len).sum();
+        let mut block = ByteBufferMut::with_capacity_aligned(len, alignment);
+        for piece in &pieces {
+            block.extend_from_slice(piece);
+        }
+        drop((self, pieces));
+        Self::decode(block.freeze())
     }
 
     /// Deserialize a Vortex-backed Liquid array.
     pub fn from_bytes(bytes: Bytes) -> Self {
-        validate_header(&bytes);
-        let header_size = HEADER_SIZE;
-        let type_len = u32::from_le_bytes(
-            bytes[header_size..header_size + 4]
-                .try_into()
-                .expect("Vortex Arrow type length"),
-        ) as usize;
-        let type_start = header_size + 4;
-        let type_end = type_start + type_len;
-        let arrow_type = serde_json::from_slice(&bytes[type_start..type_end])
-            .expect("valid serialized Arrow data type");
-        let ipc_start = type_end.next_multiple_of(8);
-        let mut reader = BufMessageReader::new(bytes.slice(ipc_start..));
+        Self::decode(ByteBuffer::from(bytes))
+    }
+
+    /// Decode a serialized block, keeping every buffer of the result a
+    /// zero-copy slice of it.
+    ///
+    /// The decoder copies out any buffer it finds misaligned, while the block
+    /// stays alive for the others, so the copied bytes would be held twice.
+    /// [`Self::encode`] pads every buffer to its alignment relative to the
+    /// block's start; this aligns the start itself, copying the block once
+    /// if the caller's allocation is not aligned enough.
+    fn decode(block: ByteBuffer) -> Self {
+        validate_header(&block);
+        let alignment = Alignment::try_from_untrusted_exponent(block[ALIGNMENT_OFFSET])
+            .expect("valid Liquid array alignment");
+        // Align the start, then drop the requirement so sections slice freely.
+        let block = block.aligned(alignment).aligned(Alignment::none());
+
+        let mut cursor = HEADER_SIZE;
+        let mut next_section = || {
+            let start = cursor + 4;
+            cursor = start + read_u32(&block, cursor) as usize;
+            start..cursor
+        };
+        let arrow_type = next_section();
+        let dtype_message = next_section();
+        let encodings = next_section();
+        let row_count = read_u32(&block, cursor) as usize;
+        let segment_start = (cursor + 4).next_multiple_of(alignment.as_usize());
+
+        let arrow_type =
+            serde_json::from_slice(&block[arrow_type]).expect("valid serialized Arrow data type");
+        let encodings: Vec<String> =
+            serde_json::from_slice(&block[encodings]).expect("valid serialized encoding ids");
+        let encodings: Vec<ArrayId> = encodings.iter().map(|id| ArrayId::new(id)).collect();
+        let mut reader = BufMessageReader::new(block.slice(dtype_message).into_bytes());
         let dtype = match reader
             .next()
             .expect("Vortex dtype message")
@@ -128,17 +172,73 @@ impl LiquidArray {
             }
             message => panic!("expected Vortex dtype message, got {message:?}"),
         };
-        let array = match reader
-            .next()
-            .expect("Vortex array message")
-            .expect("valid Vortex IPC")
-        {
-            DecoderMessage::Array((array, read_ctx, row_count)) => array
-                .decode(&dtype, row_count, &read_ctx, &SESSION)
-                .expect("valid Vortex array"),
-            message => panic!("expected Vortex array message, got {message:?}"),
-        };
-        Self { array, arrow_type }
+        let array = SerializedArray::try_from(block.slice(segment_start..))
+            .expect("valid Vortex array segment")
+            .decode(&dtype, row_count, &ReadContext::new(encodings), &SESSION)
+            .expect("valid Vortex array");
+        let memory_size = heap_size(&array, &block) + size_of::<Self>();
+        Self {
+            array,
+            arrow_type,
+            memory_size,
+        }
+    }
+
+    /// The serialized form, as pieces to write contiguously into a block
+    /// aligned to the returned alignment.
+    ///
+    /// Layout: the header, three length-prefixed sections (the Arrow type as
+    /// JSON, the Vortex dtype as an IPC message, the array's encoding ids as
+    /// JSON), the row count, and the array segment. The segment starts at a
+    /// multiple of the alignment and pads each buffer to its own alignment,
+    /// so every buffer decodes in place.
+    fn encode(&self) -> (Alignment, Vec<ByteBuffer>) {
+        let dtype_message = MessageEncoder::new(SESSION.clone())
+            .encode(EncoderMessage::DType(self.array.dtype()))
+            .expect("Vortex dtype serialization")
+            .concat();
+        let context = ArrayContext::empty();
+        let segment = self
+            .array
+            .serialize(
+                &context,
+                &SESSION,
+                &SerializeOptions {
+                    offset: 0,
+                    include_padding: true,
+                },
+            )
+            .expect("Vortex array serialization");
+        let encodings: Vec<String> = context
+            .to_ids()
+            .iter()
+            .map(|id| id.as_ref().to_string())
+            .collect();
+        // The segment's first piece is empty and carries the largest
+        // alignment its buffers ask for.
+        let alignment = segment
+            .iter()
+            .map(ByteBuffer::alignment)
+            .fold(MIN_ALIGNMENT, Ord::max);
+
+        let mut head = header_bytes(alignment).to_vec();
+        for section in [
+            serde_json::to_vec(&self.arrow_type).expect("Arrow data type serializes"),
+            dtype_message,
+            serde_json::to_vec(&encodings).expect("encoding ids serialize"),
+        ] {
+            let len = u32::try_from(section.len()).expect("Liquid array section fits in u32");
+            head.extend_from_slice(&len.to_le_bytes());
+            head.extend_from_slice(&section);
+        }
+        let row_count = u32::try_from(self.array.len()).expect("Liquid array length fits in u32");
+        head.extend_from_slice(&row_count.to_le_bytes());
+        head.resize(head.len().next_multiple_of(alignment.as_usize()), 0);
+
+        let mut pieces = Vec::with_capacity(segment.len() + 1);
+        pieces.push(ByteBuffer::from(head));
+        pieces.extend(segment);
+        (alignment, pieces)
     }
 
     fn export(&self, array: vortex_array::ArrayRef) -> ArrayRef {
@@ -174,6 +274,11 @@ impl LiquidArray {
                 | DataFusionOperator::GtEq => {
                     let op = vortex_operator(binary.op())?;
                     let constant = self.constant(literal.value(), array.len())?;
+                    let array = if matches!(op, Operator::Eq | Operator::NotEq) {
+                        with_private_fsst_symbol_tables(array).ok()?
+                    } else {
+                        array.clone()
+                    };
                     array.binary(constant, op).ok()
                 }
                 DataFusionOperator::LikeMatch | DataFusionOperator::NotLikeMatch => self.try_like(
@@ -258,9 +363,17 @@ impl LiquidArray {
 }
 
 impl LiquidArray {
+    /// Whether any node of the encoded array is FSST-compressed strings.
+    #[doc(hidden)]
+    pub fn uses_fsst(&self) -> bool {
+        self.array
+            .depth_first_traversal()
+            .any(|node| node.is::<FSST>())
+    }
+
     /// Get the memory size of the Liquid array.
     pub fn get_array_memory_size(&self) -> usize {
-        self.array.nbytes() as usize + size_of::<Self>()
+        self.memory_size
     }
 
     /// Get the length of the Liquid array.
@@ -285,21 +398,10 @@ impl LiquidArray {
 
     /// Serialize the Liquid array.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let arrow_type = serde_json::to_vec(&self.arrow_type).expect("Arrow data type serializes");
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&header_bytes());
-        bytes.extend_from_slice(&(arrow_type.len() as u32).to_le_bytes());
-        bytes.extend_from_slice(&arrow_type);
-        bytes.resize(bytes.len().next_multiple_of(8), 0);
-
-        let mut encoder = MessageEncoder::new(SESSION.clone());
-        for message in [
-            EncoderMessage::DType(self.array.dtype()),
-            EncoderMessage::Array(&self.array),
-        ] {
-            for buffer in encoder.encode(message).expect("Vortex IPC serialization") {
-                bytes.extend_from_slice(&buffer);
-            }
+        let (_, pieces) = self.encode();
+        let mut bytes = Vec::with_capacity(pieces.iter().map(ByteBuffer::len).sum());
+        for piece in &pieces {
+            bytes.extend_from_slice(piece);
         }
         bytes
     }
@@ -343,11 +445,108 @@ impl LiquidArray {
     }
 }
 
-fn header_bytes() -> [u8; HEADER_SIZE] {
+fn header_bytes(alignment: Alignment) -> [u8; HEADER_SIZE] {
     let mut bytes = [0; HEADER_SIZE];
     bytes[0..4].copy_from_slice(&MAGIC.to_le_bytes());
     bytes[4..6].copy_from_slice(&VERSION.to_le_bytes());
+    bytes[ALIGNMENT_OFFSET] = alignment.exponent();
     bytes
+}
+
+/// Heap each node of a decoded Vortex tree holds besides its buffers: the
+/// shared array allocation, its statistics set, slots and dtype. Measured
+/// with a counting allocator (`tests/liquid_array_memory.rs`).
+///
+/// Both constants depend on Vortex's internals and can drift when it is
+/// upgraded; `charge_matches_the_heap_an_entry_holds` then fails. To
+/// re-derive them, run `cargo test -p liquid-cache --test liquid_array_memory
+/// -- --nocapture`, which prints each fixture's charge and real heap, and
+/// adjust until the ratios sit around 1.0: `NODE_HEAP` from the fixtures with
+/// the most nodes per byte, then `FSST_SYMBOL_TABLE_HEAP` from the FSST ones.
+const NODE_HEAP: usize = 640;
+/// Heap an FSST node holds besides that: the decoder re-pads its symbol
+/// table to the full 256 entries of 8-byte symbols and 1-byte lengths, each
+/// in an allocation of its own, outside the block.
+const FSST_SYMBOL_TABLE_HEAP: usize = 4800;
+
+/// The heap a decoded array holds: the block, if any buffer still points
+/// into it, every buffer that does not, and per-node overhead.
+///
+/// `nbytes()`, the sum of buffer lengths, leaves out the block's framing and
+/// padding and all per-node heap. For a well-compressed column that is most
+/// of what the entry holds: a few hundred bytes of buffers can sit under
+/// several kilobytes of nodes.
+fn heap_size(array: &vortex_array::ArrayRef, block: &ByteBuffer) -> usize {
+    let block_start = block.as_ptr() as usize;
+    let block_range = block_start..block_start + block.len();
+    let mut block_held = false;
+    let mut size = 0;
+    for node in array.depth_first_traversal() {
+        size += NODE_HEAP;
+        let fsst = node.is::<FSST>();
+        if fsst {
+            size += FSST_SYMBOL_TABLE_HEAP;
+        }
+        for (index, buffer) in node.buffers().iter().enumerate() {
+            let start = buffer.as_ptr() as usize;
+            if !buffer.is_empty()
+                && block_range.contains(&start)
+                && start + buffer.len() <= block_range.end
+            {
+                block_held = true;
+            } else if !(fsst && index < 2) {
+                // FSST's first two buffers are the symbol table, counted
+                // above at its padded size.
+                size += buffer.len();
+            }
+        }
+    }
+    if block_held {
+        size += block.len();
+    }
+    size
+}
+
+/// `array` with every FSST node given a symbol table of its own.
+///
+/// FSST evaluates `=` and `!=` by compressing the literal, and memoizes the
+/// compressor it builds for that (about 160 KiB) in the node's symbol table.
+/// Slices and filters share that table with the cached entry, so the first
+/// such predicate would grow the entry for the rest of its life, and nothing
+/// recharges it. With a private table, the compressor is freed with the
+/// predicate's array. Only the table is copied (2.3 KiB); the codes are not.
+fn with_private_fsst_symbol_tables(
+    array: &vortex_array::ArrayRef,
+) -> VortexResult<vortex_array::ArrayRef> {
+    if !array.depth_first_traversal().any(|node| node.is::<FSST>()) {
+        return Ok(array.clone());
+    }
+    let slots = array
+        .slots()
+        .iter()
+        .map(|slot| {
+            slot.as_ref()
+                .map(with_private_fsst_symbol_tables)
+                .transpose()
+        })
+        .collect::<VortexResult<vortex_array::ArraySlots>>()?;
+    // SAFETY: every slot is replaced by the same values with, at most, a new
+    // FSST symbol table holding the same symbols.
+    let array = unsafe { array.clone().with_slots(slots)? };
+    if !array.is::<FSST>() {
+        return Ok(array);
+    }
+    // Rebuilding an FSST node from its own buffers builds a new symbol table.
+    // SAFETY: the buffers are the node's own.
+    let buffers = array.buffer_handles();
+    unsafe { array.with_buffers(buffers) }
+}
+
+fn read_u32(bytes: &[u8], at: usize) -> u32 {
+    let field = bytes
+        .get(at..at + 4)
+        .expect("serialized Liquid array is truncated");
+    u32::from_le_bytes(field.try_into().expect("four bytes"))
 }
 
 fn validate_header(bytes: &[u8]) {
@@ -833,7 +1032,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "Unsupported Liquid array version")]
     fn rejects_bad_ipc_version() {
-        let mut header = header_bytes();
+        let mut header = header_bytes(MIN_ALIGNMENT);
         header[4..6].copy_from_slice(&(VERSION + 1).to_le_bytes());
         LiquidArray::from_bytes(Bytes::copy_from_slice(&header));
     }
@@ -917,5 +1116,90 @@ mod tests {
             codes.capacity()
         );
         assert_eq!(liquid.to_arrow_array().as_ref(), array.as_ref());
+    }
+
+    /// Columns whose encoded buffers land at offsets their alignment rejects
+    /// unless the serializer pads for them.
+    fn misalignment_prone_columns() -> Vec<(&'static str, ArrayRef)> {
+        let mut state: u64 = 1;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let binary = BinaryArray::from_iter_values((0..8192).map(|_| {
+            let mut value = next().to_le_bytes().to_vec();
+            value.extend_from_slice(&next().to_le_bytes());
+            value
+        }));
+        let timestamps = TimestampMicrosecondArray::from_iter_values(
+            (0..8192).map(|row| 1_700_000_000_000_000 + row * 1000 + (next() % 997) as i64),
+        );
+        let hex = StringArray::from_iter_values((0..8192).map(|_| format!("{:016x}", next())));
+        let urls = StringArray::from_iter_values(
+            (0..8192)
+                .map(|row| format!("https://example.com/path/1/{row}/item?id={}", next() >> 33)),
+        );
+        vec![
+            ("Binary random 16 B", Arc::new(binary)),
+            ("Timestamp(us) ms ramp", Arc::new(timestamps)),
+            ("Utf8 hex16", Arc::new(hex)),
+            ("Utf8 urls", Arc::new(urls)),
+        ]
+    }
+
+    /// Bytes of `liquid`'s data buffers that live outside `block`.
+    ///
+    /// Two kinds of buffer are never in the block and are left out: a
+    /// constant's scalar, which `buffers()` serializes on demand, and an FSST
+    /// symbol table, which the decoder re-pads into a table of its own.
+    fn bytes_outside(liquid: &LiquidArray, block: std::ops::Range<usize>) -> Vec<String> {
+        let mut outside = Vec::new();
+        for node in liquid.array.depth_first_traversal() {
+            let encoding = node.encoding_id().as_ref().to_string();
+            let names = node.buffer_names();
+            for (index, buffer) in node.buffers().into_iter().enumerate() {
+                let name = names.get(index).map(String::as_str).unwrap_or("?");
+                if buffer.is_empty()
+                    || encoding == "vortex.constant"
+                    || (encoding == "vortex.fsst" && name != "compressed_codes")
+                {
+                    continue;
+                }
+                let start = buffer.as_slice().as_ptr() as usize;
+                if start < block.start || start + buffer.len() > block.end {
+                    outside.push(format!("{encoding}.{name} ({} bytes)", buffer.len()));
+                }
+            }
+        }
+        outside
+    }
+
+    /// A Liquid entry is decoded from one serialized block and keeps it
+    /// alive. A buffer the decoder copies out of that block, because it sits
+    /// at an offset its alignment rejects, is then held twice: once in the
+    /// block and once in the copy.
+    #[test]
+    fn decode_keeps_every_buffer_in_the_serialized_block() {
+        for (name, column) in misalignment_prone_columns() {
+            let liquid = LiquidArray::from_arrow_array(&column).unwrap();
+            // An allocation aligned for any buffer, so only the layout
+            // inside the block decides whether a buffer is copied.
+            let block = vortex_buffer::ByteBufferMut::copy_from_aligned(
+                liquid.to_bytes(),
+                vortex_buffer::Alignment::new(64),
+            )
+            .freeze()
+            .into_bytes();
+            let start = block.as_ptr() as usize;
+            let decoded = LiquidArray::from_bytes(block.clone());
+            let outside = bytes_outside(&decoded, start..start + block.len());
+            assert!(
+                outside.is_empty(),
+                "{name}: decoding copied buffers out of the block: {outside:?}"
+            );
+            assert_eq!(decoded.to_arrow_array().as_ref(), column.as_ref());
+        }
     }
 }
