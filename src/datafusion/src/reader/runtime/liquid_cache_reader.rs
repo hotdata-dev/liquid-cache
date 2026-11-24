@@ -313,6 +313,13 @@ impl LiquidCacheReaderInner {
             .cached_row_group
             .snapshot_selection(self.current_batch_id)
         {
+            // A prefetched selection covers the whole batch, like the input:
+            // keep the rows both select. `boolean_buffer_and_then` expects the
+            // right side to have one bit per selected row of the left, which a
+            // whole-batch mask only has when the input selects every row.
+            if snapshot_selection.len() == input_selection.len() {
+                return Ok(&input_selection & &snapshot_selection);
+            }
             return Ok(boolean_buffer_and_then(
                 &input_selection,
                 &snapshot_selection,
@@ -886,6 +893,36 @@ mod tests {
         let mut batches = collect_batches(reader);
         assert_eq!(batches.len(), 1);
         assert_eq!(as_i32_values(&batches.pop().unwrap()), vec![3]);
+    }
+
+    /// A batch whose predicate prefetch already evaluated carries a selection
+    /// over the whole batch. Combined with an input that selects only part of
+    /// the batch (a row selection not aligned to the grain), the reader keeps
+    /// the rows both select.
+    #[tokio::test]
+    async fn a_prefetched_selection_combines_with_a_partial_input() {
+        let batches = vec![vec![1, 2, 3, 4]];
+        let batch_size = 4;
+        let all_values = flatten_batches(&batches);
+        let test = make_row_group(batch_size, &batches).await;
+        let filter = make_gt_filter(Arc::clone(&test.schema), &all_values, 2);
+        // What prefetch records: `col0 > 2` over the rows the input selects.
+        test.row_group.insert_snapshot_selection(
+            BatchID::from_raw(0),
+            BooleanBuffer::from(vec![false, false, true, true]),
+        );
+        let selection = RowSelection::from(vec![RowSelector::skip(1), RowSelector::select(3)]);
+
+        let reader = test.reader(ReaderRequest {
+            selection,
+            row_filter: Some(filter),
+            projection_columns: vec![0],
+            schema: Arc::clone(&test.schema),
+        });
+
+        let mut batches = collect_batches(reader);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(as_i32_values(&batches.pop().unwrap()), vec![3, 4]);
     }
 
     #[tokio::test]

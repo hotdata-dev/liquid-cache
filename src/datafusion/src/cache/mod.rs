@@ -272,6 +272,12 @@ impl CachedRowGroup {
         self.snapshots.selection(batch_id)
     }
 
+    /// Test-only: record a prefetched selection for `batch_id`, as prefetch does.
+    #[cfg(test)]
+    pub(crate) fn insert_snapshot_selection(&self, batch_id: BatchID, selection: BooleanBuffer) {
+        self.snapshots.insert_selection(batch_id, selection);
+    }
+
     /// Drop the snapshots held for `batch_id` once the reader is done with it.
     pub(crate) fn release_snapshot_batch(&self, batch_id: BatchID) {
         self.snapshots.release_batch(batch_id);
