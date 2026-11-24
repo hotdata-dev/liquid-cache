@@ -71,6 +71,19 @@ pub struct AdmissionGate {
     pub strict: bool,
 }
 
+/// How far below the cache's grain the session's batch size must be before a
+/// query's scans are read as plain parquet instead of being cached.
+///
+/// The cache reads and fills at its own grain (`cache.batch_size()` rows),
+/// whatever the session's batch size. A host that sizes the session's batches
+/// by bytes narrows them for wide rows; once that is under a quarter of the
+/// grain, one cache batch of those rows is over four times the host's byte
+/// target. Caching such rows means decoding each grain whole and transcoding
+/// it, and most of it is evicted again: on a 4 GiB pod a one-column scan of
+/// 16 KB text rows peaked at 3.5 GB and took 9.7 s cached, against 0.86 GB and
+/// 0.6 s read as parquet.
+const WIDE_ROW_GRAIN_RATIO: usize = 4;
+
 /// Physical optimizer rule for local mode liquid cache.
 ///
 /// Rewrites `DataSourceExec` parquet scans to use [`LiquidParquetSource`], and
@@ -143,6 +156,36 @@ impl LocalModeOptimizer {
     }
 }
 
+impl LocalModeOptimizer {
+    /// Whether the session's batch size is so far below the cache's grain
+    /// that this query's scans should bypass the cache: see
+    /// [`WIDE_ROW_GRAIN_RATIO`].
+    fn rows_too_wide_to_cache(&self, config: &ConfigOptions) -> bool {
+        config
+            .execution
+            .batch_size
+            .get()
+            .saturating_mul(WIDE_ROW_GRAIN_RATIO)
+            < self.cache.batch_size()
+    }
+}
+
+/// One line per scan the wide-row rule bypasses, beside the admission gate's.
+fn log_wide_row_bypass(cfg: &FileScanConfig, batch_size: usize, cache_batch_size: usize) {
+    let path = cfg
+        .file_groups
+        .iter()
+        .flat_map(|g| g.files())
+        .next()
+        .map(|f| f.object_meta.location.as_ref())
+        .unwrap_or("<none>");
+    log::info!(
+        target: "liquid_cache::admission",
+        "admission BYPASS (wide rows): file={path} batch_size={batch_size} \
+         cache_batch_size={cache_batch_size}"
+    );
+}
+
 impl PhysicalOptimizerRule for LocalModeOptimizer {
     fn optimize(
         &self,
@@ -162,7 +205,12 @@ impl PhysicalOptimizerRule for LocalModeOptimizer {
         // budget, so gate behaviour is unchanged there.
         let memory_budget = self.cache.max_memory_bytes() as u64;
         let disk_budget = self.cache.max_disk_bytes() as u64;
+        let rows_too_wide = self.rows_too_wide_to_cache(config);
         let mut convert = |node: &Arc<dyn ExecutionPlan>, hints: ColumnLineages| {
+            if rows_too_wide && let Some((cfg, _)) = parquet_scan_parts(node) {
+                log_wide_row_bypass(cfg, config.execution.batch_size.get(), cache.batch_size());
+                return None;
+            }
             // Leave scans whose estimated liquid footprint exceeds the budget as
             // vanilla parquet reads, so oversized scans don't thrash the cache.
             if let Some(gate) = admission
@@ -817,6 +865,33 @@ mod tests {
         assert!(
             has_liquid_source(&uncapped),
             "fitting scan should be wrapped in LiquidParquetSource"
+        );
+    }
+
+    /// A session whose batch the host narrowed far below the cache's grain
+    /// (rows too wide to cache) reads its scans as plain parquet; a batch at
+    /// or near the grain still caches them.
+    #[tokio::test]
+    async fn rows_too_wide_for_the_grain_bypass_the_cache() {
+        use datafusion::common::config::ConfigNonZeroUsize;
+        let plan = nano_hits_plan().await;
+        let dir = tempfile::tempdir().unwrap();
+        let optimizer = LocalModeOptimizer::new(make_cache(dir.path()).await);
+
+        let mut narrowed = ConfigOptions::default();
+        narrowed.execution.batch_size = ConfigNonZeroUsize::try_new(1024).unwrap();
+        let bypassed = optimizer.optimize(plan.clone(), &narrowed).unwrap();
+        assert!(
+            !has_liquid_source(&bypassed),
+            "a batch an eighth of the grain should stay a plain ParquetSource"
+        );
+
+        let mut near_grain = ConfigOptions::default();
+        near_grain.execution.batch_size = ConfigNonZeroUsize::try_new(2048).unwrap();
+        let cached = optimizer.optimize(plan, &near_grain).unwrap();
+        assert!(
+            has_liquid_source(&cached),
+            "a batch a quarter of the grain should still be cached"
         );
     }
 
