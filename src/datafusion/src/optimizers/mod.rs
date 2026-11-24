@@ -114,8 +114,8 @@ impl LocalModeOptimizer {
     }
 
     /// Enable or disable reading a query's scans as plain parquet when its
-    /// session batch size is under a quarter of the cache's (see
-    /// [`WIDE_ROW_GRAIN_RATIO`]). On by default.
+    /// session batch size is under a quarter of the cache's: rows that wide
+    /// cost more to cache than to read. On by default.
     pub fn with_wide_row_bypass(mut self, enabled: bool) -> Self {
         self.wide_row_bypass = enabled;
         self
