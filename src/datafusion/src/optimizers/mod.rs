@@ -97,6 +97,9 @@ pub struct LocalModeOptimizer {
     /// left as a vanilla parquet read instead of being wrapped by LiquidCache.
     /// `None` means cache every scan.
     admission: Option<AdmissionGate>,
+    /// Whether a query whose batches the host sized far below the cache's
+    /// grain reads its scans as plain parquet: see [`WIDE_ROW_GRAIN_RATIO`].
+    wide_row_bypass: bool,
 }
 
 impl LocalModeOptimizer {
@@ -106,7 +109,16 @@ impl LocalModeOptimizer {
             cache,
             prefetch: true,
             admission: None,
+            wide_row_bypass: true,
         }
+    }
+
+    /// Enable or disable reading a query's scans as plain parquet when its
+    /// session batch size is under a quarter of the cache's (see
+    /// [`WIDE_ROW_GRAIN_RATIO`]). On by default.
+    pub fn with_wide_row_bypass(mut self, enabled: bool) -> Self {
+        self.wide_row_bypass = enabled;
+        self
     }
 
     /// Create an optimizer with an existing cache instance
@@ -154,31 +166,34 @@ impl LocalModeOptimizer {
         });
         self
     }
-}
 
-impl LocalModeOptimizer {
     /// Whether the session's batch size is so far below the cache's grain
     /// that this query's scans should bypass the cache: see
     /// [`WIDE_ROW_GRAIN_RATIO`].
     fn rows_too_wide_to_cache(&self, config: &ConfigOptions) -> bool {
-        config
-            .execution
-            .batch_size
-            .get()
-            .saturating_mul(WIDE_ROW_GRAIN_RATIO)
-            < self.cache.batch_size()
+        self.wide_row_bypass
+            && config
+                .execution
+                .batch_size
+                .get()
+                .saturating_mul(WIDE_ROW_GRAIN_RATIO)
+                < self.cache.batch_size()
     }
 }
 
-/// One line per scan the wide-row rule bypasses, beside the admission gate's.
-fn log_wide_row_bypass(cfg: &FileScanConfig, batch_size: usize, cache_batch_size: usize) {
-    let path = cfg
-        .file_groups
+/// The first file a scan reads, for its log lines.
+fn first_file_path(cfg: &FileScanConfig) -> &str {
+    cfg.file_groups
         .iter()
         .flat_map(|g| g.files())
         .next()
         .map(|f| f.object_meta.location.as_ref())
-        .unwrap_or("<none>");
+        .unwrap_or("<none>")
+}
+
+/// One line per scan the wide-row rule bypasses, beside the admission gate's.
+fn log_wide_row_bypass(cfg: &FileScanConfig, batch_size: usize, cache_batch_size: usize) {
+    let path = first_file_path(cfg);
     log::info!(
         target: "liquid_cache::admission",
         "admission BYPASS (wide rows): file={path} batch_size={batch_size} \
@@ -483,13 +498,7 @@ fn should_bypass(
     // every tuning cycle costs a benchmark run to infer decisions from side
     // effects. `fallback_files > 0` is the flag that the catalog has no
     // per-column sizes for this table (estimate is coarse / over-counts).
-    let path = cfg
-        .file_groups
-        .iter()
-        .flat_map(|g| g.files())
-        .next()
-        .map(|f| f.object_meta.location.as_ref())
-        .unwrap_or("<none>");
+    let path = first_file_path(cfg);
     log::info!(
         target: "liquid_cache::admission",
         "admission {verdict}: file={path} projected_cols={cols} \
@@ -884,6 +893,21 @@ mod tests {
         assert!(
             !has_liquid_source(&bypassed),
             "a batch an eighth of the grain should stay a plain ParquetSource"
+        );
+
+        let mut boundary = ConfigOptions::default();
+        boundary.execution.batch_size = ConfigNonZeroUsize::try_new(2047).unwrap();
+        let bypassed = optimizer.optimize(plan.clone(), &boundary).unwrap();
+        assert!(
+            !has_liquid_source(&bypassed),
+            "a batch one row under a quarter of the grain should bypass"
+        );
+
+        let off = LocalModeOptimizer::new(make_cache(dir.path()).await).with_wide_row_bypass(false);
+        let cached = off.optimize(plan.clone(), &narrowed).unwrap();
+        assert!(
+            has_liquid_source(&cached),
+            "with the bypass off, a narrowed batch should still be cached"
         );
 
         let mut near_grain = ConfigOptions::default();
