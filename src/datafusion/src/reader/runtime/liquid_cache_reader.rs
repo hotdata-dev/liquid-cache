@@ -313,17 +313,11 @@ impl LiquidCacheReaderInner {
             .cached_row_group
             .snapshot_selection(self.current_batch_id)
         {
-            // A prefetched selection covers the whole batch, like the input:
-            // keep the rows both select. `boolean_buffer_and_then` expects the
-            // right side to have one bit per selected row of the left, which a
-            // whole-batch mask only has when the input selects every row.
-            if snapshot_selection.len() == input_selection.len() {
-                return Ok(&input_selection & &snapshot_selection);
-            }
-            return Ok(boolean_buffer_and_then(
-                &input_selection,
-                &snapshot_selection,
-            ));
+            // Prefetch windows the same row-group selection at the same batch
+            // size, so its selection covers the whole batch, like the input,
+            // and is a subset of it: keep the rows both select.
+            debug_assert_eq!(snapshot_selection.len(), input_selection.len());
+            return Ok(&input_selection & &snapshot_selection);
         }
 
         let Some(filter) = row_filter.as_mut() else {
