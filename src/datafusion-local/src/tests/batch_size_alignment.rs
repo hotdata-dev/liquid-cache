@@ -242,10 +242,6 @@ async fn multi_row_group_scan_stays_aligned() {
 /// through `evaluate_selection_with_predicate(current_batch_id, ..)`, so this
 /// covers the filter path's use of the same id.
 #[tokio::test]
-#[ignore = "upstream bug, not a batch-size one: page-index pruning plus a pushed-down \
-           predicate panics in boolean_buffer_and_then (left.count_set_bits()=904, \
-           right.len()=5000). Reproduces with the session and cache batch sizes equal, \
-           so it is independent of this file's subject."]
 async fn pruned_filtered_scan_stays_aligned() {
     let tmp = TempDir::new().unwrap();
     let parquet_path = tmp.path().join("t.parquet");
@@ -290,10 +286,6 @@ async fn multi_partition_scan_stays_aligned() {
 /// Isolation probe: same pruned+filtered scan, but with the session batch size
 /// left equal to the cache's, so batch windowing is not involved at all.
 #[tokio::test]
-#[ignore = "upstream bug, not a batch-size one: page-index pruning plus a pushed-down \
-           predicate panics in boolean_buffer_and_then (left.count_set_bits()=904, \
-           right.len()=5000). Reproduces with the session and cache batch sizes equal, \
-           so it is independent of this file's subject."]
 async fn pruned_filtered_scan_at_matching_batch_size() {
     let tmp = TempDir::new().unwrap();
     let parquet_path = tmp.path().join("t.parquet");
